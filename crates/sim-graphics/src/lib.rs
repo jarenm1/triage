@@ -365,6 +365,7 @@ impl Renderer {
                         });
                     }
                     ViewKind::Sensor => {
+                        profiling::scope!("allocate transient resources");
                         let usage =
                             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
                         let mut acquire = |format| {
@@ -441,6 +442,7 @@ impl Renderer {
             let dynamic_offset = view_index as u32 * self.globals_stride;
             match compiled.request.kind {
                 ViewKind::Display => {
+                    profiling::scope!("display pass");
                     let external = external_views[compiled.external.expect("display target")];
                     let color_attachments = [Some(color_attachment(
                         external.color,
@@ -468,6 +470,7 @@ impl Renderer {
                     );
                 }
                 ViewKind::Sensor => {
+                    profiling::scope!("sensor pass");
                     let color_attachments = [
                         compiled.color.map(|index| {
                             color_attachment(
@@ -512,6 +515,8 @@ impl Renderer {
                     );
                     drop(pass);
 
+                    {
+                        profiling::scope!("schedule sensor readbacks");
                     for (output, texture_index) in [
                         (OutputKind::Color, compiled.color),
                         (OutputKind::Depth, compiled.depth),
@@ -536,6 +541,7 @@ impl Renderer {
                                 output,
                             })?;
                         readbacks.push(handle);
+                    }
                     }
                 }
             }
