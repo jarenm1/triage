@@ -2,7 +2,7 @@ use std::{f32::consts::FRAC_PI_4, path::PathBuf};
 
 use anyhow::{Context, Result};
 use glam::{Mat4, Quat, Vec3};
-use sim_graphics::{Camera, Cube, OffscreenTarget, Renderer};
+use sim_graphics::{Camera, Frame, MeshData, OffscreenTarget, RenderPrimitive, Renderer};
 
 fn main() -> Result<()> {
     pollster::block_on(run())
@@ -17,13 +17,24 @@ async fn run() -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let mut renderer = Renderer::new(&instance, None).await?;
     let target = OffscreenTarget::new(&renderer, width, height);
+    let cube_mesh = renderer.register_mesh(MeshData::cube())?;
+    let plane_mesh = renderer.register_mesh(MeshData::plane())?;
+    let camera = Camera {
+        eye: Vec3::new(13.5, 12.0, 16.0),
+        target: Vec3::new(0.0, 0.0, 0.0),
+        up: Vec3::Y,
+        vertical_fov_radians: FRAC_PI_4,
+        near: 0.1,
+        far: 100.0,
+    };
+    let mut frame = Frame::with_capacity(camera, 401);
 
-    let mut cubes = Vec::with_capacity(401);
-    cubes.push(Cube {
+    frame.draw(RenderPrimitive {
+        mesh: plane_mesh,
         transform: Mat4::from_scale_rotation_translation(
-            Vec3::new(24.0, 0.12, 24.0),
+            Vec3::new(24.0, 1.0, 24.0),
             Quat::IDENTITY,
-            Vec3::new(0.0, -0.56, 0.0),
+            Vec3::new(0.0, -0.5, 0.0),
         ),
         color: [0.18, 0.22, 0.26, 1.0],
     });
@@ -41,25 +52,21 @@ async fn run() -> Result<()> {
                 0.78,
                 1.0,
             ];
-            cubes.push(Cube {
+            frame.draw(RenderPrimitive {
+                mesh: cube_mesh,
                 transform: Mat4::from_scale_rotation_translation(scale, Quat::IDENTITY, position),
                 color,
             });
         }
     }
-
-    let camera = Camera {
-        eye: Vec3::new(13.5, 12.0, 16.0),
-        target: Vec3::new(0.0, 0.0, 0.0),
-        up: Vec3::Y,
-        vertical_fov_radians: FRAC_PI_4,
-        near: 0.1,
-        far: 100.0,
-    };
-    renderer.render(target.render_target(), camera, &cubes)?;
+    renderer.render(target.render_target(), &frame)?;
     let pixels = target.read_rgba(&renderer).await?;
     image::save_buffer(&output, &pixels, width, height, image::ColorType::Rgba8)
         .with_context(|| format!("saving {}", output.display()))?;
-    println!("rendered {} instances to {}", cubes.len(), output.display());
+    println!(
+        "rendered {} instances to {}",
+        frame.primitives().len(),
+        output.display()
+    );
     Ok(())
 }

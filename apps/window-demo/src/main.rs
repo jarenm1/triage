@@ -1,32 +1,55 @@
 use std::f32::consts::FRAC_PI_4;
 
 use glam::{Mat4, Quat, Vec3};
-use sim_graphics::{Camera, Cube};
-use sim_graphics_winit::{Scene, SceneFrame};
+use sim_graphics::{Camera, Frame, MeshData, MeshHandle, RenderPrimitive, Renderer, RendererError};
+use sim_graphics_winit::Scene;
 
 fn main() -> Result<(), sim_graphics_winit::WindowError> {
     sim_graphics_winit::run("Simulator Graphics", DemoScene::new())
 }
 
 struct DemoScene {
-    cubes: Vec<Cube>,
+    frame: Frame,
+    meshes: Option<(MeshHandle, MeshHandle)>,
 }
 
 impl DemoScene {
     fn new() -> Self {
-        let mut cubes = Vec::with_capacity(401);
-        cubes.push(Cube {
+        Self {
+            frame: Frame::with_capacity(camera(0.0), 401),
+            meshes: None,
+        }
+    }
+}
+
+impl Scene for DemoScene {
+    fn initialize(&mut self, renderer: &mut Renderer) -> Result<(), RendererError> {
+        self.meshes = Some((
+            renderer.register_mesh(MeshData::cube())?,
+            renderer.register_mesh(MeshData::plane())?,
+        ));
+        Ok(())
+    }
+
+    fn frame(&mut self, elapsed_seconds: f32) -> &Frame {
+        let (cube_mesh, plane_mesh) = self
+            .meshes
+            .expect("the window adapter initializes scenes before rendering");
+        self.frame.begin(camera(elapsed_seconds));
+        self.frame.draw(RenderPrimitive {
+            mesh: plane_mesh,
             transform: Mat4::from_scale_rotation_translation(
-                Vec3::new(24.0, 0.12, 24.0),
+                Vec3::new(24.0, 1.0, 24.0),
                 Quat::IDENTITY,
-                Vec3::new(0.0, -0.56, 0.0),
+                Vec3::new(0.0, -0.5, 0.0),
             ),
             color: [0.18, 0.22, 0.26, 1.0],
         });
         for z in -10_i32..10 {
             for x in -10_i32..10 {
-                cubes.push(Cube {
-                    transform: cube_transform(x, z, 0.0),
+                self.frame.draw(RenderPrimitive {
+                    mesh: cube_mesh,
+                    transform: cube_transform(x, z, elapsed_seconds),
                     color: [
                         0.22 + (x + 10) as f32 / 40.0,
                         0.35 + (z + 10) as f32 / 50.0,
@@ -36,29 +59,19 @@ impl DemoScene {
                 });
             }
         }
-        Self { cubes }
+        &self.frame
     }
 }
 
-impl Scene for DemoScene {
-    fn frame(&mut self, elapsed_seconds: f32) -> SceneFrame<'_> {
-        for (index, cube) in self.cubes[1..].iter_mut().enumerate() {
-            let x = index as i32 % 20 - 10;
-            let z = index as i32 / 20 - 10;
-            cube.transform = cube_transform(x, z, elapsed_seconds);
-        }
-        let orbit = elapsed_seconds * 0.16;
-        SceneFrame {
-            camera: Camera {
-                eye: Vec3::new(orbit.cos() * 20.5, 12.0, orbit.sin() * 20.5),
-                target: Vec3::ZERO,
-                up: Vec3::Y,
-                vertical_fov_radians: FRAC_PI_4,
-                near: 0.1,
-                far: 100.0,
-            },
-            cubes: &self.cubes,
-        }
+fn camera(elapsed_seconds: f32) -> Camera {
+    let orbit = elapsed_seconds * 0.16;
+    Camera {
+        eye: Vec3::new(orbit.cos() * 20.5, 12.0, orbit.sin() * 20.5),
+        target: Vec3::ZERO,
+        up: Vec3::Y,
+        vertical_fov_radians: FRAC_PI_4,
+        near: 0.1,
+        far: 100.0,
     }
 }
 

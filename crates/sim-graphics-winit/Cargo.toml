@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 pollster.workspace = true
+profiling.workspace = true
 sim-graphics = { path = "../sim-graphics" }
 wgpu.workspace = true
 winit.workspace = true

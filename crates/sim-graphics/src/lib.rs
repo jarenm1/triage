@@ -1,42 +1,29 @@
 use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
+
+mod camera;
+mod frame;
+mod primitive;
+mod resource;
+
+pub use camera::Camera;
+pub use frame::Frame;
+pub use primitive::{Mesh, MeshData, MeshHandle, MeshVertex, RenderPrimitive};
+pub use resource::{Handle, ResourceRegistry};
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-
-#[derive(Clone, Copy, Debug)]
-pub struct Camera {
-    pub eye: Vec3,
-    pub target: Vec3,
-    pub up: Vec3,
-    pub vertical_fov_radians: f32,
-    pub near: f32,
-    pub far: f32,
-}
-
-impl Camera {
-    fn view_projection(self, aspect: f32) -> Mat4 {
-        let view = Mat4::look_at_rh(self.eye, self.target, self.up);
-        let projection =
-            Mat4::perspective_rh(self.vertical_fov_radians, aspect, self.near, self.far);
-        projection * view
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Cube {
-    pub transform: Mat4,
-    pub color: [f32; 4],
-}
 
 #[derive(Debug)]
 pub enum RendererError {
     NoAdapter(wgpu::RequestAdapterError),
     RequestDevice(wgpu::RequestDeviceError),
     TooManyInstances(usize),
+    TooManyIndices(usize),
+    EmptyMesh,
+    InvalidMeshHandle(MeshHandle),
     ReadbackFailed,
 }
 
@@ -48,19 +35,19 @@ impl std::fmt::Display for RendererError {
             Self::TooManyInstances(count) => {
                 write!(f, "{count} instances exceed the GPU draw limit")
             }
+            Self::TooManyIndices(count) => {
+                write!(f, "{count} mesh indices exceed the GPU draw limit")
+            }
+            Self::EmptyMesh => write!(f, "meshes require at least one vertex and one index"),
+            Self::InvalidMeshHandle(handle) => {
+                write!(f, "frame references missing mesh {handle:?}")
+            }
             Self::ReadbackFailed => write!(f, "GPU readback failed"),
         }
     }
 }
 
 impl std::error::Error for RendererError {}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    normal: [f32; 3],
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -76,6 +63,13 @@ struct Globals {
     light_direction: [f32; 4],
 }
 
+#[derive(Clone, Copy)]
+struct DrawBatch {
+    mesh: MeshHandle,
+    first_instance: u32,
+    instance_count: u32,
+}
+
 pub struct Renderer {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -84,11 +78,11 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     globals: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
-    vertices: wgpu::Buffer,
-    indices: wgpu::Buffer,
+    meshes: ResourceRegistry<Mesh>,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     instances: Vec<Instance>,
+    batches: Vec<DrawBatch>,
 }
 
 pub struct RenderTarget<'a> {
@@ -103,6 +97,8 @@ impl Renderer {
         instance: &wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'_>>,
     ) -> Result<Self, RendererError> {
+        let _profiler = profiling::tracy_client::Client::start();
+        profiling::function_scope!();
         let preferred_adapter = wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface,
@@ -170,12 +166,12 @@ impl Renderer {
         });
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cube pipeline layout"),
+            label: Some("primitive pipeline layout"),
             bind_group_layouts: &[Some(&globals_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("instanced cube pipeline"),
+            label: Some("instanced primitive pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -208,17 +204,6 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
-        let (vertices_data, indices_data) = cube_geometry();
-        let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("cube vertices"),
-            contents: bytemuck::cast_slice(&vertices_data),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("cube indices"),
-            contents: bytemuck::cast_slice(&indices_data),
-            usage: wgpu::BufferUsages::INDEX,
-        });
         let instance_capacity = 64;
         let instance_buffer = create_instance_buffer(&device, instance_capacity);
 
@@ -230,11 +215,11 @@ impl Renderer {
             pipeline,
             globals,
             globals_bind_group,
-            vertices,
-            indices,
+            meshes: ResourceRegistry::new(),
             instance_buffer,
             instance_capacity,
             instances: Vec::with_capacity(instance_capacity),
+            batches: Vec::new(),
         })
     }
 
@@ -254,40 +239,98 @@ impl Renderer {
         self.queue.present(surface_texture);
     }
 
+    pub fn register_mesh(&mut self, data: MeshData) -> Result<MeshHandle, RendererError> {
+        profiling::function_scope!();
+        if data.vertices.is_empty() || data.indices.is_empty() {
+            return Err(RendererError::EmptyMesh);
+        }
+        let index_count = u32::try_from(data.indices.len())
+            .map_err(|_| RendererError::TooManyIndices(data.indices.len()))?;
+        let vertices = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh vertices"),
+                contents: bytemuck::cast_slice(&data.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let indices = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh indices"),
+                contents: bytemuck::cast_slice(&data.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        Ok(self.meshes.insert(Mesh {
+            vertices,
+            indices,
+            index_count,
+        }))
+    }
+
+    pub fn remove_mesh(&mut self, handle: MeshHandle) -> bool {
+        self.meshes.remove(handle).is_some()
+    }
+
     pub fn render(
         &mut self,
         target: RenderTarget<'_>,
-        camera: Camera,
-        cubes: &[Cube],
+        frame: &Frame,
     ) -> Result<wgpu::SubmissionIndex, RendererError> {
+        profiling::function_scope!();
         assert!(
             target.width > 0 && target.height > 0,
             "render dimensions must be non-zero"
         );
-        let instance_count =
-            u32::try_from(cubes.len()).map_err(|_| RendererError::TooManyInstances(cubes.len()))?;
-        self.ensure_instance_capacity(cubes.len());
-        self.instances.clear();
-        self.instances.extend(cubes.iter().map(|cube| Instance {
-            model: cube.transform.to_cols_array_2d(),
-            color: cube.color,
-        }));
-        if !self.instances.is_empty() {
-            self.queue.write_buffer(
-                &self.instance_buffer,
-                0,
-                bytemuck::cast_slice(&self.instances),
-            );
-        }
-        let globals = Globals {
-            view_projection: camera
-                .view_projection(target.width as f32 / target.height as f32)
-                .to_cols_array_2d(),
-            light_direction: [0.35, 0.8, 0.45, 0.0],
-        };
-        self.queue
-            .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
+        {
+            profiling::scope!("prepare frame");
+            let primitive_count = frame.primitives().len();
+            u32::try_from(primitive_count)
+                .map_err(|_| RendererError::TooManyInstances(primitive_count))?;
+            self.ensure_instance_capacity(primitive_count);
+            self.instances.clear();
+            self.batches.clear();
 
+            for primitive in frame.primitives() {
+                if self.meshes.get(primitive.mesh).is_none() {
+                    return Err(RendererError::InvalidMeshHandle(primitive.mesh));
+                }
+                self.instances.push(Instance {
+                    model: primitive.transform.to_cols_array_2d(),
+                    color: primitive.color,
+                });
+                match self.batches.last_mut() {
+                    Some(batch) if batch.mesh == primitive.mesh => {
+                        batch.instance_count += 1;
+                    }
+                    _ => self.batches.push(DrawBatch {
+                        mesh: primitive.mesh,
+                        first_instance: (self.instances.len() - 1) as u32,
+                        instance_count: 1,
+                    }),
+                }
+            }
+        }
+        {
+            profiling::scope!("upload frame");
+            if !self.instances.is_empty() {
+                self.queue.write_buffer(
+                    &self.instance_buffer,
+                    0,
+                    bytemuck::cast_slice(&self.instances),
+                );
+            }
+            let globals = Globals {
+                view_projection: frame
+                    .camera()
+                    .view_projection(target.width as f32 / target.height as f32)
+                    .to_cols_array_2d(),
+                light_direction: [0.35, 0.8, 0.45, 0.0],
+            };
+            self.queue
+                .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
+        }
+
+        profiling::scope!("encode and submit");
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -324,10 +367,20 @@ impl Renderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.vertices.slice(..));
             pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..36, 0, 0..instance_count);
+            for batch in &self.batches {
+                let mesh = self
+                    .meshes
+                    .get(batch.mesh)
+                    .expect("mesh handles were validated before encoding");
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(
+                    0..mesh.index_count,
+                    0,
+                    batch.first_instance..batch.first_instance + batch.instance_count,
+                );
+            }
         }
         Ok(self.queue.submit(Some(encoder.finish())))
     }
@@ -336,6 +389,7 @@ impl Renderer {
         if required <= self.instance_capacity {
             return;
         }
+        profiling::scope!("grow instance buffer");
         self.instance_capacity = required.next_power_of_two();
         self.instance_buffer = create_instance_buffer(&self.device, self.instance_capacity);
     }
@@ -410,6 +464,7 @@ impl OffscreenTarget {
     }
 
     pub async fn read_rgba(&self, renderer: &Renderer) -> Result<Vec<u8>, RendererError> {
+        profiling::function_scope!();
         let unpadded_bytes_per_row = self.width * 4;
         let padded_bytes_per_row =
             unpadded_bytes_per_row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
@@ -498,7 +553,7 @@ fn create_target(
 
 fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cube instances"),
+        label: Some("primitive instances"),
         size: (capacity * size_of::<Instance>()) as u64,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
@@ -511,7 +566,7 @@ const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array!
 
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
-        array_stride: size_of::<Vertex>() as u64,
+        array_stride: size_of::<MeshVertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &VERTEX_ATTRIBUTES,
     }
@@ -522,111 +577,5 @@ fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
         array_stride: size_of::<Instance>() as u64,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &INSTANCE_ATTRIBUTES,
-    }
-}
-
-fn cube_geometry() -> ([Vertex; 24], [u16; 36]) {
-    let mut vertices = [Vertex {
-        position: [0.0; 3],
-        normal: [0.0; 3],
-    }; 24];
-    let faces = [
-        (
-            [1.0, 0.0, 0.0],
-            [
-                [0.5, -0.5, -0.5],
-                [0.5, -0.5, 0.5],
-                [0.5, 0.5, 0.5],
-                [0.5, 0.5, -0.5],
-            ],
-        ),
-        (
-            [-1.0, 0.0, 0.0],
-            [
-                [-0.5, -0.5, 0.5],
-                [-0.5, -0.5, -0.5],
-                [-0.5, 0.5, -0.5],
-                [-0.5, 0.5, 0.5],
-            ],
-        ),
-        (
-            [0.0, 1.0, 0.0],
-            [
-                [-0.5, 0.5, -0.5],
-                [0.5, 0.5, -0.5],
-                [0.5, 0.5, 0.5],
-                [-0.5, 0.5, 0.5],
-            ],
-        ),
-        (
-            [0.0, -1.0, 0.0],
-            [
-                [-0.5, -0.5, 0.5],
-                [0.5, -0.5, 0.5],
-                [0.5, -0.5, -0.5],
-                [-0.5, -0.5, -0.5],
-            ],
-        ),
-        (
-            [0.0, 0.0, 1.0],
-            [
-                [0.5, -0.5, 0.5],
-                [-0.5, -0.5, 0.5],
-                [-0.5, 0.5, 0.5],
-                [0.5, 0.5, 0.5],
-            ],
-        ),
-        (
-            [0.0, 0.0, -1.0],
-            [
-                [-0.5, -0.5, -0.5],
-                [0.5, -0.5, -0.5],
-                [0.5, 0.5, -0.5],
-                [-0.5, 0.5, -0.5],
-            ],
-        ),
-    ];
-    for (face_index, (normal, positions)) in faces.into_iter().enumerate() {
-        for (corner, position) in positions.into_iter().enumerate() {
-            vertices[face_index * 4 + corner] = Vertex { position, normal };
-        }
-    }
-    let mut indices = [0_u16; 36];
-    for face in 0..6_u16 {
-        let base = face * 4;
-        indices[(face as usize) * 6..(face as usize + 1) * 6].copy_from_slice(&[
-            base,
-            base + 2,
-            base + 1,
-            base,
-            base + 3,
-            base + 2,
-        ]);
-    }
-    (vertices, indices)
-}
-
-#[cfg(test)]
-mod tests {
-    use glam::Vec3;
-
-    use super::cube_geometry;
-
-    #[test]
-    fn cube_triangles_wind_counter_clockwise_from_outside() {
-        let (vertices, indices) = cube_geometry();
-        for triangle in indices.chunks_exact(3) {
-            let a = Vec3::from_array(vertices[triangle[0] as usize].position);
-            let b = Vec3::from_array(vertices[triangle[1] as usize].position);
-            let c = Vec3::from_array(vertices[triangle[2] as usize].position);
-            let expected_normal =
-                Vec3::from_array(vertices[triangle[0] as usize].normal);
-            let geometric_normal = (b - a).cross(c - a);
-
-            assert!(
-                geometric_normal.dot(expected_normal) > 0.0,
-                "triangle {triangle:?} faces into the cube"
-            );
-        }
     }
 }

@@ -18,5 +18,6 @@ bytemuck = { version = "1.24", features = ["derive"] }
 glam = { version = "0.30", features = ["bytemuck"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = "0.4"
+profiling = { version = "1.0.18", features = ["profile-with-tracy"] }
 wgpu = "30.0.1"
 winit = "0.30.12"

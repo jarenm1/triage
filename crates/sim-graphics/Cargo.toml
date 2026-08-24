@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 bytemuck.workspace = true
 glam.workspace = true
+profiling.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]

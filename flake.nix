@@ -55,6 +55,7 @@
               cargo-edit
               cargo-nextest
               pkg-config
+              tracy
               vulkan-loader
               vulkan-tools
               wayland

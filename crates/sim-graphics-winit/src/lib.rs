@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Instant};
 
-use sim_graphics::{Camera, Cube, DepthTarget, RenderTarget, Renderer, RendererError};
+use sim_graphics::{DepthTarget, Frame, RenderTarget, Renderer, RendererError};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
@@ -9,13 +9,12 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-pub struct SceneFrame<'a> {
-    pub camera: Camera,
-    pub cubes: &'a [Cube],
-}
-
 pub trait Scene {
-    fn frame(&mut self, elapsed_seconds: f32) -> SceneFrame<'_>;
+    fn initialize(&mut self, _renderer: &mut Renderer) -> Result<(), RendererError> {
+        Ok(())
+    }
+
+    fn frame(&mut self, elapsed_seconds: f32) -> &Frame;
 }
 
 #[derive(Debug)]
@@ -86,7 +85,12 @@ impl<S: Scene> ApplicationHandler for WindowApplication<S> {
             return;
         }
         match pollster::block_on(WindowState::new(event_loop, &self.title)) {
-            Ok(window) => {
+            Ok(mut window) => {
+                if let Err(error) = self.scene.initialize(&mut window.renderer) {
+                    self.error = Some(WindowError::Renderer(error));
+                    event_loop.exit();
+                    return;
+                }
                 self.window = Some(window);
                 self.started = Instant::now();
             }
@@ -114,11 +118,13 @@ impl<S: Scene> ApplicationHandler for WindowApplication<S> {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => window.resize(size),
             WindowEvent::RedrawRequested => {
+                profiling::scope!("window frame");
                 let frame = self.scene.frame(self.started.elapsed().as_secs_f32());
                 if let Err(error) = window.render(frame) {
                     self.error = Some(error);
                     event_loop.exit();
                 }
+                profiling::finish_frame!();
             }
             _ => {}
         }
@@ -158,8 +164,8 @@ impl WindowState {
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 2,
+            present_mode: wgpu::PresentMode::AutoNoVsync,
+            desired_maximum_frame_latency: 1,
             alpha_mode: capabilities.alpha_modes[0],
             view_formats: vec![],
         };
@@ -185,7 +191,8 @@ impl WindowState {
         self.depth = DepthTarget::new(&self.renderer, size.width, size.height);
     }
 
-    fn render(&mut self, frame: SceneFrame<'_>) -> Result<(), WindowError> {
+    fn render(&mut self, frame: &Frame) -> Result<(), WindowError> {
+        profiling::function_scope!();
         let (surface_texture, reconfigure_after_present) = match self.surface.get_current_texture()
         {
             wgpu::CurrentSurfaceTexture::Success(texture) => (texture, false),
@@ -218,8 +225,7 @@ impl WindowState {
                     width: self.config.width,
                     height: self.config.height,
                 },
-                frame.camera,
-                frame.cubes,
+                frame,
             )
             .map_err(WindowError::Renderer)?;
         self.renderer.present(surface_texture);
