@@ -95,7 +95,10 @@ impl Frame {
     }
 
     pub fn add_view(&mut self, view: RenderView) -> ViewId {
-        assert!(view.width > 0 && view.height > 0, "view dimensions must be non-zero");
+        assert!(
+            view.width > 0 && view.height > 0,
+            "view dimensions must be non-zero"
+        );
         let index = u32::try_from(self.views.len()).expect("frame exhausted u32 view identifiers");
         self.views.push(view);
         ViewId(index)

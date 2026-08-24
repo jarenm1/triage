@@ -1,4 +1,10 @@
-use std::{collections::HashMap, sync::{Arc, atomic::{AtomicU8, Ordering}}};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 
 use crate::{ViewId, ViewKey};
 
@@ -80,7 +86,9 @@ struct PooledTexture {
 
 impl TexturePool {
     pub fn new() -> Self {
-        Self { textures: Vec::new() }
+        Self {
+            textures: Vec::new(),
+        }
     }
 
     pub fn begin_frame(&mut self) {
@@ -156,7 +164,9 @@ const FAILED: u8 = 3;
 
 impl ReadbackRing {
     pub fn new() -> Self {
-        Self { streams: HashMap::new() }
+        Self {
+            streams: HashMap::new(),
+        }
     }
 
     pub fn schedule(
@@ -177,7 +187,8 @@ impl ReadbackRing {
         slots.next = (slot_index + 1) % slots.slots.len();
 
         let bytes_per_row = width * 4;
-        let padded_bytes_per_row = bytes_per_row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let padded_bytes_per_row =
+            bytes_per_row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let required_size = u64::from(padded_bytes_per_row) * u64::from(height);
         let slot = &mut slots.slots[slot_index];
         if slot.buffer_size < required_size {
@@ -202,7 +213,11 @@ impl ReadbackRing {
                     rows_per_image: Some(height),
                 },
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
 
         Some(ReadbackHandle {
@@ -224,15 +239,15 @@ impl ReadbackRing {
                 .expect("scheduled readback has a buffer")
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, move |result| {
-                    state.store(if result.is_ok() { READY } else { FAILED }, Ordering::Release);
+                    state.store(
+                        if result.is_ok() { READY } else { FAILED },
+                        Ordering::Release,
+                    );
                 });
         }
     }
 
-    pub fn poll(
-        &mut self,
-        handle: ReadbackHandle,
-    ) -> Result<Option<ReadbackData>, ()> {
+    pub fn poll(&mut self, handle: ReadbackHandle) -> Result<Option<ReadbackData>, ()> {
         let Some(stream) = self.streams.get_mut(&handle.stream) else {
             return Err(());
         };
@@ -260,10 +275,16 @@ impl ReadbackRing {
                 Ok(Some(match handle.stream.output {
                     OutputKind::Color => ReadbackData::Color(bytes),
                     OutputKind::Depth => ReadbackData::Depth(
-                        bytes.chunks_exact(4).map(|value| f32::from_le_bytes(value.try_into().unwrap())).collect(),
+                        bytes
+                            .chunks_exact(4)
+                            .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+                            .collect(),
                     ),
                     OutputKind::ObjectId => ReadbackData::ObjectIds(
-                        bytes.chunks_exact(4).map(|value| u32::from_le_bytes(value.try_into().unwrap())).collect(),
+                        bytes
+                            .chunks_exact(4)
+                            .map(|value| u32::from_le_bytes(value.try_into().unwrap()))
+                            .collect(),
                     ),
                 }))
             }

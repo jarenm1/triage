@@ -30,6 +30,7 @@ pub enum RendererError {
     ReadbackRingFull { view: ViewKey, output: OutputKind },
     MissingExternalView(ViewId),
     InvalidReadbackHandle,
+    SkyboxImageError(String),
 }
 
 impl std::fmt::Display for RendererError {
@@ -49,10 +50,18 @@ impl std::fmt::Display for RendererError {
             }
             Self::ReadbackFailed => write!(f, "GPU readback failed"),
             Self::ReadbackRingFull { view, output } => {
-                write!(f, "readback ring for view {view:?} output {output:?} is full")
+                write!(
+                    f,
+                    "readback ring for view {view:?} output {output:?} is full"
+                )
             }
             Self::InvalidReadbackHandle => write!(f, "readback handle is stale or failed"),
-            Self::MissingExternalView(view) => write!(f, "display view {view:?} has no external target"),
+            Self::MissingExternalView(view) => {
+                write!(f, "display view {view:?} has no external target")
+            }
+            Self::SkyboxImageError(error) => {
+                write!(f, "failed to load skybox image: {error}")
+            }
         }
     }
 }
@@ -73,7 +82,11 @@ struct Instance {
 struct Globals {
     view: [[f32; 4]; 4],
     view_projection: [[f32; 4]; 4],
+    inv_view_projection: [[f32; 4]; 4],
+    camera_position: [f32; 4],
     light_direction: [f32; 4],
+    light_color: [f32; 4],
+    ambient_color: [f32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -82,7 +95,6 @@ struct DrawBatch {
     first_instance: u32,
     instance_count: u32,
 }
-
 
 #[derive(Clone, Copy)]
 struct CompiledView {
@@ -100,6 +112,10 @@ pub struct Renderer {
     color_format: wgpu::TextureFormat,
     display_pipeline: wgpu::RenderPipeline,
     sensor_pipelines: Vec<Option<wgpu::RenderPipeline>>,
+    skybox_pipeline: wgpu::RenderPipeline,
+    skybox_bind_group_layout: wgpu::BindGroupLayout,
+    skybox_texture: wgpu::Texture,
+    skybox_bind_group: wgpu::BindGroup,
     globals: wgpu::Buffer,
     globals_layout: wgpu::BindGroupLayout,
     globals_capacity: usize,
@@ -127,6 +143,7 @@ impl Renderer {
         instance: &wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'_>>,
     ) -> Result<Self, RendererError> {
+        #[cfg(not(target_arch = "wasm32"))]
         let _profiler = profiling::tracy_client::Client::start();
         profiling::function_scope!();
         let preferred_adapter = wgpu::RequestAdapterOptions {
@@ -156,11 +173,16 @@ impl Renderer {
                     .or_else(|| capabilities.formats.first().copied())
             })
             .unwrap_or(COLOR_FORMAT);
+        let limits = if cfg!(target_arch = "wasm32") {
+            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits())
+        } else {
+            wgpu::Limits::default()
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sim-graphics device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: limits,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
@@ -169,9 +191,10 @@ impl Renderer {
             .map_err(RendererError::RequestDevice)?;
 
         let globals_capacity = 8;
-        let globals_stride = device.limits().min_uniform_buffer_offset_alignment.max(
-            u32::try_from(size_of::<Globals>()).expect("globals size exceeds u32"),
-        );
+        let globals_stride = device
+            .limits()
+            .min_uniform_buffer_offset_alignment
+            .max(u32::try_from(size_of::<Globals>()).expect("globals size exceeds u32"));
         let globals = create_globals_buffer(&device, globals_capacity, globals_stride);
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene globals layout"),
@@ -232,9 +255,77 @@ impl Renderer {
                 &targets,
             )));
         }
+        let skybox_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("skybox bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let default_sky_width = 512;
+        let default_sky_height = 256;
+        let default_sky_data = generate_default_skybox_rgba(default_sky_width, default_sky_height);
+        let (skybox_texture, skybox_bind_group) = create_skybox_texture_and_bind_group(
+            &device,
+            &queue,
+            &skybox_bind_group_layout,
+            default_sky_width,
+            default_sky_height,
+            &default_sky_data,
+        );
+        let skybox_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("skybox pipeline layout"),
+                bind_group_layouts: &[Some(&globals_layout), Some(&skybox_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let skybox_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("skybox pipeline"),
+            layout: Some(&skybox_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_skybox"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_skybox"),
+                compilation_options: Default::default(),
+                targets: &[Some(color_target(color_format))],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let instance_capacity = 64;
         let instance_buffer = create_instance_buffer(&device, instance_capacity);
-
         Ok(Self {
             adapter,
             device,
@@ -242,6 +333,10 @@ impl Renderer {
             color_format,
             display_pipeline,
             sensor_pipelines,
+            skybox_pipeline,
+            skybox_bind_group_layout,
+            skybox_texture,
+            skybox_bind_group,
             globals,
             globals_layout,
             globals_capacity,
@@ -300,6 +395,47 @@ impl Renderer {
             indices,
             index_count,
         }))
+    }
+
+    pub fn set_skybox_rgba(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba_data: &[u8],
+    ) -> Result<(), RendererError> {
+        if (width * height * 4) as usize != rgba_data.len() {
+            return Err(RendererError::SkyboxImageError(format!(
+                "RGBA data length {} does not match dimensions {}x{}",
+                rgba_data.len(),
+                width,
+                height
+            )));
+        }
+        let (texture, bind_group) = create_skybox_texture_and_bind_group(
+            &self.device,
+            &self.queue,
+            &self.skybox_bind_group_layout,
+            width,
+            height,
+            rgba_data,
+        );
+        self.skybox_texture = texture;
+        self.skybox_bind_group = bind_group;
+        Ok(())
+    }
+
+    pub fn set_skybox_from_image_bytes(&mut self, bytes: &[u8]) -> Result<(), RendererError> {
+        let img = image::load_from_memory(bytes)
+            .map_err(|err| RendererError::SkyboxImageError(err.to_string()))?;
+        let rgba = dynamic_image_to_srgb_rgba8(&img);
+        self.set_skybox_rgba(rgba.width(), rgba.height(), &rgba)
+    }
+
+    pub fn load_skybox(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), RendererError> {
+        let img = image::open(path)
+            .map_err(|err| RendererError::SkyboxImageError(err.to_string()))?;
+        let rgba = dynamic_image_to_srgb_rgba8(&img);
+        self.set_skybox_rgba(rgba.width(), rgba.height(), &rgba)
     }
 
     pub fn remove_mesh(&mut self, handle: MeshHandle) -> bool {
@@ -415,13 +551,23 @@ impl Renderer {
                 );
             }
             for (index, view) in frame.views().iter().enumerate() {
+                let view_proj = view
+                    .camera
+                    .view_projection(view.width as f32 / view.height as f32);
+                let inv_view_proj = view_proj.inverse();
                 let globals = Globals {
                     view: view.camera.view().to_cols_array_2d(),
-                    view_projection: view
-                        .camera
-                        .view_projection(view.width as f32 / view.height as f32)
-                        .to_cols_array_2d(),
-                    light_direction: [0.35, 0.8, 0.45, 0.0],
+                    view_projection: view_proj.to_cols_array_2d(),
+                    inv_view_projection: inv_view_proj.to_cols_array_2d(),
+                    camera_position: [
+                        view.camera.eye.x,
+                        view.camera.eye.y,
+                        view.camera.eye.z,
+                        1.0,
+                    ],
+                    light_direction: [0.55, 0.78, 0.30, 0.0],
+                    light_color: [1.40, 1.35, 1.25, 1.0],
+                    ambient_color: [0.42, 0.46, 0.52, 1.0],
                 };
                 self.queue.write_buffer(
                     &self.globals,
@@ -468,6 +614,10 @@ impl Renderer {
                         &self.meshes,
                         &self.batches,
                     );
+                    pass.set_pipeline(&self.skybox_pipeline);
+                    pass.set_bind_group(0, &self.globals_bind_group, &[dynamic_offset]);
+                    pass.set_bind_group(1, &self.skybox_bind_group, &[]);
+                    pass.draw(0..3, 0..1);
                 }
                 ViewKind::Sensor => {
                     profiling::scope!("sensor pass");
@@ -499,8 +649,12 @@ impl Renderer {
                     let depth_attachment = self
                         .texture_pool
                         .view(compiled.depth_attachment.expect("sensor depth attachment"));
-                    let mut pass =
-                        begin_pass(&mut encoder, "sensor pass", &color_attachments, depth_attachment);
+                    let mut pass = begin_pass(
+                        &mut encoder,
+                        "sensor pass",
+                        &color_attachments,
+                        depth_attachment,
+                    );
                     let pipeline = self.sensor_pipelines[compiled.request.outputs.bits() as usize]
                         .as_ref()
                         .expect("sensor views request at least one output");
@@ -517,31 +671,31 @@ impl Renderer {
 
                     {
                         profiling::scope!("schedule sensor readbacks");
-                    for (output, texture_index) in [
-                        (OutputKind::Color, compiled.color),
-                        (OutputKind::Depth, compiled.depth),
-                        (OutputKind::ObjectId, compiled.object_id),
-                    ] {
-                        let Some(texture_index) = texture_index else {
-                            continue;
-                        };
-                        let handle = self
-                            .readbacks
-                            .schedule(
-                                &self.device,
-                                &mut encoder,
-                                compiled.request.key,
-                                output,
-                                self.texture_pool.texture(texture_index),
-                                compiled.request.width,
-                                compiled.request.height,
-                            )
-                            .ok_or(RendererError::ReadbackRingFull {
-                                view: compiled.request.key,
-                                output,
-                            })?;
-                        readbacks.push(handle);
-                    }
+                        for (output, texture_index) in [
+                            (OutputKind::Color, compiled.color),
+                            (OutputKind::Depth, compiled.depth),
+                            (OutputKind::ObjectId, compiled.object_id),
+                        ] {
+                            let Some(texture_index) = texture_index else {
+                                continue;
+                            };
+                            let handle = self
+                                .readbacks
+                                .schedule(
+                                    &self.device,
+                                    &mut encoder,
+                                    compiled.request.key,
+                                    output,
+                                    self.texture_pool.texture(texture_index),
+                                    compiled.request.width,
+                                    compiled.request.height,
+                                )
+                                .ok_or(RendererError::ReadbackRingFull {
+                                    view: compiled.request.key,
+                                    output,
+                                })?;
+                            readbacks.push(handle);
+                        }
                     }
                 }
             }
@@ -583,11 +737,8 @@ impl Renderer {
         self.globals_capacity = required.next_power_of_two();
         self.globals =
             create_globals_buffer(&self.device, self.globals_capacity, self.globals_stride);
-        self.globals_bind_group = create_globals_bind_group(
-            &self.device,
-            &self.globals_layout,
-            &self.globals,
-        );
+        self.globals_bind_group =
+            create_globals_bind_group(&self.device, &self.globals_layout, &self.globals);
     }
 }
 
@@ -747,11 +898,7 @@ fn create_target(
     })
 }
 
-fn create_globals_buffer(
-    device: &wgpu::Device,
-    capacity: usize,
-    stride: u32,
-) -> wgpu::Buffer {
+fn create_globals_buffer(device: &wgpu::Device, capacity: usize, stride: u32) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("view globals"),
         size: capacity as u64 * u64::from(stride),
@@ -917,5 +1064,160 @@ fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
         array_stride: size_of::<Instance>() as u64,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &INSTANCE_ATTRIBUTES,
+    }
+}
+fn create_skybox_texture_and_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    width: u32,
+    height: u32,
+    rgba_data: &[u8],
+) -> (wgpu::Texture, wgpu::BindGroup) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("skybox texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba_data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("skybox sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..Default::default()
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("skybox bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+
+    (texture, bind_group)
+}
+
+fn generate_default_skybox_rgba(width: u32, height: u32) -> Vec<u8> {
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        let v = y as f32 / (height - 1) as f32;
+        let (r, g, b) = if v < 0.5 {
+            let t = v / 0.5;
+            (
+                0.15 + (0.80 - 0.15) * t.powf(0.6),
+                0.40 + (0.85 - 0.40) * t.powf(0.6),
+                0.85 + (0.95 - 0.85) * t.powf(0.6),
+            )
+        } else {
+            let t = (v - 0.5) / 0.5;
+            (
+                0.80 + (0.08 - 0.80) * t.powf(0.4),
+                0.85 + (0.10 - 0.85) * t.powf(0.4),
+                0.95 + (0.14 - 0.95) * t.powf(0.4),
+            )
+        };
+        for _x in 0..width {
+            pixels.push((r.clamp(0.0, 1.0) * 255.0) as u8);
+            pixels.push((g.clamp(0.0, 1.0) * 255.0) as u8);
+            pixels.push((b.clamp(0.0, 1.0) * 255.0) as u8);
+            pixels.push(255);
+        }
+    }
+    pixels
+}
+fn dynamic_image_to_srgb_rgba8(img: &image::DynamicImage) -> image::RgbaImage {
+    let aces_tonemap = |x: f32| -> f32 {
+        let a = 2.51;
+        let b = 0.03;
+        let c = 2.43;
+        let d = 0.59;
+        let e = 0.14;
+        ((x * (a * x + b)) / (x * (c * x + d) + e)).clamp(0.0, 1.0)
+    };
+
+    let to_srgb = |c: f32| -> u8 {
+        let s = if c <= 0.0031308 {
+            12.92 * c
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (s.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+
+    match img {
+        image::DynamicImage::ImageRgb32F(f_img) => {
+            let (width, height) = (f_img.width(), f_img.height());
+            let mut out = image::RgbaImage::new(width, height);
+            for (x, y, pixel) in f_img.enumerate_pixels() {
+                let r = aces_tonemap(pixel[0].max(0.0));
+                let g = aces_tonemap(pixel[1].max(0.0));
+                let b = aces_tonemap(pixel[2].max(0.0));
+                out.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([to_srgb(r), to_srgb(g), to_srgb(b), 255]),
+                );
+            }
+            out
+        }
+        image::DynamicImage::ImageRgba32F(f_img) => {
+            let (width, height) = (f_img.width(), f_img.height());
+            let mut out = image::RgbaImage::new(width, height);
+            for (x, y, pixel) in f_img.enumerate_pixels() {
+                let r = aces_tonemap(pixel[0].max(0.0));
+                let g = aces_tonemap(pixel[1].max(0.0));
+                let b = aces_tonemap(pixel[2].max(0.0));
+                let a = (pixel[3].clamp(0.0, 1.0) * 255.0).round() as u8;
+                out.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([to_srgb(r), to_srgb(g), to_srgb(b), a]),
+                );
+            }
+            out
+        }
+        other => other.to_rgba8(),
     }
 }

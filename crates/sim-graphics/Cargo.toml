@@ -8,8 +8,12 @@ rust-version.workspace = true
 [dependencies]
 bytemuck.workspace = true
 glam.workspace = true
+image.workspace = true
 profiling.workspace = true
 wgpu.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+profiling = { version = "1.0.18", features = ["profile-with-tracy"] }
 
 [dev-dependencies]
 pollster.workspace = true

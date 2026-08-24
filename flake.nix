@@ -44,6 +44,7 @@
               "rust-src"
               "rustfmt"
             ];
+            targets = [ "wasm32-unknown-unknown" ];
           };
 
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
@@ -51,13 +52,16 @@
         {
           default = craneLib.devShell {
             packages = with pkgs; [
+              binaryen
               cargo-audit
               cargo-edit
               cargo-nextest
               pkg-config
-              tracy
+              tracy_0_11
+              trunk
               vulkan-loader
               vulkan-tools
+              wasm-bindgen-cli
               wayland
             ];
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [

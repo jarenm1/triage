@@ -16,8 +16,30 @@ rust-version = "1.87"
 anyhow = "1.0"
 bytemuck = { version = "1.24", features = ["derive"] }
 glam = { version = "0.30", features = ["bytemuck"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "webp", "exr"] }
 pollster = "0.4"
-profiling = { version = "1.0.18", features = ["profile-with-tracy"] }
-wgpu = "30.0.1"
+profiling = "1.0.18"
+wgpu = { version = "30.0.1", features = ["webgl"] }
 winit = "0.30.12"
+web-time = "1.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+console_log = "1.0"
+log = "0.4"
+web-sys = { version = "0.3", features = [
+  "Document",
+  "Element",
+  "HtmlCanvasElement",
+  "Node",
+  "Window",
+  "CssStyleDeclaration",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 2

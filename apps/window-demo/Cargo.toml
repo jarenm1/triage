@@ -7,5 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 glam.workspace = true
+image.workspace = true
 sim-graphics = { path = "../../crates/sim-graphics" }
 sim-graphics-winit = { path = "../../crates/sim-graphics-winit" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
