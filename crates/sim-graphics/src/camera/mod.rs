@@ -11,8 +11,12 @@ pub struct Camera {
 }
 
 impl Camera {
+    pub fn view(self) -> Mat4 {
+        Mat4::look_at_rh(self.eye, self.target, self.up)
+    }
+
     pub fn view_projection(self, aspect: f32) -> Mat4 {
-        let view = Mat4::look_at_rh(self.eye, self.target, self.up);
+        let view = self.view();
         let projection =
             Mat4::perspective_rh(self.vertical_fov_radians, aspect, self.near, self.far);
         projection * view

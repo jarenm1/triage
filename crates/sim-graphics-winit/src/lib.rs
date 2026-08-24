@@ -1,6 +1,9 @@
 use std::{sync::Arc, time::Instant};
 
-use sim_graphics::{DepthTarget, Frame, RenderTarget, Renderer, RendererError};
+use sim_graphics::{
+    DepthTarget, ExternalView, Frame, OutputKind, ReadbackData, ReadbackHandle, Renderer,
+    RendererError, ViewKey, ViewKind,
+};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
@@ -14,7 +17,15 @@ pub trait Scene {
         Ok(())
     }
 
-    fn frame(&mut self, elapsed_seconds: f32) -> &Frame;
+    fn frame(&mut self, elapsed_seconds: f32, width: u32, height: u32) -> &Frame;
+
+    fn sensor_output(
+        &mut self,
+        _view: ViewKey,
+        _output: OutputKind,
+        _data: ReadbackData,
+    ) {
+    }
 }
 
 #[derive(Debug)]
@@ -23,6 +34,7 @@ pub enum WindowError {
     Window(winit::error::OsError),
     CreateSurface(wgpu::CreateSurfaceError),
     Renderer(RendererError),
+    MissingDisplayView,
     SurfaceValidation,
 }
 
@@ -33,6 +45,7 @@ impl std::fmt::Display for WindowError {
             Self::Window(error) => write!(f, "creating the window failed: {error}"),
             Self::CreateSurface(error) => write!(f, "creating the window surface failed: {error}"),
             Self::Renderer(error) => write!(f, "creating the renderer failed: {error}"),
+            Self::MissingDisplayView => write!(f, "window frame has no display view"),
             Self::SurfaceValidation => write!(f, "surface texture acquisition failed validation"),
         }
     }
@@ -77,6 +90,7 @@ struct WindowState {
     renderer: Renderer,
     depth: DepthTarget,
     config: wgpu::SurfaceConfiguration,
+    pending_readbacks: Vec<ReadbackHandle>,
 }
 
 impl<S: Scene> ApplicationHandler for WindowApplication<S> {
@@ -119,8 +133,16 @@ impl<S: Scene> ApplicationHandler for WindowApplication<S> {
             WindowEvent::Resized(size) => window.resize(size),
             WindowEvent::RedrawRequested => {
                 profiling::scope!("window frame");
-                let frame = self.scene.frame(self.started.elapsed().as_secs_f32());
+                let frame = self.scene.frame(
+                    self.started.elapsed().as_secs_f32(),
+                    window.config.width,
+                    window.config.height,
+                );
                 if let Err(error) = window.render(frame) {
+                    self.error = Some(error);
+                    event_loop.exit();
+                }
+                if let Err(error) = window.poll_outputs(&mut self.scene) {
                     self.error = Some(error);
                     event_loop.exit();
                 }
@@ -178,6 +200,7 @@ impl WindowState {
             renderer,
             depth,
             config,
+            pending_readbacks: Vec::new(),
         })
     }
 
@@ -217,20 +240,44 @@ impl WindowState {
             }
         };
         let color = surface_texture.texture.create_view(&Default::default());
-        self.renderer
-            .render(
-                RenderTarget {
+        let display_view = frame
+            .first_view(ViewKind::Display)
+            .ok_or(WindowError::MissingDisplayView)?;
+        let submission = self
+            .renderer
+            .execute(
+                frame,
+                &[ExternalView {
+                    view: display_view,
                     color: &color,
                     depth: self.depth.view(),
-                    width: self.config.width,
-                    height: self.config.height,
-                },
-                frame,
+                }],
             )
             .map_err(WindowError::Renderer)?;
+        self.pending_readbacks.extend(submission.readbacks);
         self.renderer.present(surface_texture);
         if reconfigure_after_present {
             self.resize(self.window.inner_size());
+        }
+        Ok(())
+    }
+
+    fn poll_outputs(&mut self, scene: &mut impl Scene) -> Result<(), WindowError> {
+        profiling::scope!("poll sensor readbacks");
+        let mut index = 0;
+        while index < self.pending_readbacks.len() {
+            let handle = self.pending_readbacks[index];
+            match self
+                .renderer
+                .poll_readback(handle)
+                .map_err(WindowError::Renderer)?
+            {
+                Some(data) => {
+                    self.pending_readbacks.swap_remove(index);
+                    scene.sensor_output(handle.view(), handle.output(), data);
+                }
+                None => index += 1,
+            }
         }
         Ok(())
     }

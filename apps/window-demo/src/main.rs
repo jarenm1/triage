@@ -1,7 +1,10 @@
 use std::f32::consts::FRAC_PI_4;
 
 use glam::{Mat4, Quat, Vec3};
-use sim_graphics::{Camera, Frame, MeshData, MeshHandle, RenderPrimitive, Renderer, RendererError};
+use sim_graphics::{
+    Camera, Frame, MeshData, MeshHandle, RenderPrimitive, RenderView, Renderer, RendererError,
+    ViewKey, ViewKind, ViewOutputs,
+};
 use sim_graphics_winit::Scene;
 
 fn main() -> Result<(), sim_graphics_winit::WindowError> {
@@ -16,7 +19,7 @@ struct DemoScene {
 impl DemoScene {
     fn new() -> Self {
         Self {
-            frame: Frame::with_capacity(camera(0.0), 401),
+            frame: Frame::with_capacity(401, 2),
             meshes: None,
         }
     }
@@ -31,11 +34,27 @@ impl Scene for DemoScene {
         Ok(())
     }
 
-    fn frame(&mut self, elapsed_seconds: f32) -> &Frame {
+    fn frame(&mut self, elapsed_seconds: f32, width: u32, height: u32) -> &Frame {
         let (cube_mesh, plane_mesh) = self
             .meshes
             .expect("the window adapter initializes scenes before rendering");
-        self.frame.begin(camera(elapsed_seconds));
+        self.frame.begin();
+        self.frame.add_view(RenderView {
+            key: ViewKey(0),
+            kind: ViewKind::Display,
+            camera: camera(elapsed_seconds),
+            width,
+            height,
+            outputs: ViewOutputs::COLOR,
+        });
+        self.frame.add_view(RenderView {
+            key: ViewKey(1),
+            kind: ViewKind::Sensor,
+            camera: camera(elapsed_seconds),
+            width: 640,
+            height: 480,
+            outputs: ViewOutputs::COLOR | ViewOutputs::DEPTH | ViewOutputs::OBJECT_ID,
+        });
         self.frame.draw(RenderPrimitive {
             mesh: plane_mesh,
             transform: Mat4::from_scale_rotation_translation(
@@ -44,6 +63,7 @@ impl Scene for DemoScene {
                 Vec3::new(0.0, -0.5, 0.0),
             ),
             color: [0.18, 0.22, 0.26, 1.0],
+            object_id: 1,
         });
         for z in -10_i32..10 {
             for x in -10_i32..10 {
@@ -56,6 +76,7 @@ impl Scene for DemoScene {
                         0.78,
                         1.0,
                     ],
+                    object_id: ((z + 10) * 20 + (x + 10) + 2) as u32,
                 });
             }
         }

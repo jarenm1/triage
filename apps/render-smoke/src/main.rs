@@ -2,7 +2,10 @@ use std::{f32::consts::FRAC_PI_4, path::PathBuf};
 
 use anyhow::{Context, Result};
 use glam::{Mat4, Quat, Vec3};
-use sim_graphics::{Camera, Frame, MeshData, OffscreenTarget, RenderPrimitive, Renderer};
+use sim_graphics::{
+    Camera, Frame, MeshData, OutputKind, ReadbackData, RenderPrimitive, RenderView, Renderer,
+    ViewKey, ViewKind, ViewOutputs,
+};
 
 fn main() -> Result<()> {
     pollster::block_on(run())
@@ -16,7 +19,6 @@ async fn run() -> Result<()> {
     let (width, height) = (960, 540);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let mut renderer = Renderer::new(&instance, None).await?;
-    let target = OffscreenTarget::new(&renderer, width, height);
     let cube_mesh = renderer.register_mesh(MeshData::cube())?;
     let plane_mesh = renderer.register_mesh(MeshData::plane())?;
     let camera = Camera {
@@ -27,7 +29,15 @@ async fn run() -> Result<()> {
         near: 0.1,
         far: 100.0,
     };
-    let mut frame = Frame::with_capacity(camera, 401);
+    let mut frame = Frame::with_capacity(401, 1);
+    frame.add_view(RenderView {
+        key: ViewKey(1),
+        kind: ViewKind::Sensor,
+        camera,
+        width,
+        height,
+        outputs: ViewOutputs::COLOR | ViewOutputs::DEPTH | ViewOutputs::OBJECT_ID,
+    });
 
     frame.draw(RenderPrimitive {
         mesh: plane_mesh,
@@ -37,6 +47,7 @@ async fn run() -> Result<()> {
             Vec3::new(0.0, -0.5, 0.0),
         ),
         color: [0.18, 0.22, 0.26, 1.0],
+        object_id: 1,
     });
     for z in -10_i32..10 {
         for x in -10_i32..10 {
@@ -56,11 +67,22 @@ async fn run() -> Result<()> {
                 mesh: cube_mesh,
                 transform: Mat4::from_scale_rotation_translation(scale, Quat::IDENTITY, position),
                 color,
+                object_id: ((z + 10) * 20 + (x + 10) + 2) as u32,
             });
         }
     }
-    renderer.render(target.render_target(), &frame)?;
-    let pixels = target.read_rgba(&renderer).await?;
+    let submission = renderer.execute(&frame, &[])?;
+    let color = submission
+        .readbacks
+        .into_iter()
+        .find(|handle| handle.output() == OutputKind::Color)
+        .context("sensor color readback was not scheduled")?;
+    let pixels = loop {
+        if let Some(ReadbackData::Color(pixels)) = renderer.poll_readback(color)? {
+            break pixels;
+        }
+        std::thread::yield_now();
+    };
     image::save_buffer(&output, &pixels, width, height, image::ColorType::Rgba8)
         .with_context(|| format!("saving {}", output.display()))?;
     println!(

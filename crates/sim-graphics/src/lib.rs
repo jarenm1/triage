@@ -5,11 +5,13 @@ use wgpu::util::DeviceExt;
 
 mod camera;
 mod frame;
+mod graph;
 mod primitive;
 mod resource;
 
 pub use camera::Camera;
-pub use frame::Frame;
+pub use frame::{Frame, RenderView, ViewId, ViewKey, ViewKind, ViewOutputs};
+pub use graph::{ExternalView, FrameSubmission, OutputKind, ReadbackData, ReadbackHandle};
 pub use primitive::{Mesh, MeshData, MeshHandle, MeshVertex, RenderPrimitive};
 pub use resource::{Handle, ResourceRegistry};
 
@@ -25,6 +27,9 @@ pub enum RendererError {
     EmptyMesh,
     InvalidMeshHandle(MeshHandle),
     ReadbackFailed,
+    ReadbackRingFull { view: ViewKey, output: OutputKind },
+    MissingExternalView(ViewId),
+    InvalidReadbackHandle,
 }
 
 impl std::fmt::Display for RendererError {
@@ -43,6 +48,11 @@ impl std::fmt::Display for RendererError {
                 write!(f, "frame references missing mesh {handle:?}")
             }
             Self::ReadbackFailed => write!(f, "GPU readback failed"),
+            Self::ReadbackRingFull { view, output } => {
+                write!(f, "readback ring for view {view:?} output {output:?} is full")
+            }
+            Self::InvalidReadbackHandle => write!(f, "readback handle is stale or failed"),
+            Self::MissingExternalView(view) => write!(f, "display view {view:?} has no external target"),
         }
     }
 }
@@ -54,11 +64,14 @@ impl std::error::Error for RendererError {}
 struct Instance {
     model: [[f32; 4]; 4],
     color: [f32; 4],
+    object_id: u32,
+    padding: [u32; 3],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Globals {
+    view: [[f32; 4]; 4],
     view_projection: [[f32; 4]; 4],
     light_direction: [f32; 4],
 }
@@ -70,19 +83,36 @@ struct DrawBatch {
     instance_count: u32,
 }
 
+
+#[derive(Clone, Copy)]
+struct CompiledView {
+    request: RenderView,
+    external: Option<usize>,
+    color: Option<usize>,
+    depth: Option<usize>,
+    object_id: Option<usize>,
+    depth_attachment: Option<usize>,
+}
 pub struct Renderer {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     color_format: wgpu::TextureFormat,
-    pipeline: wgpu::RenderPipeline,
+    display_pipeline: wgpu::RenderPipeline,
+    sensor_pipelines: Vec<Option<wgpu::RenderPipeline>>,
     globals: wgpu::Buffer,
+    globals_layout: wgpu::BindGroupLayout,
+    globals_capacity: usize,
+    globals_stride: u32,
     globals_bind_group: wgpu::BindGroup,
     meshes: ResourceRegistry<Mesh>,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     instances: Vec<Instance>,
     batches: Vec<DrawBatch>,
+    texture_pool: graph::TexturePool,
+    readbacks: graph::ReadbackRing,
+    compiled_views: Vec<CompiledView>,
 }
 
 pub struct RenderTarget<'a> {
@@ -138,11 +168,11 @@ impl Renderer {
             .await
             .map_err(RendererError::RequestDevice)?;
 
-        let globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("scene globals"),
-            contents: bytemuck::bytes_of(&Globals::zeroed()),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let globals_capacity = 8;
+        let globals_stride = device.limits().min_uniform_buffer_offset_alignment.max(
+            u32::try_from(size_of::<Globals>()).expect("globals size exceeds u32"),
+        );
+        let globals = create_globals_buffer(&device, globals_capacity, globals_stride);
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene globals layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -150,8 +180,8 @@ impl Renderer {
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(size_of::<Globals>() as u64),
                 },
                 count: None,
             }],
@@ -161,7 +191,11 @@ impl Renderer {
             layout: &globals_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: globals.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &globals,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(size_of::<Globals>() as u64),
+                }),
             }],
         });
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
@@ -170,40 +204,34 @@ impl Renderer {
             bind_group_layouts: &[Some(&globals_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("instanced primitive pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(vertex_layout()), Some(instance_layout())],
-            },
-            primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let display_pipeline = create_render_pipeline(
+            &device,
+            &pipeline_layout,
+            &shader,
+            "display primitive pipeline",
+            "fs_display",
+            &[Some(color_target(color_format))],
+        );
+        let mut sensor_pipelines = Vec::with_capacity(8);
+        sensor_pipelines.push(None);
+        for mask in 1_u8..8 {
+            let targets = [
+                (mask & ViewOutputs::COLOR.bits() != 0)
+                    .then(|| color_target(graph::SENSOR_COLOR_FORMAT)),
+                (mask & ViewOutputs::DEPTH.bits() != 0)
+                    .then(|| color_target(graph::SENSOR_DEPTH_FORMAT)),
+                (mask & ViewOutputs::OBJECT_ID.bits() != 0)
+                    .then(|| color_target(graph::SENSOR_OBJECT_ID_FORMAT)),
+            ];
+            sensor_pipelines.push(Some(create_render_pipeline(
+                &device,
+                &pipeline_layout,
+                &shader,
+                "sensor primitive pipeline",
+                "fs_sensor",
+                &targets,
+            )));
+        }
         let instance_capacity = 64;
         let instance_buffer = create_instance_buffer(&device, instance_capacity);
 
@@ -212,14 +240,21 @@ impl Renderer {
             device,
             queue,
             color_format,
-            pipeline,
+            display_pipeline,
+            sensor_pipelines,
             globals,
+            globals_layout,
+            globals_capacity,
+            globals_stride,
             globals_bind_group,
             meshes: ResourceRegistry::new(),
             instance_buffer,
             instance_capacity,
             instances: Vec::with_capacity(instance_capacity),
             batches: Vec::new(),
+            texture_pool: graph::TexturePool::new(),
+            readbacks: graph::ReadbackRing::new(),
+            compiled_views: Vec::new(),
         })
     }
 
@@ -271,25 +306,21 @@ impl Renderer {
         self.meshes.remove(handle).is_some()
     }
 
-    pub fn render(
+    pub fn execute(
         &mut self,
-        target: RenderTarget<'_>,
         frame: &Frame,
-    ) -> Result<wgpu::SubmissionIndex, RendererError> {
+        external_views: &[ExternalView<'_>],
+    ) -> Result<FrameSubmission, RendererError> {
         profiling::function_scope!();
-        assert!(
-            target.width > 0 && target.height > 0,
-            "render dimensions must be non-zero"
-        );
         {
-            profiling::scope!("prepare frame");
+            profiling::scope!("extract world");
             let primitive_count = frame.primitives().len();
             u32::try_from(primitive_count)
                 .map_err(|_| RendererError::TooManyInstances(primitive_count))?;
             self.ensure_instance_capacity(primitive_count);
+            self.ensure_globals_capacity(frame.views().len());
             self.instances.clear();
             self.batches.clear();
-
             for primitive in frame.primitives() {
                 if self.meshes.get(primitive.mesh).is_none() {
                     return Err(RendererError::InvalidMeshHandle(primitive.mesh));
@@ -297,11 +328,11 @@ impl Renderer {
                 self.instances.push(Instance {
                     model: primitive.transform.to_cols_array_2d(),
                     color: primitive.color,
+                    object_id: primitive.object_id,
+                    padding: [0; 3],
                 });
                 match self.batches.last_mut() {
-                    Some(batch) if batch.mesh == primitive.mesh => {
-                        batch.instance_count += 1;
-                    }
+                    Some(batch) if batch.mesh == primitive.mesh => batch.instance_count += 1,
                     _ => self.batches.push(DrawBatch {
                         mesh: primitive.mesh,
                         first_instance: (self.instances.len() - 1) as u32,
@@ -310,8 +341,71 @@ impl Renderer {
                 }
             }
         }
+
         {
-            profiling::scope!("upload frame");
+            profiling::scope!("compile frame graph");
+            self.texture_pool.begin_frame();
+            self.compiled_views.clear();
+            for (view_index, view) in frame.views().iter().copied().enumerate() {
+                match view.kind {
+                    ViewKind::Display => {
+                        let external = external_views
+                            .iter()
+                            .position(|external| external.view.index() == view_index)
+                            .ok_or(RendererError::MissingExternalView(ViewId::from_index(
+                                view_index,
+                            )))?;
+                        self.compiled_views.push(CompiledView {
+                            request: view,
+                            external: Some(external),
+                            color: None,
+                            depth: None,
+                            object_id: None,
+                            depth_attachment: None,
+                        });
+                    }
+                    ViewKind::Sensor => {
+                        let usage =
+                            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+                        let mut acquire = |format| {
+                            self.texture_pool.acquire(
+                                &self.device,
+                                graph::TextureKey {
+                                    width: view.width,
+                                    height: view.height,
+                                    format,
+                                    usage,
+                                },
+                            )
+                        };
+                        let color = view
+                            .outputs
+                            .contains(ViewOutputs::COLOR)
+                            .then(|| acquire(graph::SENSOR_COLOR_FORMAT));
+                        let depth = view
+                            .outputs
+                            .contains(ViewOutputs::DEPTH)
+                            .then(|| acquire(graph::SENSOR_DEPTH_FORMAT));
+                        let object_id = view
+                            .outputs
+                            .contains(ViewOutputs::OBJECT_ID)
+                            .then(|| acquire(graph::SENSOR_OBJECT_ID_FORMAT));
+                        let depth_attachment = Some(acquire(DEPTH_FORMAT));
+                        self.compiled_views.push(CompiledView {
+                            request: view,
+                            external: None,
+                            color,
+                            depth,
+                            object_id,
+                            depth_attachment,
+                        });
+                    }
+                }
+            }
+        }
+
+        {
+            profiling::scope!("upload instances and views");
             if !self.instances.is_empty() {
                 self.queue.write_buffer(
                     &self.instance_buffer,
@@ -319,70 +413,151 @@ impl Renderer {
                     bytemuck::cast_slice(&self.instances),
                 );
             }
-            let globals = Globals {
-                view_projection: frame
-                    .camera()
-                    .view_projection(target.width as f32 / target.height as f32)
-                    .to_cols_array_2d(),
-                light_direction: [0.35, 0.8, 0.45, 0.0],
-            };
-            self.queue
-                .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
+            for (index, view) in frame.views().iter().enumerate() {
+                let globals = Globals {
+                    view: view.camera.view().to_cols_array_2d(),
+                    view_projection: view
+                        .camera
+                        .view_projection(view.width as f32 / view.height as f32)
+                        .to_cols_array_2d(),
+                    light_direction: [0.35, 0.8, 0.45, 0.0],
+                };
+                self.queue.write_buffer(
+                    &self.globals,
+                    index as u64 * u64::from(self.globals_stride),
+                    bytemuck::bytes_of(&globals),
+                );
+            }
         }
 
-        profiling::scope!("encode and submit");
+        profiling::scope!("encode frame graph");
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("scene encoder"),
+                label: Some("frame graph encoder"),
             });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target.color,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
+        let mut readbacks = Vec::new();
+        for (view_index, compiled) in self.compiled_views.iter().copied().enumerate() {
+            let dynamic_offset = view_index as u32 * self.globals_stride;
+            match compiled.request.kind {
+                ViewKind::Display => {
+                    let external = external_views[compiled.external.expect("display target")];
+                    let color_attachments = [Some(color_attachment(
+                        external.color,
+                        wgpu::Color {
                             r: 0.015,
                             g: 0.025,
                             b: 0.045,
                             a: 1.0,
+                        },
+                    ))];
+                    let mut pass = begin_pass(
+                        &mut encoder,
+                        "display pass",
+                        &color_attachments,
+                        external.depth,
+                    );
+                    encode_batches(
+                        &mut pass,
+                        &self.display_pipeline,
+                        &self.globals_bind_group,
+                        dynamic_offset,
+                        &self.instance_buffer,
+                        &self.meshes,
+                        &self.batches,
+                    );
+                }
+                ViewKind::Sensor => {
+                    let color_attachments = [
+                        compiled.color.map(|index| {
+                            color_attachment(
+                                self.texture_pool.view(index),
+                                wgpu::Color::TRANSPARENT,
+                            )
                         }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: target.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.globals_bind_group, &[]);
-            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            for batch in &self.batches {
-                let mesh = self
-                    .meshes
-                    .get(batch.mesh)
-                    .expect("mesh handles were validated before encoding");
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(
-                    0..mesh.index_count,
-                    0,
-                    batch.first_instance..batch.first_instance + batch.instance_count,
-                );
+                        compiled.depth.map(|index| {
+                            color_attachment(
+                                self.texture_pool.view(index),
+                                wgpu::Color {
+                                    r: compiled.request.camera.far as f64,
+                                    g: 0.0,
+                                    b: 0.0,
+                                    a: 0.0,
+                                },
+                            )
+                        }),
+                        compiled.object_id.map(|index| {
+                            color_attachment(
+                                self.texture_pool.view(index),
+                                wgpu::Color::TRANSPARENT,
+                            )
+                        }),
+                    ];
+                    let depth_attachment = self
+                        .texture_pool
+                        .view(compiled.depth_attachment.expect("sensor depth attachment"));
+                    let mut pass =
+                        begin_pass(&mut encoder, "sensor pass", &color_attachments, depth_attachment);
+                    let pipeline = self.sensor_pipelines[compiled.request.outputs.bits() as usize]
+                        .as_ref()
+                        .expect("sensor views request at least one output");
+                    encode_batches(
+                        &mut pass,
+                        pipeline,
+                        &self.globals_bind_group,
+                        dynamic_offset,
+                        &self.instance_buffer,
+                        &self.meshes,
+                        &self.batches,
+                    );
+                    drop(pass);
+
+                    for (output, texture_index) in [
+                        (OutputKind::Color, compiled.color),
+                        (OutputKind::Depth, compiled.depth),
+                        (OutputKind::ObjectId, compiled.object_id),
+                    ] {
+                        let Some(texture_index) = texture_index else {
+                            continue;
+                        };
+                        let handle = self
+                            .readbacks
+                            .schedule(
+                                &self.device,
+                                &mut encoder,
+                                compiled.request.key,
+                                output,
+                                self.texture_pool.texture(texture_index),
+                                compiled.request.width,
+                                compiled.request.height,
+                            )
+                            .ok_or(RendererError::ReadbackRingFull {
+                                view: compiled.request.key,
+                                output,
+                            })?;
+                        readbacks.push(handle);
+                    }
+                }
             }
         }
-        Ok(self.queue.submit(Some(encoder.finish())))
+        let submission = self.queue.submit(Some(encoder.finish()));
+        self.readbacks.begin_mapping(&readbacks);
+        Ok(FrameSubmission {
+            submission,
+            readbacks,
+        })
+    }
+
+    pub fn poll_readback(
+        &mut self,
+        handle: ReadbackHandle,
+    ) -> Result<Option<ReadbackData>, RendererError> {
+        self.device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|_| RendererError::ReadbackFailed)?;
+        self.readbacks
+            .poll(handle)
+            .map_err(|_| RendererError::InvalidReadbackHandle)
     }
 
     fn ensure_instance_capacity(&mut self, required: usize) {
@@ -392,6 +567,21 @@ impl Renderer {
         profiling::scope!("grow instance buffer");
         self.instance_capacity = required.next_power_of_two();
         self.instance_buffer = create_instance_buffer(&self.device, self.instance_capacity);
+    }
+
+    fn ensure_globals_capacity(&mut self, required: usize) {
+        if required <= self.globals_capacity {
+            return;
+        }
+        profiling::scope!("grow view uniforms");
+        self.globals_capacity = required.next_power_of_two();
+        self.globals =
+            create_globals_buffer(&self.device, self.globals_capacity, self.globals_stride);
+        self.globals_bind_group = create_globals_bind_group(
+            &self.device,
+            &self.globals_layout,
+            &self.globals,
+        );
     }
 }
 
@@ -551,6 +741,150 @@ fn create_target(
     })
 }
 
+fn create_globals_buffer(
+    device: &wgpu::Device,
+    capacity: usize,
+    stride: u32,
+) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("view globals"),
+        size: capacity as u64 * u64::from(stride),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn create_globals_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("scene globals bind group"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer,
+                offset: 0,
+                size: wgpu::BufferSize::new(size_of::<Globals>() as u64),
+            }),
+        }],
+    })
+}
+
+fn color_target(format: wgpu::TextureFormat) -> wgpu::ColorTargetState {
+    wgpu::ColorTargetState {
+        format,
+        blend: None,
+        write_mask: wgpu::ColorWrites::ALL,
+    }
+}
+
+fn create_render_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    label: &str,
+    fragment_entry: &str,
+    targets: &[Option<wgpu::ColorTargetState>],
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[Some(vertex_layout()), Some(instance_layout())],
+        },
+        primitive: wgpu::PrimitiveState {
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fragment_entry),
+            compilation_options: Default::default(),
+            targets,
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn color_attachment(
+    view: &wgpu::TextureView,
+    clear: wgpu::Color,
+) -> wgpu::RenderPassColorAttachment<'_> {
+    wgpu::RenderPassColorAttachment {
+        view,
+        depth_slice: None,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Clear(clear),
+            store: wgpu::StoreOp::Store,
+        },
+    }
+}
+
+fn begin_pass<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    label: &'a str,
+    color_attachments: &'a [Option<wgpu::RenderPassColorAttachment<'a>>],
+    depth: &'a wgpu::TextureView,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments,
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(1.0),
+                store: wgpu::StoreOp::Discard,
+            }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+fn encode_batches<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    pipeline: &'a wgpu::RenderPipeline,
+    globals: &'a wgpu::BindGroup,
+    globals_offset: u32,
+    instances: &'a wgpu::Buffer,
+    meshes: &'a ResourceRegistry<Mesh>,
+    batches: &'a [DrawBatch],
+) {
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, globals, &[globals_offset]);
+    pass.set_vertex_buffer(1, instances.slice(..));
+    for batch in batches {
+        let mesh = meshes
+            .get(batch.mesh)
+            .expect("mesh handles were validated before encoding");
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(
+            0..mesh.index_count,
+            0,
+            batch.first_instance..batch.first_instance + batch.instance_count,
+        );
+    }
+}
+
 fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("primitive instances"),
@@ -562,7 +896,7 @@ fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffe
 
 const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4];
+const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Uint32];
 
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {

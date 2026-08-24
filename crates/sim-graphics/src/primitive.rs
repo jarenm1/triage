@@ -128,6 +128,7 @@ pub struct RenderPrimitive {
     pub mesh: MeshHandle,
     pub transform: Mat4,
     pub color: [f32; 4],
+    pub object_id: u32,
 }
 
 #[cfg(test)]
