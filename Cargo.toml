@@ -1,0 +1,22 @@
+[workspace]
+members = [
+  "crates/sim-graphics",
+  "crates/sim-graphics-winit",
+  "apps/render-smoke",
+  "apps/window-demo",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.87"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bytemuck = { version = "1.24", features = ["derive"] }
+glam = { version = "0.30", features = ["bytemuck"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+pollster = "0.4"
+wgpu = "30.0.1"
+winit = "0.30.12"
