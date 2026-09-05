@@ -2,8 +2,6 @@
 
 #include "physics_math.hpp"
 
-#include <cmath>
-
 #if defined(__CUDACC__)
 #define SIM_CUDA_HOST_DEVICE __host__ __device__
 #else
@@ -21,19 +19,6 @@ SIM_CUDA_HOST_DEVICE Scalar clamp_action(const Scalar action) {
     return Scalar{1};
   }
   return action;
-}
-
-// Exact first-order motor response for a command held over timestep.
-template <typename Scalar>
-SIM_CUDA_HOST_DEVICE Scalar rotor_response(const Scalar current_speed,
-                                           const Scalar action,
-                                           const RotorParameters<Scalar> &rotor,
-                                           const Scalar timestep) {
-  const Scalar commanded_speed =
-      rotor.minimum_speed +
-      clamp_action(action) * (rotor.maximum_speed - rotor.minimum_speed);
-  const Scalar decay = exp(-timestep / rotor.time_constant);
-  return commanded_speed + (current_speed - commanded_speed) * decay;
 }
 
 template <typename Scalar> struct BodyWrench {

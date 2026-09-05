@@ -202,13 +202,28 @@ RK4 is therefore a candidate, not an architectural requirement.
 
 #### Current integration selection (2026-09-04)
 
-Production CPU and CUDA stepping now use coupled explicit midpoint/RK2, including motor speeds at both stages and normalized stage/output attitude. The split semi-implicit method remains a benchmark baseline, not a production option. Each supplied physics timestep must be strictly less than twice **every** rotor time constant; validation rejects the non-decaying motor limit and larger steps without silently subdividing time. This is a motor stability condition, not a general rigid-body stability or accuracy guarantee.
+Production CPU and CUDA stepping use coupled explicit midpoint/RK2, including motor speeds at both stages and normalized stage/output attitude. The discarded semi-implicit implementation and its selection experiment are preserved in JJ revision `vpommxpy` (`319431e2`), not in current source. Each supplied physics timestep must be strictly less than twice **every** rotor time constant; validation rejects the non-decaying motor limit and larger steps without silently subdividing time. This is a motor stability condition, not a general rigid-body stability or accuracy guarantee.
 
-Reproduce the comparison with `nu cuda/build.nu --release` followed by `cuda/build/sim_cuda_integrator_benchmark` (optional `--environments N`). It compares 1–2,048 physics substeps per 10 ms control interval against double-precision RK4 traces, checks reference refinement, and reports endpoint errors separately from warmed CUDA-event and completion-inclusive wall timing.
+The original selection experiment swept 1–2,048 physics substeps per 10 ms control interval against double-precision RK4 traces. Its measurements below are historical evidence for the selection, not a retained alternative implementation or a baseline directly comparable to the current production-path benchmark.
 
 On the RTX 2070 SUPER, a 10,000-environment **homogeneous replicated** batch over 100 control calls passed all four scenarios—hover, motor command reversals, coupled attitude motion, and unequal-inertia torque-free rotation—with midpoint at **16 substeps (0.625 ms)**. Maximum errors across these traces were approximately 0.107 mm position, 0.192 mm/s velocity, 0.000146 rad/s angular rate, 0.0000116 rad attitude, and 0.0422 rad/s rotor speed. The provisional gates are 1 mm, 1 mm/s, 0.001 rad/s, 0.001 rad, and 0.1 rad/s respectively. No tested baseline substep count passed every gate across all four scenarios; fine-step float32 error is not monotonically decreasing.
 
-Release-build median device times for the selected configuration were 3.2–6.9 ms per 100-control-call trajectory, depending on scenario, with uncontrolled clocks/power. These are physics-only measurements, not full-environment or training throughput, and do not establish a matched-accuracy speedup ratio when no baseline configuration passes. The scenario/parameter envelope is defined in `cuda/benchmarks/integrator_cases.hpp`; 0.625 ms is a measured starting point, not a universal timestep default or proof of the broader flight envelope.
+That experiment's Release-build median device times for the selected configuration were 3.2–6.9 ms per 100-control-call trajectory, depending on scenario, with uncontrolled clocks/power. These are physics-only measurements, not full-environment or training throughput, and do not establish a matched-accuracy speedup ratio when no baseline configuration passes. The retained scenario/parameter envelope is defined in `cuda/benchmarks/physics_cases.hpp`; 0.625 ms is a measured starting point, not a universal timestep default or proof of the broader flight envelope.
+
+#### Production regression benchmark
+
+`sim_cuda_physics_benchmark` calls the real `launch_physics_step` interface; it has no private stepping kernel or competing integrator. The default workload set times the four scenarios at 10,000 environments plus coupled attitude at 100,000 environments, all at 16 substeps per 10 ms control call. `--environments N` changes the base count; the larger case remains `10*N`. The double-precision RK4 oracle is checked by refinement, and accuracy is measured at the first/middle/last environment after each control call. Additional motor-transient refinement at 32 and 64 substeps is accuracy-only, with float32 error floors.
+
+```sh
+nu cuda/build.nu --release
+cuda/build/sim_cuda_physics_benchmark --label REVISION --output cuda/build/physics-baseline.tsv
+# After rebuilding the revision being compared, on the same machine:
+cuda/build/sim_cuda_physics_benchmark --label NEW_REVISION --baseline cuda/build/physics-baseline.tsv --output cuda/build/physics-current.tsv
+```
+
+Use actual revision identifiers for the labels. Saved reports include hardware/compiler/configuration metadata and fingerprints of the scenario parameters, initial states, and action schedules. Comparison requires matching metadata and complete workload/count/substep sets; incompatible, malformed, or incomplete reports are rejected. A workload that fails accuracy in either run is ineligible for a timing percentage. Correctness failures return nonzero, but timing changes are informational: report event/wall median deltas and min/max spread, then repeat suspicious measurements rather than applying an arbitrary CI slowdown threshold. Sample ranges are not confidence intervals, and clocks/system load remain uncontrolled.
+
+Both timers cover the production launch sequence, including parameter validation and launch overhead; wall time additionally includes waiting for completion. Initial-state reset, allocation, preuploaded action schedules, accuracy readback, and logging are outside the timed interval. The workload uses distinct ping-pong state buffers and full per-environment actions, so old selection-experiment timing is not a comparable regression baseline. Memory reporting distinguishes owned payload allocations from process RSS and does not claim whole-GPU peak memory.
 
 ---
 

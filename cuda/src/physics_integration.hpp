@@ -35,43 +35,6 @@ integrate_attitude(const Quaternion<Scalar> q,
   return next;
 }
 
-// Benchmark-only baseline: split, first-order scheme with exact motor response,
-// endpoint rotor wrench evaluated at the old attitude and angular velocity.
-// Translation and rotation are semi-implicit: position uses the new velocity,
-// and normalized quaternion Euler uses the new body angular velocity.
-// timestep is the duration of each substep, not the total divided by substeps.
-template <typename Scalar>
-SIM_CUDA_HOST_DEVICE MultirotorState<Scalar> step_semi_implicit(
-    const MultirotorState<Scalar> &state, const RotorActions<Scalar> &actions,
-    const VehicleParameters<Scalar> &parameters, const Scalar timestep) {
-  MultirotorState<Scalar> next = state;
-  BodyWrench<Scalar> wrench{};
-
-#pragma unroll
-  for (std::size_t rotor_index = 0; rotor_index < kRotorCount; ++rotor_index) {
-    const RotorParameters<Scalar> &rotor = parameters.rotors[rotor_index];
-    const Scalar speed = rotor_response(state.rotor_speed[rotor_index],
-                                        actions[rotor_index], rotor, timestep);
-    next.rotor_speed[rotor_index] = speed;
-    accumulate_rotor_wrench(wrench, rotor, speed);
-  }
-
-  const Vec3<Scalar> acceleration_w =
-      linear_acceleration_w(state.attitude_wb, wrench.force_b, parameters);
-  next.linear_velocity_w =
-      add(state.linear_velocity_w, scale(acceleration_w, timestep));
-  next.position_w =
-      add(state.position_w, scale(next.linear_velocity_w, timestep));
-
-  const Vec3<Scalar> angular_acceleration = angular_acceleration_b(
-      state.angular_velocity_b, wrench.torque_b, parameters);
-  next.angular_velocity_b =
-      add(state.angular_velocity_b, scale(angular_acceleration, timestep));
-  next.attitude_wb =
-      integrate_attitude(state.attitude_wb, next.angular_velocity_b, timestep);
-  return next;
-}
-
 // Full-state explicit midpoint: both wrenches use their stage's rotor speeds,
 // and body derivatives use that stage's attitude and angular velocity.
 // Requires positive motor time constants and timestep / time_constant < 2
