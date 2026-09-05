@@ -4,3 +4,6 @@ target/
 .direnv/
 dist/
 cuda/build/
+__pycache__/
+*.py[cod]
+rl/.venv/
