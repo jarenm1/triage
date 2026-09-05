@@ -1,0 +1,59 @@
+PufferLib-derived CUDA hover learner
+===================================
+Upstream: https://github.com/PufferAI/PufferLib
+Pinned revision: 42f70d6932c30ac977736f861006809c50168ba9 (4.0)
+License: MIT; upstream copyright and full license in LICENSE.txt.
+
+muon.py is copied from upstream pufferlib/muon.py with one compatibility change:
+the private _to_scalar import is replaced by explicit Tensor.item handling.
+This optimizer already computes Newton-Schulz in its input dtype. The hover
+policy and gradients remain float32: no autocast or BF16 conversion is used,
+including on pre-Ampere GPUs. No optimizer substitution is made.
+
+torch_pufferl.py is an explicitly adapted subset of upstream
+pufferlib/torch_pufferl.py, not an installed pufferlib package or a fake _C.
+The continuous Normal branch and PuffeRL.train are adapted from upstream.
+Training retains Muon, absolute-advantage prioritized segment sampling with
+replacement, annealed importance weights, recomputed V-trace advantages,
+updated replay values/ratios, clipped policy and clipped value objectives,
+entropy regularization, cosine learning-rate annealing and gradient clipping.
+
+Changes from upstream:
+- Removed _C import, precision checks, unrelated CLI/model factory/distributed
+  integration, discrete action handling, CPU environment support and dashboard.
+- Replaced native vector construction/pointers with the CUDA-only HoverEnv
+  adapter and the caller's CUDA stream; no per-step synchronize or profiling.
+- Gaussian sampling uses loc + scale*randn_like(loc), avoiding torch.normal's
+  per-step tensor-standard-deviation validation readback and host wait.
+- Replaced upstream rollout with transition-aligned rewards, separate terminated
+  and truncated buffers, pre-reset final-state values, and final horizon value.
+  No final action/reward is discarded; fixed rollout buffers are reused.
+- Replaced _C.puff_advantage with a TorchScript GPU tensor recurrence carrying
+  one value per environment across the full segment. Its delta retains upstream
+  clipped rho; its recurrence retains gamma*lambda*clipped c. True termination
+  suppresses value bootstrap. Timeout uses pre-reset final value and stops the
+  recurrence. Ordinary horizon boundary bootstraps the final observation.
+- Removed Profile and all per-minibatch event synchronization. Loss scalar
+  transfer occurs only after training, episode transfer only after rollout.
+- Reused an advantage buffer, used explicit index_copy_ for sampled replay rows,
+  made explained variance tensor-select instead of Python tensor truth testing,
+  used population advantage std for one-element minibatches, and ensure at least
+  one minibatch. Rewards retain upstream [-1,1] clipping.
+- Learning-rate annealing uses Python math scalars, so optimizer checkpoints
+  remain loadable through torch.load(weights_only=True).
+- Added a small non-recurrent float32 Gaussian policy with validate_args=False,
+  native zero-copy adapter, and training/saved-checkpoint evaluation CLI.
+
+Evaluation runs 2000 controls at 100 Hz on held-out seed streams. It accumulates
+only each environment's first episode and inspects pre-reset final observations;
+subsequent same-step autoresets do not contaminate metrics. Success requires all
+2000 controls without failure, distance <=1m and tilt <=0.7 radians throughout.
+The baseline is zero raw action (native hover equilibrium), never a learned or
+scripted replacement for training. Checkpoints record architecture, task version
+and parameters, upstream revision, optimizer, RNG states, seed and evaluation.
+
+CLI from repository root:
+  cuda/build/rl-venv/bin/python rl/train.py train --seed 1 --checkpoint cuda/build/hover.pt
+  cuda/build/rl-venv/bin/python rl/train.py eval --checkpoint cuda/build/hover.pt --eval-envs 1024
+Requirements beyond Python standard library: torch and numpy only. Native
+cuda/build/libtriage_hover.so must be built before constructing an environment.

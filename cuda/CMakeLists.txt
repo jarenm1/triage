@@ -56,6 +56,11 @@ if(SIM_CUDA_ENABLE_CUDA)
     POSITION_INDEPENDENT_CODE ON
   )
 
+  add_library(triage_hover SHARED src/hover_env.cu)
+  target_link_libraries(triage_hover PRIVATE sim_cuda_runtime)
+  target_include_directories(triage_hover PUBLIC src)
+  set_target_properties(triage_hover PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
   add_executable(sim_cuda_physics_benchmark benchmarks/physics_benchmark.cpp)
   target_link_libraries(sim_cuda_physics_benchmark
     PRIVATE sim_cuda_runtime sim_cuda_reference)
@@ -68,6 +73,11 @@ if(SIM_CUDA_ENABLE_CUDA)
     add_executable(sim_cuda_runtime_smoke tests/runtime_smoke.cu)
     target_link_libraries(sim_cuda_runtime_smoke PRIVATE sim_cuda_runtime)
     add_test(NAME sim_cuda_runtime_smoke COMMAND sim_cuda_runtime_smoke)
+
+    add_executable(sim_cuda_hover_env_test tests/hover_env_test.cpp)
+    target_include_directories(sim_cuda_hover_env_test PRIVATE "${SIM_CUDA_INCLUDE_DIR}")
+    target_link_libraries(sim_cuda_hover_env_test PRIVATE triage_hover CUDA::cudart)
+    add_test(NAME sim_cuda_hover_env_test COMMAND sim_cuda_hover_env_test)
 
     add_executable(sim_cuda_physics_batch_test tests/physics_batch_test.cu)
     target_link_libraries(sim_cuda_physics_batch_test

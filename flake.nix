@@ -70,19 +70,24 @@
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                 pkgs.cmake
                 pkgs.ninja
+                pkgs.python312
+                pkgs.uv
                 pkgs.cudaPackages.cudatoolkit
                 pkgs.cudaPackages.cuda_gdb
               ];
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-              pkgs.vulkan-loader
-              pkgs.libxkbcommon
-              pkgs.wayland
-              pkgs.libx11
-              pkgs.libxcursor
-              pkgs.libxi
-              pkgs.libxrandr
-              pkgs.libxcb
-            ];
+            LD_LIBRARY_PATH =
+              (pkgs.lib.makeLibraryPath [
+                pkgs.stdenv.cc.cc.lib
+                pkgs.vulkan-loader
+                pkgs.libxkbcommon
+                pkgs.wayland
+                pkgs.libx11
+                pkgs.libxcursor
+                pkgs.libxi
+                pkgs.libxrandr
+                pkgs.libxcb
+              ])
+              + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ":/run/opengl-driver/lib";
           };
         }
       );

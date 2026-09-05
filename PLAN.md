@@ -564,6 +564,40 @@ Initial hover acceptance profile, to be versioned with the task: at least 90% of
 
 **Exit gate:** A saved policy reproducibly meets the versioned hover criterion on held-out randomized seeds, and the end-to-end training profile identifies simulation versus learner cost.
 
+#### Current GPU hover / PufferLib integration
+
+JJ change `mxmnyztp` adds a concrete GPU hover environment and a PufferLib-derived Torch learner. The chosen integration is a narrowly vendored, explicitly adapted learner from [PufferLib 4.0 revision `42f70d6932c30ac977736f861006809c50168ba9`](https://github.com/PufferAI/PufferLib/tree/42f70d6932c30ac977736f861006809c50168ba9), not the full PufferLib installation or its CPU-environment vectorizer. Attribution, the MIT license, and the exact adaptation rationale are retained in `rl/vendor/`. The learner retains Muon, prioritized trajectory-segment replay, clipped policy/value objectives, and V-trace corrections. It uses a two-hidden-layer float32 MLP Gaussian policy; native BF16 learning, recurrent policies, distributed execution, Protein, and dashboards are not included.
+
+`cuda/src/hover_env.h` exposes the task through a C interface; `rl/environment.py` borrows its CUDA buffers through ctypes and the CUDA array interface. Physics remains in `PhysicsBatch`. The task owns GPU observations, rewards, episode clocks/counters, failure/timeout decisions, deterministic reset generation, final observations, and same-step autoreset. Python consumers and native operations use one declared CUDA stream. Policy actions map to `clamp(hover_command + 0.15*tanh(raw_action), 0, 1)` per rotor; the policy learns the offsets, with no scripted stabilizing controller. The 22 observation values are target-relative world position, world velocity, a row-major body-to-world rotation matrix, body angular velocity, and normalized actual rotor speeds.
+
+Task version 1 holds a fixed reference Quad-X at target `(0,0,1)` using a 100 Hz control rate and 16 midpoint substeps. Initial position varies by ±0.15 m per axis, roll/pitch by ±0.05 rad, yaw across a full turn, velocity by ±0.05 m/s, and body rate by ±0.02 rad/s. Motor state starts at equilibrium. Ground crossing, distance beyond 2 m, tilt beyond 0.8 rad, and nonfinite state/actions terminate; the 2,000-control limit truncates instead. Final observations are preserved before reset on every step. The learner bootstraps timeouts from final observations, suppresses bootstrap on failure, stops advantage recurrence at either episode boundary, and retains the final rollout transition.
+
+The target Nix shell includes Python 3.12, uv, and runtime/driver library discovery. `rl/uv.lock` pins Torch 2.7.1+cu128, NumPy 2.2.6, and transitive dependencies. From the repository root:
+
+```sh
+nix develop
+nu rl/setup.nu
+cuda/build/rl-venv/bin/python -m unittest rl.test_advantage
+cuda/build/rl-venv/bin/python rl/train.py train --seed 1 --log-every 25 --checkpoint cuda/build/hover-final-seed1.pt
+cuda/build/rl-venv/bin/python rl/train.py train --seed 2 --log-every 25 --checkpoint cuda/build/hover-final-seed2.pt
+cuda/build/rl-venv/bin/python rl/train.py eval --checkpoint cuda/build/hover-final-seed1.pt --eval-envs 1024 --eval-seed 900000001
+cuda/build/rl-venv/bin/python rl/train.py eval --checkpoint cuda/build/hover-final-seed2.pt --eval-envs 1024 --eval-seed 900000002
+cuda/build/rl-venv/bin/python rl/profile_rollout.py
+```
+
+The default training run uses 1,024 environments, a 64-control rollout horizon, minibatches of 8,192 transitions, replay ratio 2, and 20 million requested transitions (20,054,016 after completing the last rollout). Both independently trained checkpoints loaded successfully with `weights_only=True` and passed fresh held-out evaluation:
+
+| Training seed | Fresh evaluation seed | Successful 20-second episodes | Fixed hover-thrust baseline | Mean episode maximum distance / tilt |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | 900000001 | 1,024 / 1,024 | 0 / 1,024 | 0.278 m / 0.088 rad |
+| 2 | 900000002 | 1,024 / 1,024 | 0 / 1,024 | 0.309 m / 0.126 rad |
+
+Success requires remaining within 1 m of the target and 0.7 rad tilt for the entire 20 seconds, without failure. Evaluation counts only the first episode per environment, not subsequent autoresets. Checkpoints retain task/learner configuration, seeds, optimizer and RNG state, and evaluation metadata; they support saved-policy evaluation, not exact mid-episode simulator restoration.
+
+All five native CTests passed, including hover timeout/failure separation, final observations, seed replay, and cross-stream stepping. Compute Sanitizer reported zero errors for the hover test. Both advantage regression tests passed on CPU and CUDA. A warmed 1,024-environment, 64-control rollout trace recorded 3,338 GPU kernels and 513 device-to-device copies, with no host-copy activities, scalar readbacks, CUDA allocation/free calls, or host synchronization inside the collection interval. `rl/profile_rollout.py` repeats this check and saves its trace and summary under `cuda/build/`; profiler setup/teardown, learner updates, and logging are explicitly outside that interval. Torch's tensor-standard-deviation Gaussian sampling originally introduced per-step readbacks; equivalent `loc + scale*randn_like(loc)` arithmetic removed them. Device copies and multiple kernel launches remain; no CUDA-graph or maximum-throughput claim is made.
+
+This establishes the first state-based training milestone on the RTX 2070 SUPER, not the complete Phase 1/2 roadmap or a sim-to-real result. Vehicle parameters are fixed; broad domain randomization, wind/drag, noisy sensors, other tasks, a general Gymnasium adapter, and rendering integration remain separate work.
+
 ### Phase 3: Rendering integration and replay
 
 **Goal:** Add visualization and bounded visual sensing without coupling renderer cadence to training cadence.
