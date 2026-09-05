@@ -34,6 +34,7 @@
         let
           pkgs = import nixpkgs {
             inherit system;
+            config.allowUnfree = true;
             overlays = [ rust-overlay.overlays.default ];
           };
 
@@ -51,19 +52,27 @@
         in
         {
           default = craneLib.devShell {
-            packages = with pkgs; [
-              binaryen
-              cargo-audit
-              cargo-edit
-              cargo-nextest
-              pkg-config
-              tracy_0_11
-              trunk
-              vulkan-loader
-              vulkan-tools
-              wasm-bindgen-cli
-              wayland
-            ];
+            packages =
+              (with pkgs; [
+                binaryen
+                cargo-audit
+                cargo-edit
+                cargo-nextest
+                nushell
+                pkg-config
+                tracy_0_11
+                trunk
+                vulkan-loader
+                vulkan-tools
+                wasm-bindgen-cli
+                wayland
+              ])
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.cmake
+                pkgs.ninja
+                pkgs.cudaPackages.cudatoolkit
+                pkgs.cudaPackages.cuda_gdb
+              ];
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
               pkgs.vulkan-loader
               pkgs.libxkbcommon
