@@ -17,6 +17,7 @@ constexpr unsigned threads = 256;
 constexpr float timestep = 0.000625f;
 constexpr int substeps = 16;
 constexpr float pi = 3.14159265358979323846f;
+constexpr int plan_commands = 101;
 thread_local char last_error[1024]{};
 
 void check(cudaError_t result, const char *operation) {
@@ -63,6 +64,19 @@ struct Buffers {
   DeviceActions *commands = nullptr;
   std::uint8_t *reset_mask = nullptr;
   std::uint8_t *invalid_actions = nullptr;
+  bool tracking = false;
+  int schedule = 0;
+  float *targets = nullptr;
+  float *final_targets = nullptr;
+  float *command_duration = nullptr;
+  float *command_elapsed = nullptr;
+  float *command_finished = nullptr;
+  float *command_settled = nullptr;
+  std::uint64_t *command_index = nullptr;
+  float *action_saturation = nullptr;
+  float *command_plan = nullptr;
+  int *elapsed = nullptr;
+  int *settled_steps = nullptr;
 };
 
 __device__ std::uint64_t mix(std::uint64_t value) {
@@ -78,6 +92,58 @@ __device__ float uniform(std::uint64_t &rng) {
 
 __device__ float symmetric(std::uint64_t &rng, float extent) {
   return (2.0f * uniform(rng) - 1.0f) * extent;
+}
+// Duration draws use rejection to avoid modulo bias. This stream is separate
+// from reset-state sampling and keyed by episode and command, never trajectory.
+__device__ unsigned uniform_integer(std::uint64_t &rng, unsigned count) {
+  const unsigned threshold = (0u - count) % count;
+  unsigned value;
+  do {
+    rng += 0x9e3779b97f4a7c15ULL;
+    value = static_cast<unsigned>(mix(rng));
+  } while (value < threshold);
+  return value % count;
+}
+
+__device__ void select_command(Buffers b, std::size_t i,
+                               std::uint64_t command) {
+  b.command_index[i] = command;
+  const float *entry = b.command_plan + (i * plan_commands + command) * 4;
+  for (int axis = 0; axis < 3; ++axis)
+    b.targets[3 * i + axis] = entry[axis];
+  b.elapsed[i] = b.settled_steps[i] = 0;
+}
+
+__device__ void generate_plan(Buffers b, std::size_t i, std::uint64_t seed,
+                              std::uint64_t episode) {
+  float previous[3] = {0.0f, 0.0f, 1.0f};
+  for (int command = 0; command < plan_commands; ++command) {
+    std::uint64_t rng = mix(seed ^ 0xa0761d6478bd642fULL) ^
+                        mix(i + 0xe7037ed1a0b428dbULL) ^
+                        mix(episode + 0x8ebc6af09c88c6e3ULL) ^
+                        mix(command + 0x589965cc75374cc3ULL);
+    float *entry = b.command_plan + (i * plan_commands + command) * 4;
+    float displacement2;
+    do {
+      entry[0] = symmetric(rng, 1.0f);
+      entry[1] = symmetric(rng, 1.0f);
+      entry[2] = 1.25f + symmetric(rng, .5f);
+      const float dx = entry[0] - previous[0];
+      const float dy = entry[1] - previous[1];
+      const float dz = entry[2] - previous[2];
+      displacement2 = dx * dx + dy * dy + dz * dz;
+    } while (displacement2 < .25f || displacement2 > 2.25f);
+    if (b.schedule == 1) {
+      entry[3] = 500.0f;
+    } else {
+      const bool short_interval = uniform_integer(rng, 4) == 0;
+      entry[3] = short_interval ? 20 + uniform_integer(rng, 81)
+                                : 200 + uniform_integer(rng, 301);
+    }
+    for (int axis = 0; axis < 3; ++axis)
+      previous[axis] = entry[axis];
+  }
+  select_command(b, i, 0);
 }
 
 // Matches make_reference_quad_x, expressed on-device to avoid host staging.
@@ -135,10 +201,11 @@ __device__ DeviceState reset_state(std::uint64_t seed, std::size_t index,
 }
 
 __device__ bool observation(const DeviceState &s,
-                            const DeviceVehicleParameters &p, float *out) {
-  out[0] = s.position_w.x;
-  out[1] = s.position_w.y;
-  out[2] = s.position_w.z - 1.0f;
+                            const DeviceVehicleParameters &p, float *out,
+                            const float *target = nullptr) {
+  out[0] = target ? s.position_w.x - target[0] : s.position_w.x;
+  out[1] = target ? s.position_w.y - target[1] : s.position_w.y;
+  out[2] = s.position_w.z - (target ? target[2] : 1.0f);
   out[3] = s.linear_velocity_w.x;
   out[4] = s.linear_velocity_w.y;
   out[5] = s.linear_velocity_w.z;
@@ -184,7 +251,16 @@ __global__ void initialize(Buffers b, std::size_t n, std::uint64_t seed) {
   b.reset_mask[i] = 1;
   b.invalid_actions[i] = 0;
   b.reset_status[i] = ResetStatus::applied;
-  observation(b.states[i], b.parameters[i], b.observations + 22 * i);
+  if (b.tracking) {
+    generate_plan(b, i, seed, 0);
+    for (int axis = 0; axis < 3; ++axis)
+      b.final_targets[3 * i + axis] = b.targets[3 * i + axis];
+    b.command_duration[i] = b.command_elapsed[i] = 0.0f;
+    b.command_finished[i] = b.command_settled[i] = 0.0f;
+    b.action_saturation[i] = 0.0f;
+  }
+  observation(b.states[i], b.parameters[i], b.observations + 22 * i,
+              b.tracking ? b.targets + 3 * i : nullptr);
   for (int j = 0; j < 22; ++j)
     b.final_observations[22 * i + j] = b.observations[22 * i + j];
 }
@@ -198,17 +274,22 @@ __global__ void map_actions(Buffers b, std::size_t n, const float *actions) {
   const float speed = hover_speed(p);
   bool invalid = false;
   float cost = 0.0f;
+  float saturated = 0.0f;
   for (int r = 0; r < 4; ++r) {
     const float raw = actions[4 * i + r];
     invalid = invalid || !isfinite(raw);
     const float bounded = isfinite(raw) ? tanhf(raw) : 0.0f;
     cost += bounded * bounded;
+    if (b.tracking && (isinf(raw) || fabsf(bounded) >= .99f))
+      saturated += .25f;
     const auto &rotor = p.rotors[r];
     const float hover = (speed - rotor.minimum_speed) /
                         (rotor.maximum_speed - rotor.minimum_speed);
     b.commands[i][r] = fminf(1.0f, fmaxf(0.0f, hover + .15f * bounded));
   }
   b.invalid_actions[i] = invalid;
+  if (b.tracking)
+    b.action_saturation[i] = saturated;
   // Reuse the reward slot as stream-local scratch until transition completion.
   b.rewards[i] = .005f * .25f * cost;
 }
@@ -220,14 +301,19 @@ __global__ void finish_transition(Buffers b, std::size_t n, std::uint64_t seed,
   if (i >= n)
     return;
   float *out = b.final_observations + 22 * i;
-  const bool finite = observation(b.states[i], b.parameters[i], out);
+  const bool finite = observation(b.states[i], b.parameters[i], out,
+                                  b.tracking ? b.targets + 3 * i : nullptr);
   const float distance2 = out[0] * out[0] + out[1] * out[1] + out[2] * out[2];
   const float velocity2 = out[3] * out[3] + out[4] * out[4] + out[5] * out[5];
   const float rate2 = out[15] * out[15] + out[16] * out[16] + out[17] * out[17];
   const float tilt = acosf(fminf(1.0f, fmaxf(-1.0f, out[14])));
-  const bool failed = !finite || b.invalid_actions[i] ||
-                      b.states[i].position_w.z < .05f || distance2 > 4.0f ||
-                      tilt > .8f;
+  const auto position = b.states[i].position_w;
+  const bool outside = b.tracking
+                           ? fabsf(position.x) > 3.0f ||
+                                 fabsf(position.y) > 3.0f || position.z > 3.0f
+                           : distance2 > 4.0f;
+  const bool failed = !finite || b.invalid_actions[i] || position.z < .05f ||
+                      outside || tilt > .8f;
   const float reward = failed ? -1.0f
                               : expf(-2.0f * distance2 - .1f * velocity2 -
                                      .05f * rate2 - .5f * tilt * tilt) -
@@ -244,9 +330,30 @@ __global__ void finish_transition(Buffers b, std::size_t n, std::uint64_t seed,
   b.completed_lengths[i] = done ? length : 0.0f;
   b.current_returns[i] = done ? 0.0f : episode_return;
   b.current_lengths[i] = done ? 0.0f : length;
+  if (b.tracking) {
+    for (int axis = 0; axis < 3; ++axis)
+      b.final_targets[3 * i + axis] = b.targets[3 * i + axis];
+    const auto command = b.command_index[i];
+    const float duration =
+        b.command_plan[(i * plan_commands + command) * 4 + 3];
+    const int elapsed = ++b.elapsed[i];
+    b.settled_steps[i] = !failed && distance2 <= .04f && velocity2 <= .04f
+                             ? b.settled_steps[i] + 1
+                             : 0;
+    // Failure takes precedence, including failure exactly on a boundary.
+    const bool finished = !failed && elapsed >= duration;
+    b.command_duration[i] = duration;
+    b.command_elapsed[i] = elapsed;
+    b.command_finished[i] = finished ? 1.0f : 0.0f;
+    b.command_settled[i] = finished && b.settled_steps[i] >= 50 ? 1.0f : 0.0f;
+    if (finished && !done)
+      select_command(b, i, command + 1);
+  }
   if (done) {
     const auto episode = ++b.episode_counts[i];
     b.states[i] = reset_state(seed, i, episode, b.parameters[i]);
+    if (b.tracking)
+      generate_plan(b, i, seed, episode);
   }
 }
 
@@ -255,19 +362,27 @@ __global__ void publish_observations(Buffers b, std::size_t n) {
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n)
     return;
-  observation(b.states[i], b.parameters[i], b.observations + 22 * i);
+  observation(b.states[i], b.parameters[i], b.observations + 22 * i,
+              b.tracking ? b.targets + 3 * i : nullptr);
 }
 
 class HoverEnv {
 public:
   HoverEnv(int device, std::size_t n, std::uint64_t seed, int max_steps,
-           cudaStream_t stream)
+           cudaStream_t stream, bool tracking = false, int schedule = 0)
       : device_(device), n_(n), seed_(seed), max_steps_(max_steps) {
     if (n == 0 || n > std::numeric_limits<std::uint32_t>::max())
       throw std::invalid_argument(
           "hover environment count must be in [1, UINT32_MAX]");
     if (max_steps <= 0 || max_steps > (1 << 24))
       throw std::invalid_argument("max_steps must be in [1, 16777216]");
+    if (tracking && max_steps > 2000)
+      throw std::invalid_argument("tracking max_steps must be in [1, 2000]");
+    if (tracking && schedule != 0 && schedule != 1)
+      throw std::invalid_argument(
+          "tracking schedule must be 0 (mixed) or 1 (fixed500)");
+    b_.tracking = tracking;
+    b_.schedule = schedule;
     DeviceGuard guard(device_);
     validate_stream(stream);
     try {
@@ -289,6 +404,19 @@ public:
       allocate(b_.commands);
       allocate(b_.reset_mask);
       allocate(b_.invalid_actions);
+      if (tracking) {
+        allocate(b_.targets, 3);
+        allocate(b_.final_targets, 3);
+        allocate(b_.command_duration);
+        allocate(b_.command_elapsed);
+        allocate(b_.command_finished);
+        allocate(b_.command_settled);
+        allocate(b_.command_index);
+        allocate(b_.action_saturation);
+        allocate(b_.command_plan, plan_commands * 4);
+        allocate(b_.elapsed);
+        allocate(b_.settled_steps);
+      }
       initialize<<<blocks(), threads, 0, stream>>>(b_, n_, seed_);
       check(cudaGetLastError(), "initialize hover task");
       physics_ = std::make_unique<PhysicsBatch>(
@@ -350,6 +478,9 @@ public:
   }
 
   void *buffer(int field) {
+    if (field >= TRIAGE_TRACKING_TARGETS && !b_.tracking)
+      throw std::invalid_argument(
+          "tracking buffers require a tracking environment");
     switch (field) {
     case TRIAGE_HOVER_OBSERVATIONS:
       return b_.observations;
@@ -373,9 +504,27 @@ public:
       return b_.current_returns;
     case TRIAGE_HOVER_CURRENT_LENGTHS:
       return b_.current_lengths;
+    case TRIAGE_TRACKING_TARGETS:
+      return b_.targets;
+    case TRIAGE_TRACKING_FINAL_TARGETS:
+      return b_.final_targets;
+    case TRIAGE_TRACKING_COMMAND_DURATION:
+      return b_.command_duration;
+    case TRIAGE_TRACKING_COMMAND_ELAPSED:
+      return b_.command_elapsed;
+    case TRIAGE_TRACKING_COMMAND_FINISHED:
+      return b_.command_finished;
+    case TRIAGE_TRACKING_COMMAND_SETTLED:
+      return b_.command_settled;
+    case TRIAGE_TRACKING_COMMAND_INDEX:
+      return b_.command_index;
+    case TRIAGE_TRACKING_ACTION_SATURATION:
+      return b_.action_saturation;
+    case TRIAGE_TRACKING_COMMAND_PLAN:
+      return b_.command_plan;
     default:
       throw std::invalid_argument(
-          "unknown hover buffer field; expected an id in [0,10]");
+          "unknown environment buffer field; expected an id in [0,19]");
     }
   }
 
@@ -391,7 +540,8 @@ private:
   std::uint64_t seed_;
   int max_steps_;
   Buffers b_{};
-  void *allocations_[16]{};
+  void *allocations_[27]{};
+  std::size_t allocation_bytes_[27]{};
   unsigned allocation_count_ = 0;
   std::unique_ptr<PhysicsBatch> physics_;
   cudaEvent_t completion_ = nullptr;
@@ -407,6 +557,7 @@ private:
     void *allocation = nullptr;
     check(cudaMalloc(&allocation, n_ * width * sizeof(T)),
           "allocate hover buffer");
+    allocation_bytes_[allocation_count_] = n_ * width * sizeof(T);
     allocations_[allocation_count_++] = allocation;
     pointer = static_cast<T *>(allocation);
   }
@@ -435,25 +586,9 @@ private:
       throw std::invalid_argument("hover action address range overflows");
     // Task outputs are mutable during a step; disallow overlapping action
     // views.
-    const std::size_t sizes[16] = {22 * sizeof(float),
-                                   sizeof(float),
-                                   sizeof(float),
-                                   sizeof(float),
-                                   22 * sizeof(float),
-                                   sizeof(float),
-                                   sizeof(float),
-                                   sizeof(ResetStatus),
-                                   sizeof(std::uint64_t),
-                                   sizeof(float),
-                                   sizeof(float),
-                                   sizeof(DeviceState),
-                                   sizeof(DeviceVehicleParameters),
-                                   sizeof(DeviceActions),
-                                   sizeof(std::uint8_t),
-                                   sizeof(std::uint8_t)};
     for (unsigned j = 0; j < allocation_count_; ++j) {
       const auto start = reinterpret_cast<std::uintptr_t>(allocations_[j]);
-      if (begin_address < start + n_ * sizes[j] &&
+      if (begin_address < start + allocation_bytes_[j] &&
           start < begin_address + bytes)
         throw std::invalid_argument(
             "hover actions must not overlap task buffers");
@@ -531,6 +666,19 @@ extern "C" void *triage_hover_create(int device, size_t n, uint64_t seed,
   try {
     return new HoverEnv(device, n, seed, max_steps,
                         static_cast<cudaStream_t>(stream));
+  } catch (...) {
+    capture_error();
+    return nullptr;
+  }
+}
+
+extern "C" void *triage_tracking_create(int device, size_t n, uint64_t seed,
+                                        int max_steps, int schedule,
+                                        void *stream) {
+  last_error[0] = '\0';
+  try {
+    return new HoverEnv(device, n, seed, max_steps,
+                        static_cast<cudaStream_t>(stream), true, schedule);
   } catch (...) {
     capture_error();
     return nullptr;

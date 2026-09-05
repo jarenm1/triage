@@ -598,6 +598,58 @@ All five native CTests passed, including hover timeout/failure separation, final
 
 This establishes the first state-based training milestone on the RTX 2070 SUPER, not the complete Phase 1/2 roadmap or a sim-to-real result. Vehicle parameters are fixed; broad domain randomization, wind/drag, noisy sensors, other tasks, a general Gymnasium adapter, and rendering integration remain separate work.
 
+#### Randomized target tracking contract
+
+JJ change `zmowkoop` adds a separately named `tracking` task; `hover` remains the default and retains its task/checkpoint contract. Both share the existing `PhysicsBatch`, direct four-motor action mapping, reward coefficients, initial-state distribution, and 22-value ground-truth observation layout. For tracking, the first three observations are world position relative to the **current** commanded target. Neither future commands nor countdowns enter the policy observation. Vehicle parameters remain fixed; this slice adds no wind, obstacles, noisy sensors, yaw commands, or rendering.
+
+Each episode lasts 2,000 controls at 100 Hz, with 16 midpoint physics substeps per control (`dt = 0.000625 s`). Commands are generated from seed, environment, episode, and command identities, independently of the vehicle trajectory. Candidates are uniform in `x,y ∈ [-1,1] m`, `z ∈ [0.75,1.75] m`, rejected until displacement from the previous commanded target is within `[0.5,1.5] m`; the first previous target is `(0,0,1)`. Each mixed-schedule command independently chooses a 75% long interval, uniform integer `[200,500]` controls, or a 25% short interval, uniform integer `[20,100]`. Consecutive short commands are allowed. A new command replaces the previous one without resetting physical state.
+
+Transition ordering is physics, reward/outcomes/metrics against the preceding target, then command publication for the next observation or episode autoreset. Final observations and `final_targets` describe the preceding transition. Tracking terminates on nonfinite state/actions, tilt beyond 0.8 rad, `x,y` outside ±3 m, or `z` outside `[0.05,3] m—not on target distance. Timeout truncates. Reward remains `exp(-2*distance² - 0.1*speed² - 0.05*body_rate² - 0.5*tilt²) - 0.005*mean(tanh(raw_action)²)`, with failure reward −1.
+
+Acceptance uses two suites, with 1,024 fresh 20-second episodes per suite and policy:
+
+- **Settling:** four fixed-500-control commands per episode. A command settles only when its final 50 consecutive controls have distance ≤0.2 m and speed ≤0.2 m/s. At least 90% of all commanded targets must settle, with at least 95% episode survival. Failed episode tails do not remove targets from the denominator.
+- **Mixed/interruption:** the randomized schedule above, at least 95% survival, and mean episode RMS position error ≤75% of a frozen trained hover policy's mean episode RMS. That baseline continues holding `(0,0,1)`; it is not supplied moving-target errors. Each paired evaluation receives an identical pre-generated command plan.
+
+Every episode contributes its full 2,000-control error horizon. Failure and remaining tail controls receive squared error `37.0625 m²`, the worst arena-to-target bound (`4² + 4² + 2.25²`). Reports distinguish mean episode RMS (the gate), pooled RMS, short-/long-interval pooled RMS, maximum error including failure padding, and action saturation. Saturation is the fraction of executed rotor controls with `abs(tanh(raw_action)) >= 0.99`; nonexistent failure-tail controls do not enter that denominator.
+
+`rl/train.py --task tracking` trains the mixed schedule; `--schedule settling|mixed` filters evaluation only. Tracking checkpoints bind the exact 2,000-control task configuration. `--init-checkpoint` loads weights with a fresh optimizer and records their provenance. Checkpoints and evaluation JSON are retained under ignored `cuda/build/`, not embedded in source control.
+
+#### Tracking training and measured acceptance
+
+Tracking seeds 11 and 22 independently initialized from the previously trained hover seeds 1 and 2, respectively, using fresh optimizers. Each trained for 80,019,456 tracking transitions (80 million requested, rounded to the final complete rollout), with learning rate 0.0025 and the existing 1,024-environment / 64-control rollout / 8,192-transition minibatch / replay-ratio-2 configuration. These are hover-initialized tracking policies, not tracking runs from scratch. Development evaluation used 128 episodes on seeds 5000011 and 5000022. Initial 40-million-transition runs at learning rate 0.0005 failed; increasing learning updates and training duration—not changing the task, reward, or gates—produced the accepted policies.
+
+Both saved policies loaded with `weights_only=True` and passed both suites on previously unused evaluation seeds. The paired frozen baseline was `hover-final-seed1.pt`, holding `(0,0,1)`; it survived all baseline episodes.
+
+| Training seed | Fresh evaluation seed | Settled targets | Settling survival | Mixed survival | Mixed mean episode RMS / baseline | Baseline RMS ratio |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 11 | 910000011 | 4,096 / 4,096 (100%) | 1,024 / 1,024 | 997 / 1,024 (97.36%) | 0.5772 / 0.8384 m | 68.84% |
+| 22 | 910000022 | 4,033 / 4,096 (98.46%) | 1,021 / 1,024 (99.71%) | 1,011 / 1,024 (98.73%) | 0.5395 / 0.8432 m | 63.99% |
+
+| Policy / suite | Mean episode RMS | Pooled RMS | Short / long interval RMS | Maximum error | Action saturation |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 11 / settling | 0.3702 m | 0.3745 m | — / 0.3745 m | 1.5924 m | 0% |
+| 22 / settling | 0.3842 m | 0.4192 m | — / 0.4192 m | 6.0879 m | 0% |
+| 11 / mixed | 0.5772 m | 0.8084 m | 1.0909 / 0.7885 m | 6.0879 m | 0.000481% |
+| 22 / mixed | 0.5395 m | 0.6448 m | 0.9768 / 0.6188 m | 6.0879 m | 0% |
+
+The 6.0879 m maxima include the explicit failure padding; failures were not discarded. All five native CTests and four Python regression tests passed. The new tests cover command bounds/timing and replay, uninterrupted physical state, old-target reward ordering, failure-tail error accounting, missed settling targets, and original-plan short/long classification after autoreset. An independent recorded-state check recomputed the final-50-control settling windows and matched every native finish/settlement flag across 128 × 2,000 controls (486 settled commands on the development policy). Compute Sanitizer reported zero errors. Both original hover checkpoints still achieved 1,024 / 1,024 hover successes on their regression seeds.
+
+Warmed hover and tracking rollout traces each recorded 3,338 kernels and 513 device-to-device copies for 1,024 environments × 64 controls, with no recorded host-copy activities, scalar readbacks, CUDA allocation/free calls, or host synchronization in the collection interval. This checks rollout residency, not learner-update residency or a controlled throughput comparison. The Nix shell also supplies zlib, required for NumPy to import independently of Torch.
+
+After creating the hover checkpoints with the commands above, reproduce the training and acceptance runs inside `nix develop`:
+
+```sh
+cuda/build/rl-venv/bin/python rl/train.py train --task tracking --seed 11 --init-checkpoint cuda/build/hover-final-seed1.pt --steps 80000000 --learning-rate 0.0025 --log-every 200 --eval-envs 128 --eval-seed 5000011 --checkpoint cuda/build/tracking-final-seed11.pt --output cuda/build/tracking-final-development-seed11.json
+cuda/build/rl-venv/bin/python rl/train.py train --task tracking --seed 22 --init-checkpoint cuda/build/hover-final-seed2.pt --steps 80000000 --learning-rate 0.0025 --log-every 200 --eval-envs 128 --eval-seed 5000022 --checkpoint cuda/build/tracking-final-seed22.pt --output cuda/build/tracking-final-development-seed22.json
+cuda/build/rl-venv/bin/python rl/train.py eval --task tracking --checkpoint cuda/build/tracking-final-seed11.pt --baseline-checkpoint cuda/build/hover-final-seed1.pt --eval-envs 1024 --eval-seed 910000011 --output cuda/build/tracking-acceptance-seed11.json
+cuda/build/rl-venv/bin/python rl/train.py eval --task tracking --checkpoint cuda/build/tracking-final-seed22.pt --baseline-checkpoint cuda/build/hover-final-seed1.pt --eval-envs 1024 --eval-seed 910000022 --output cuda/build/tracking-acceptance-seed22.json
+cuda/build/rl-venv/bin/python -m unittest rl.test_advantage rl.test_tracking
+cuda/build/rl-venv/bin/python rl/profile_rollout.py --task tracking
+```
+
+This completes the agreed fixed-vehicle target-tracking slice, not the remaining Phase 1/2 roadmap, general Gymnasium compatibility, or sim-to-real validation.
+
 ### Phase 3: Rendering integration and replay
 
 **Goal:** Add visualization and bounded visual sensing without coupling renderer cadence to training cadence.

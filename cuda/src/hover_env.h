@@ -26,7 +26,26 @@ enum triage_hover_field {
                                          2 invalid state, 3 invalid params */
   TRIAGE_HOVER_EPISODE_COUNTS = 8,     /* uint64 [N], completed episodes */
   TRIAGE_HOVER_CURRENT_RETURNS = 9,    /* float [N], zero after autoreset */
-  TRIAGE_HOVER_CURRENT_LENGTHS = 10    /* float [N], zero after autoreset */
+  TRIAGE_HOVER_CURRENT_LENGTHS = 10,   /* float [N], zero after autoreset */
+  /* Tracking-only fields; requesting them from a hover env is an error.
+   * Final observations and final_targets describe the just-finished step,
+   * before both command replacement and physical autoreset. Targets and
+   * command_index describe the next observation, including after autoreset.
+   * All tracking buffers are read-only to consumers.
+   */
+  TRIAGE_TRACKING_TARGETS = 11,          /* float [N,3], next target xyz */
+  TRIAGE_TRACKING_FINAL_TARGETS = 12,    /* float [N,3], preceding target xyz */
+  TRIAGE_TRACKING_COMMAND_DURATION = 13, /* float [N], preceding duration */
+  TRIAGE_TRACKING_COMMAND_ELAPSED = 14,  /* float [N], preceding age, 1-based */
+  TRIAGE_TRACKING_COMMAND_FINISHED =
+      15, /* float [N], scheduled end, no failure */
+  TRIAGE_TRACKING_COMMAND_SETTLED = 16, /* float [N], finished and last 50 steps
+                                          distance <= .2 and speed <= .2 */
+  TRIAGE_TRACKING_COMMAND_INDEX = 17, /* uint64 [N], next command, zero-based */
+  TRIAGE_TRACKING_ACTION_SATURATION =
+      18,                           /* float [N], fraction |tanh(raw)|>=.99 */
+  TRIAGE_TRACKING_COMMAND_PLAN = 19 /* float [N,101,4], xyz and duration;
+                                     replaced on each episode reset */
 };
 
 /* n and max_steps must be positive; max_steps <= 2^24 (exact float lengths).
@@ -39,6 +58,26 @@ enum triage_hover_field {
  */
 void *triage_hover_create(int device, size_t n, uint64_t seed, int max_steps,
                           void *stream);
+/* Tracking uses the same reset/step/buffer/destroy/error functions below.
+ * max_steps must be in [1,2000]; schedule 0 is 75% uniform integer [200,500],
+ * 25% uniform integer [20,100], and schedule 1 is fixed 500. The complete plan
+ * is generated on-device before initial observations, keyed by seed, row,
+ * episode and command independently of physical state/reset sampling.
+ * Targets are uniform in x/y [-1,1], z [.75,1.75], rejection sampled to lie
+ * [.5,1.5] from the preceding command (initially (0,0,1)).
+ * Observation positions are world position minus current target; all other
+ * fields and motor mapping match hover. Safety is target-independent:
+ * x/y [-3,3], z [.05,3], tilt <= .8, finite state/actions.
+ * Reward and final buffers use the old command; replacement never resets
+ * physical state. Failure overrides scheduled completion; timeout counts as
+ * command completion only when its scheduled boundary coincides.
+ * Explicit reset clears preceding-step metrics to zero, pairs final_targets
+ * with initial final_observations, and restarts episode/command indices at 0.
+ * Evaluators needing the terminated episode's future commands must clone its
+ * initial plan before stepping; autoreset replaces it in-place.
+ */
+void *triage_tracking_create(int device, size_t n, uint64_t seed, int max_steps,
+                             int schedule, void *stream);
 int triage_hover_reset(void *env, uint64_t seed, void *stream);
 int triage_hover_step(void *env, const float *actions, void *stream);
 void *triage_hover_buffer(void *env, int field);
