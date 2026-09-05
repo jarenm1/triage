@@ -675,6 +675,42 @@ This completes the agreed fixed-vehicle target-tracking slice, not the remaining
 
 **Exit gate:** A trained trajectory can be viewed live and replayed; the headless step path remains render-independent; visual correctness fixtures pass; throughput impact is measured rather than assumed.
 
+#### Current sensor-inspection slice
+
+JJ change `uunkvlmu` starts the visual/data path independently of drone training. `sim-inspection` supplies a shared version-1 scene configuration: explicit axis-aligned boxes with stable nonzero uint32 IDs, names, positions, scales and linear colors, plus camera pose, vertical field of view, clipping planes and resolution. Both the native window inspector and headless renderer consume this configuration. Coordinates are explicitly right-handed **Y-up, in metres**, matching the renderer; this is not yet the ENU/FLU physics `RenderSnapshot` adapter.
+
+The inspector displays RGB, optical depth, instance colors, and a separate observer view with the sensor's true near/far frustum, world axes, and object identity callouts. Observer gizmos never enter sensor labels. Camera intrinsics use pixel centers `(column+0.5,row+0.5)` with the image origin at the upper-left edge. Exported extrinsics map world coordinates into optical X-right/Y-down/Z-forward coordinates and are stored column-major.
+
+Interactive presentation uses `GpuInspector` and the existing renderer's frame graph, mesh registry, and transient texture pool. Both scene views use `Renderer::execute_gpu`, which skips readback scheduling. Sensor outputs are copied into persistent sampled GPU textures before the observer graph can reuse transient attachments. Panel coloring, text and callouts are composed on the GPU and presented through a `wgpu` surface. Meshes, pipelines, font atlas and sampled textures persist; sensor textures resize only when sensor dimensions change. Camera input only updates the scene and requests redraw. Explicit export retains the synchronous CPU capture path.
+
+The initial CPU-preview design was rejected after an instrumented debug-build run measured a 792.63 ms median camera-update path: roughly 39 ms sensor capture/readback, 2 ms observer capture, 220 ms CPU panel construction and 532 ms CPU preview resizing. The replacement's warmed, offscreen GPU-completed frame benchmark measured 0.544 ms median over 16 camera updates at 948×1064 output with 640×480 sensors on the RTX 2070 SUPER. Completion waits were benchmark-only; the interactive rendering method does not poll or wait for readback. These are pipeline timings, not desktop input-to-photon latency or a vsync/frame-rate guarantee. The GPU-composited image was inspected offscreen.
+
+Native controls: arrows orbit the camera; `+`/`-` dolly; PageUp/PageDown translate camera height; `[`/`]` change FOV; `S` saves the configuration; `L` reloads; `R` resets the unsaved scene; `E` explicitly exports a capture; Escape closes. A missing window scene file starts the default scene. Invalid reloads report an error and preserve the current valid scene. Repeated window exports use unique subdirectories under `target/inspection/`.
+
+```sh
+nix develop
+cargo run -p window-demo -- --inspect
+# Or edit/reload a specific scene:
+cargo run -p window-demo -- --inspect target/my-scene.json
+cargo run -p render-smoke -- --inspect --output target/my-capture --verify
+cargo run -p render-smoke -- --inspect --scene target/my-capture/scene.json --output target/my-replay
+```
+
+Capture destinations must be absent or empty. A complete bundle is published together rather than overwriting a previous capture with partially updated files:
+
+- `scene.json`: the exact versioned scene configuration.
+- `metadata.json`: dimensions, layout, intrinsics, extrinsics, object identities and output interpretation.
+- `color.rgba8`: top-to-bottom, tightly packed **linear RGBA8 UNORM**, not sRGB; lighting is clipped/quantized by the existing sensor attachment.
+- `depth.f32le`: float32 little-endian optical Z-depth in metres; background is the camera's far value.
+- `object_ids.u32le`: uint32 little-endian IDs, with background `0`; no palette or 8-bit truncation.
+- `preview.png`: diagnostic panels only, including sRGB display conversion, false-color depth, instance palette and observer annotations.
+
+The headless `--verify` command checks all 76,800 pixels of an asymmetric, analytically projected two-box scene: visible IDs, occlusion, optical depths 3.5/5.5 m and far-plane background. It also verifies exact RGB/depth/ID replay after saving and reloading the supplied scene on the current renderer. An independent export check reconstructed all 30,710 foreground pixels in the default 640×480 capture using its calibration; the maximum distance from the labelled box surface was 0.0000273 m, and IDs 11, 257 and 65539 survived export intact. This is same-backend replay evidence, not a promise of bit-identical rendering across devices.
+
+After the GPU presentation cutover, the headless geometry/replay checks still passed and all three raw sensor payloads were byte-identical to the preceding CPU-inspector capture. All four existing rendering/registry unit tests passed, and the unchanged headless demo still rendered its 401-instance scene. Unsupported scene versions are rejected without creating a capture bundle. The temporary latency probe and timing instrumentation were removed after measurement.
+
+This slice establishes inspectable sensor output and scene replay. Procedural scene distributions, large dataset batches, perception-model comparisons, physical camera motion and sim-to-real improvement remain separate milestones.
+
 ### Phase 4: Synthetic data and transfer evaluation
 
 **Goal:** Produce auditable datasets and answer whether they improve performance on held-out real data.

@@ -7,11 +7,16 @@ use sim_graphics::{
     ViewKey, ViewKind, ViewOutputs,
 };
 
+mod inspection;
+
 fn main() -> Result<()> {
     pollster::block_on(run())
 }
 
 async fn run() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--inspect")) {
+        return inspection::run().await;
+    }
     let output = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
