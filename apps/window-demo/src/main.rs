@@ -17,8 +17,17 @@ const ARENA_HEIGHT: f32 = 26.0;
 const COLLISION_RADIUS: f32 = 0.85;
 
 #[cfg(not(target_arch = "wasm32"))]
-fn main() -> Result<(), sim_graphics_winit::WindowError> {
-    sim_graphics_winit::run("Autonomous Drone Swarm Simulator", DroneDemoScene::new())
+mod inspection;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn main() -> anyhow::Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("--inspect")) {
+        let path = args.next().map(std::path::PathBuf::from);
+        anyhow::ensure!(args.next().is_none(), "usage: window-demo --inspect [scene.json]");
+        return inspection::run(path);
+    }
+    Ok(sim_graphics_winit::run("Autonomous Drone Swarm Simulator", DroneDemoScene::new())?)
 }
 
 #[cfg(target_arch = "wasm32")]

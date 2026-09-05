@@ -357,6 +357,21 @@ impl Renderer {
         &self.device
     }
 
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Output of the last execution, valid until the next execution reuses the pool.
+    pub fn output_texture(&self, key: ViewKey, output: OutputKind) -> Option<&wgpu::Texture> {
+        let view = self.compiled_views.iter().find(|view| view.request.key == key)?;
+        let index = match output {
+            OutputKind::Color => view.color,
+            OutputKind::Depth => view.depth,
+            OutputKind::ObjectId => view.object_id,
+        }?;
+        Some(self.texture_pool.texture(index))
+    }
+
     pub fn adapter(&self) -> &wgpu::Adapter {
         &self.adapter
     }
@@ -446,6 +461,24 @@ impl Renderer {
         &mut self,
         frame: &Frame,
         external_views: &[ExternalView<'_>],
+    ) -> Result<FrameSubmission, RendererError> {
+        self.execute_inner(frame, external_views, true)
+    }
+
+    /// Execute the same frame graph without allocating or mapping readback buffers.
+    pub fn execute_gpu(
+        &mut self,
+        frame: &Frame,
+        external_views: &[ExternalView<'_>],
+    ) -> Result<FrameSubmission, RendererError> {
+        self.execute_inner(frame, external_views, false)
+    }
+
+    fn execute_inner(
+        &mut self,
+        frame: &Frame,
+        external_views: &[ExternalView<'_>],
+        readback: bool,
     ) -> Result<FrameSubmission, RendererError> {
         profiling::function_scope!();
         {
@@ -669,7 +702,7 @@ impl Renderer {
                     );
                     drop(pass);
 
-                    {
+                    if readback {
                         profiling::scope!("schedule sensor readbacks");
                         for (output, texture_index) in [
                             (OutputKind::Color, compiled.color),
