@@ -1,4 +1,4 @@
-"""Zero-copy, stream-ordered access to the native CUDA hover task."""
+"""Zero-copy, stream-ordered access to native CUDA hover and tracking tasks."""
 
 import ctypes
 from pathlib import Path
@@ -43,6 +43,41 @@ TASK_CONFIG = {
     "evaluation": {"steps": 2000, "maximum_distance": 1.0, "maximum_tilt": 0.7},
 }
 
+TRACKING_TASK_CONFIG = {
+    **TASK_CONFIG,
+    "version": 1,
+    "name": "randomized_target_tracking",
+    "target": {
+        "bounds": [[-1.0, 1.0], [-1.0, 1.0], [0.75, 1.75]],
+        "displacement": [0.5, 1.5],
+        "previous_initial": [0.0, 0.0, 1.0],
+        "sampling": "uniform box rejection, independent of physical trajectory",
+        "schedule": {"long_probability": 0.75, "long": [200, 500], "short": [20, 100]},
+        "rng": "seed/env/episode/command; independent of physical reset RNG",
+        "plan_commands": 101,
+    },
+    "observation_position": "world position minus active target; no future target or countdown",
+    "failure": {
+        "x_bounds": [-3.0, 3.0],
+        "y_bounds": [-3.0, 3.0],
+        "z_bounds": [0.05, 3.0],
+        "maximum_tilt": 0.8,
+        "nonfinite": True,
+    },
+    "target_transition": "reward/final observation use old target; next observation uses new target; no physical reset",
+    "evaluation": {
+        "steps": 2000,
+        "settling_duration": 500,
+        "settling_last_steps": 50,
+        "settling_distance": 0.2,
+        "settling_speed": 0.2,
+        "settled_fraction": 0.9,
+        "survival_fraction": 0.95,
+        "mixed_rms_baseline_ratio": 0.75,
+        "failed_step_squared_error": 37.0625,
+    },
+}
+
 
 class _CudaPtr:
     def __init__(self, owner, ptr, shape, typestr):
@@ -62,11 +97,15 @@ class HoverEnv:
     this object while using any view. close() invalidates every borrowed view.
     """
 
-    def __init__(self, n=1024, seed=1, max_steps=2000, device=0, library=None):
+    def __init__(
+        self, n=1024, seed=1, max_steps=2000, device=0, library=None, *, _schedule=None
+    ):
         if n <= 0 or max_steps <= 0:
             raise ValueError("n and max_steps must be positive")
         if not torch.cuda.is_available():
-            raise RuntimeError("Hover training requires CUDA; no CPU fallback exists")
+            raise RuntimeError(
+                "Flight environments require CUDA; no CPU fallback exists"
+            )
         self.device = torch.device("cuda", device)
         self.n = n
         self.max_steps = max_steps
@@ -93,9 +132,16 @@ class HoverEnv:
             fn.argtypes, fn.restype = args, result
         with torch.cuda.device(self.device):
             self.stream = torch.cuda.current_stream(self.device)
-            self.handle = self.lib.triage_hover_create(
-                device, n, seed, max_steps, self.stream.cuda_stream
-            )
+            if _schedule is None:
+                self.handle = self.lib.triage_hover_create(
+                    device, n, seed, max_steps, self.stream.cuda_stream
+                )
+            else:
+                create = self.lib.triage_tracking_create
+                create.argtypes, create.restype = [i, z, u, i, i, p], p
+                self.handle = create(
+                    device, n, seed, max_steps, _schedule, self.stream.cuda_stream
+                )
             if not self.handle:
                 self._raise()
             fields = [
@@ -111,6 +157,20 @@ class HoverEnv:
                 ("current_returns", (n,), "<f4"),
                 ("current_lengths", (n,), "<f4"),
             ]
+            if _schedule is not None:
+                fields.extend(
+                    [
+                        ("targets", (n, 3), "<f4"),
+                        ("final_targets", (n, 3), "<f4"),
+                        ("command_duration", (n,), "<f4"),
+                        ("command_elapsed", (n,), "<f4"),
+                        ("command_finished", (n,), "<f4"),
+                        ("command_settled", (n,), "<f4"),
+                        ("command_index", (n,), "<u8"),
+                        ("action_saturation", (n,), "<f4"),
+                        ("command_plan", (n, 101, 4), "<f4"),
+                    ]
+                )
             try:
                 for field, (name, shape, typestr) in enumerate(fields):
                     ptr = self.lib.triage_hover_buffer(self.handle, field)
@@ -125,14 +185,18 @@ class HoverEnv:
 
     def _raise(self):
         error = self.lib.triage_hover_error()
-        raise RuntimeError(error.decode() if error else "Native hover call failed")
+        raise RuntimeError(
+            error.decode() if error else "Native environment call failed"
+        )
 
     def _stream(self):
         if self.handle is None:
             raise RuntimeError("Environment is closed")
         stream = torch.cuda.current_stream(self.device)
         if stream.cuda_stream != self.stream.cuda_stream:
-            raise RuntimeError("Use the CUDA stream on which HoverEnv was created")
+            raise RuntimeError(
+                "Use the CUDA stream on which the environment was created"
+            )
         return stream.cuda_stream
 
     def reset(self, seed=None):
@@ -172,3 +236,24 @@ class HoverEnv:
 
     def __exit__(self, *exc):
         self.close()
+
+
+class TrackingEnv(HoverEnv):
+    """Tracking views share HoverEnv lifetime/stream rules; command_plan is read-only."""
+
+    def __init__(
+        self, n=1024, seed=1, max_steps=2000, device=0, library=None, schedule="mixed"
+    ):
+        if schedule not in ("mixed", "settling"):
+            raise ValueError("schedule must be mixed or settling")
+        if not 0 < max_steps <= 2000:
+            raise ValueError("tracking max_steps must be in [1,2000]")
+        self.schedule = schedule
+        super().__init__(
+            n,
+            seed,
+            max_steps,
+            device,
+            library,
+            _schedule=0 if schedule == "mixed" else 1,
+        )

@@ -1,19 +1,20 @@
-"""CUDA hover learning and checkpoint evaluation: python rl/train.py --help."""
+"""CUDA hover/tracking learning and checkpoint evaluation: python rl/train.py --help."""
 
 import argparse
 import json
 import math
-from pathlib import Path
 import sys
 import time
+from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from rl.environment import HoverEnv, TASK_CONFIG
+from rl.environment import TASK_CONFIG, TRACKING_TASK_CONFIG, HoverEnv, TrackingEnv
 from rl.policy import HoverPolicy
+from rl.tracking import evaluate_suites
 from rl.vendor.torch_pufferl import PuffeRL
 
 PUFFERLIB_COMMIT = "42f70d6932c30ac977736f861006809c50168ba9"
@@ -110,7 +111,10 @@ def save_checkpoint(path, learner, args, baseline, evaluation):
         {
             "checkpoint_version": CHECKPOINT_VERSION,
             "pufferlib_commit": PUFFERLIB_COMMIT,
-            "task": dict(TASK_CONFIG, max_steps=args.max_steps),
+            "task": dict(
+                TRACKING_TASK_CONFIG if args.task == "tracking" else TASK_CONFIG,
+                max_steps=args.max_steps,
+            ),
             "policy_config": {"hidden_size": args.hidden_size},
             "policy": learner.policy.state_dict(),
             "optimizer": learner.optimizer.state_dict(),
@@ -124,21 +128,71 @@ def save_checkpoint(path, learner, args, baseline, evaluation):
             "cuda_rng_state": torch.cuda.get_rng_state(args.device),
             "baseline": baseline,
             "evaluation": evaluation,
+            "initialization": args.initialization,
         },
         path,
     )
 
 
+def load_policy(path, task, device):
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Required {task} checkpoint does not exist: {path}")
+    checkpoint = torch.load(path, map_location=f"cuda:{device}", weights_only=True)
+    if (
+        checkpoint["checkpoint_version"] != CHECKPOINT_VERSION
+        or checkpoint["pufferlib_commit"] != PUFFERLIB_COMMIT
+    ):
+        raise ValueError("Unsupported checkpoint/learner version")
+    config = TRACKING_TASK_CONFIG if task == "tracking" else TASK_CONFIG
+    max_steps = checkpoint["task"]["max_steps"]
+    if (
+        checkpoint["task"] != dict(config, max_steps=max_steps)
+        or max_steps <= 0
+        or (task == "tracking" and max_steps != 2000)
+    ):
+        raise ValueError(f"Checkpoint task contract does not match {task} adapter")
+    policy = HoverPolicy(**checkpoint["policy_config"]).cuda(device)
+    policy.load_state_dict(checkpoint["policy"], strict=True)
+    policy.eval()
+    return policy, checkpoint
+
+
+def emit_report(report, output=None):
+    encoded = json.dumps(report, allow_nan=False)
+    if output:
+        path = Path(output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(encoded + "\n")
+    print(encoded, flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["train", "eval"])
-    parser.add_argument("--checkpoint", default="cuda/build/hover.pt")
+    parser.add_argument("--task", choices=["hover", "tracking"], default="hover")
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument(
+        "--baseline-checkpoint", default="cuda/build/hover-final-seed1.pt"
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="tracking weights-only initialization; fresh optimizer and rollout state",
+    )
+    parser.add_argument(
+        "--schedule",
+        choices=["mixed", "settling"],
+        default=None,
+        help="tracking eval suite filter; default evaluates both (training is always mixed)",
+    )
+    parser.add_argument("--output", default=None, help="retain final evaluation JSON")
     parser.add_argument("--num-envs", type=int, default=1024)
     parser.add_argument("--horizon", type=int, default=64)
     parser.add_argument("--steps", type=int, default=20_000_000)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--eval-seed", type=int, default=None)
-    parser.add_argument("--eval-envs", type=int, default=256)
+    parser.add_argument("--eval-envs", type=int, default=None)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--library", default=None)
     parser.add_argument("--hidden-size", type=int, default=128)
@@ -154,6 +208,19 @@ def main():
         help="updates between evaluation/checkpointing (0: final only)",
     )
     args = parser.parse_args()
+    args.checkpoint = args.checkpoint or f"cuda/build/{args.task}.pt"
+    args.eval_envs = (
+        args.eval_envs
+        if args.eval_envs is not None
+        else (1024 if args.task == "tracking" else 256)
+    )
+    args.initialization = None
+    if args.schedule is not None and (args.mode != "eval" or args.task != "tracking"):
+        parser.error("--schedule is only for tracking evaluation; training uses mixed")
+    if args.init_checkpoint and (args.mode != "train" or args.task != "tracking"):
+        parser.error("--init-checkpoint is only for tracking training")
+    if args.task == "tracking" and args.max_steps != 2000:
+        parser.error("tracking task version 1 requires --max-steps 2000")
     for name in (
         "num_envs",
         "horizon",
@@ -175,87 +242,130 @@ def main():
             "eval-every must be nonnegative; minibatch-size must be a multiple of horizon"
         )
     seed_all(args.seed, args.device)
-    if args.mode == "eval":
-        checkpoint = torch.load(
-            args.checkpoint, map_location=f"cuda:{args.device}", weights_only=True
+    baseline_policy = None
+    if args.task == "tracking":
+        baseline_policy, baseline_checkpoint = load_policy(
+            args.baseline_checkpoint, "hover", args.device
         )
-        if (
-            checkpoint["checkpoint_version"] != CHECKPOINT_VERSION
-            or checkpoint["pufferlib_commit"] != PUFFERLIB_COMMIT
-        ):
-            raise ValueError("Unsupported checkpoint/learner version")
-        expected_task = dict(TASK_CONFIG, max_steps=checkpoint["task"]["max_steps"])
-        if checkpoint["task"] != expected_task:
-            raise ValueError(
-                "Checkpoint task contract does not match this native adapter"
+        baseline_policy.requires_grad_(False)
+
+    def evaluation_report(policy):
+        if args.task == "tracking":
+            report = evaluate_suites(
+                policy,
+                baseline_policy,
+                args.eval_envs,
+                args.eval_seed,
+                args.device,
+                args.library,
+                args.schedule,
             )
+            report["baseline_checkpoint"] = str(
+                Path(args.baseline_checkpoint).resolve()
+            )
+            return report
+        return evaluate(
+            policy, args.eval_envs, args.eval_seed, args.device, args.library
+        )
+
+    if args.mode == "eval":
+        policy, checkpoint = load_policy(args.checkpoint, args.task, args.device)
         args.eval_seed = (
             checkpoint["eval_seed"] if args.eval_seed is None else args.eval_seed
         )
         if args.eval_seed == checkpoint["seed"]:
             parser.error("evaluation seed must be held out from the training seed")
-        policy = HoverPolicy(**checkpoint["policy_config"]).cuda(args.device)
-        policy.load_state_dict(checkpoint["policy"])
-        policy.eval()
-        print(
-            json.dumps(
-                {
-                    "baseline": evaluate(
-                        policy,
-                        args.eval_envs,
-                        args.eval_seed,
-                        args.device,
-                        args.library,
-                        True,
-                    ),
-                    "evaluation": evaluate(
-                        policy,
-                        args.eval_envs,
-                        args.eval_seed,
-                        args.device,
-                        args.library,
-                    ),
-                }
-            ),
-            flush=True,
-        )
+        if args.task == "tracking" and args.eval_seed == baseline_checkpoint["seed"]:
+            parser.error(
+                "evaluation seed must be held out from the baseline training seed"
+            )
+        report = evaluation_report(policy)
+        if args.task == "hover":
+            report = {
+                "baseline": evaluate(
+                    policy,
+                    args.eval_envs,
+                    args.eval_seed,
+                    args.device,
+                    args.library,
+                    True,
+                ),
+                "evaluation": report,
+            }
+        report["checkpoint"] = str(Path(args.checkpoint).resolve())
+        emit_report(report, args.output)
         return
     args.eval_seed = (
         (args.seed + 1_000_003) % (2**63) if args.eval_seed is None else args.eval_seed
     )
     if args.eval_seed == args.seed:
         parser.error("evaluation seed must be held out from the training seed")
-    policy = HoverPolicy(args.hidden_size).cuda(args.device)
-    baseline = evaluate(
-        policy, args.eval_envs, args.eval_seed, args.device, args.library, True
+    if args.task == "tracking" and args.eval_seed == baseline_checkpoint["seed"]:
+        parser.error("evaluation seed must be held out from the baseline training seed")
+    if args.init_checkpoint:
+        source = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
+        source_task = (
+            "tracking"
+            if source["task"].get("name") == "randomized_target_tracking"
+            else "hover"
+        )
+        policy, source = load_policy(args.init_checkpoint, source_task, args.device)
+        if source["policy_config"] != {"hidden_size": args.hidden_size}:
+            parser.error("--hidden-size must match --init-checkpoint")
+        if args.eval_seed == source["seed"]:
+            parser.error(
+                "evaluation seed must be held out from the initialization training seed"
+            )
+        args.initialization = {
+            "checkpoint": str(Path(args.init_checkpoint).resolve()),
+            "task": source_task,
+            "source_seed": source["seed"],
+            "source_global_step": source["global_step"],
+            "weights_only": True,
+            "optimizer": "fresh",
+        }
+    else:
+        policy = HoverPolicy(args.hidden_size).cuda(args.device)
+    baseline = (
+        {"checkpoint": str(Path(args.baseline_checkpoint).resolve())}
+        if args.task == "tracking"
+        else evaluate(
+            policy, args.eval_envs, args.eval_seed, args.device, args.library, True
+        )
     )
-    initial = evaluate(
-        policy, args.eval_envs, args.eval_seed, args.device, args.library
+    # Tracking final acceptance is not used for initialization/checkpoint selection.
+    initial = None if args.task == "tracking" else evaluation_report(policy)
+    emit_report(
+        {
+            "baseline": baseline,
+            "initial_policy": initial,
+            "initialization": args.initialization,
+        }
     )
-    print(json.dumps({"baseline": baseline, "initial_policy": initial}), flush=True)
-    config = dict(
-        horizon=args.horizon,
-        total_timesteps=args.steps,
-        minibatch_size=args.minibatch_size,
-        learning_rate=args.learning_rate,
-        replay_ratio=args.replay_ratio,
-        beta1=0.9,
-        eps=1e-8,
-        prio_alpha=0.8,
-        prio_beta0=0.2,
-        clip_coef=0.2,
-        vf_clip_coef=0.2,
-        anneal_lr=True,
-        min_lr_ratio=0.0,
-        gamma=0.99,
-        gae_lambda=0.95,
-        vtrace_rho_clip=1.0,
-        vtrace_c_clip=1.0,
-        vf_coef=0.5,
-        ent_coef=0.001,
-        max_grad_norm=1.0,
-    )
-    with HoverEnv(
+    config = {
+        "horizon": args.horizon,
+        "total_timesteps": args.steps,
+        "minibatch_size": args.minibatch_size,
+        "learning_rate": args.learning_rate,
+        "replay_ratio": args.replay_ratio,
+        "beta1": 0.9,
+        "eps": 1e-8,
+        "prio_alpha": 0.8,
+        "prio_beta0": 0.2,
+        "clip_coef": 0.2,
+        "vf_clip_coef": 0.2,
+        "anneal_lr": True,
+        "min_lr_ratio": 0.0,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "vtrace_rho_clip": 1.0,
+        "vtrace_c_clip": 1.0,
+        "vf_coef": 0.5,
+        "ent_coef": 0.001,
+        "max_grad_norm": 1.0,
+    }
+    env_class = TrackingEnv if args.task == "tracking" else HoverEnv
+    with env_class(
         args.num_envs, args.seed, args.max_steps, args.device, args.library
     ) as env:
         learner = PuffeRL(config, env, policy)
@@ -290,9 +400,14 @@ def main():
                 args.eval_every and learner.epoch % args.eval_every == 0
             ) or learner.global_step >= args.steps:
                 policy.eval()
-                evaluation = evaluate(
-                    policy, args.eval_envs, args.eval_seed, args.device, args.library
+                # Intermediate tracking checkpoints never query the final held-out suites.
+                evaluation = (
+                    evaluation_report(policy)
+                    if args.task == "hover" or learner.global_step >= args.steps
+                    else None
                 )
+                if args.output and evaluation is not None:
+                    emit_report(evaluation, args.output)
                 save_checkpoint(args.checkpoint, learner, args, baseline, evaluation)
                 print(
                     json.dumps(
