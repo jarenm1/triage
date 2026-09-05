@@ -56,11 +56,13 @@ if(SIM_CUDA_ENABLE_CUDA)
     POSITION_INDEPENDENT_CODE ON
   )
 
-  add_executable(sim_cuda_integrator_benchmark benchmarks/integrator_benchmark.cu)
-  target_link_libraries(sim_cuda_integrator_benchmark
+  add_executable(sim_cuda_physics_benchmark benchmarks/physics_benchmark.cpp)
+  target_link_libraries(sim_cuda_physics_benchmark
     PRIVATE sim_cuda_runtime sim_cuda_reference)
-  target_compile_definitions(sim_cuda_integrator_benchmark
-    PRIVATE SIM_CUDA_BUILD_PROFILE="$<CONFIG>")
+  target_compile_definitions(sim_cuda_physics_benchmark PRIVATE
+    SIM_CUDA_BUILD_PROFILE="$<CONFIG>"
+    SIM_CUDA_COMPILER_VERSION="${CMAKE_CUDA_COMPILER_VERSION}"
+    SIM_CUDA_HOST_COMPILER_VERSION="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 
   if(BUILD_TESTING)
     add_executable(sim_cuda_runtime_smoke tests/runtime_smoke.cu)

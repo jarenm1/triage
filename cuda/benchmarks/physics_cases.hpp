@@ -95,7 +95,7 @@ inline Quaternion<double> normalized(Quaternion<double> q) {
 }
 
 // Independent RK4 integration of the same physical equations, not repeated
-// calls to either candidate. Stage motor speeds feed each stage's wrench.
+// calls to production stepping. Stage motor speeds feed each stage's wrench.
 inline ReferenceState derivative(const ReferenceState &state,
                                  const ReferenceActions &actions,
                                  const ReferenceVehicleParameters &parameters) {
