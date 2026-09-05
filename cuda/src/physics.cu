@@ -25,7 +25,7 @@ __global__ void physics_step_kernel(const DeviceState *current_states,
   DeviceState state = current_states[environment_index];
   const DeviceActions action = actions[environment_index];
   for (int substep = 0; substep < substeps; ++substep) {
-    state = model::step_substep(state, action, parameters, timestep);
+    state = model::step_midpoint(state, action, parameters, timestep);
   }
   next_states[environment_index] = state;
 }

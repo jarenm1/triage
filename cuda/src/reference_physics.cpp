@@ -67,8 +67,8 @@ ReferenceState step_reference(const ReferenceState &initial_state,
   validate_reference_parameters(parameters, physics_timestep_seconds, substeps);
   ReferenceState state = initial_state;
   for (int substep = 0; substep < substeps; ++substep) {
-    state = model::step_substep(state, actions, parameters,
-                                physics_timestep_seconds);
+    state = model::step_midpoint(state, actions, parameters,
+                                 physics_timestep_seconds);
   }
   return state;
 }

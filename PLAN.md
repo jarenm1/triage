@@ -200,6 +200,16 @@ The selected method must:
 
 RK4 is therefore a candidate, not an architectural requirement.
 
+#### Current integration selection (2026-09-04)
+
+Production CPU and CUDA stepping now use coupled explicit midpoint/RK2, including motor speeds at both stages and normalized stage/output attitude. The split semi-implicit method remains a benchmark baseline, not a production option. Each supplied physics timestep must be strictly less than twice **every** rotor time constant; validation rejects the non-decaying motor limit and larger steps without silently subdividing time. This is a motor stability condition, not a general rigid-body stability or accuracy guarantee.
+
+Reproduce the comparison with `nu cuda/build.nu --release` followed by `cuda/build/sim_cuda_integrator_benchmark` (optional `--environments N`). It compares 1–2,048 physics substeps per 10 ms control interval against double-precision RK4 traces, checks reference refinement, and reports endpoint errors separately from warmed CUDA-event and completion-inclusive wall timing.
+
+On the RTX 2070 SUPER, a 10,000-environment **homogeneous replicated** batch over 100 control calls passed all four scenarios—hover, motor command reversals, coupled attitude motion, and unequal-inertia torque-free rotation—with midpoint at **16 substeps (0.625 ms)**. Maximum errors across these traces were approximately 0.107 mm position, 0.192 mm/s velocity, 0.000146 rad/s angular rate, 0.0000116 rad attitude, and 0.0422 rad/s rotor speed. The provisional gates are 1 mm, 1 mm/s, 0.001 rad/s, 0.001 rad, and 0.1 rad/s respectively. No tested baseline substep count passed every gate across all four scenarios; fine-step float32 error is not monotonically decreasing.
+
+Release-build median device times for the selected configuration were 3.2–6.9 ms per 100-control-call trajectory, depending on scenario, with uncontrolled clocks/power. These are physics-only measurements, not full-environment or training throughput, and do not establish a matched-accuracy speedup ratio when no baseline configuration passes. The scenario/parameter envelope is defined in `cuda/benchmarks/integrator_cases.hpp`; 0.625 ms is a measured starting point, not a universal timestep default or proof of the broader flight envelope.
+
 ---
 
 ## 5. Logical State and Tensor Contracts
