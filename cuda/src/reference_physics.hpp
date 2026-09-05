@@ -1,6 +1,6 @@
 #pragma once
 
-#include "physics_types.cuh"
+#include "physics_types.hpp"
 
 namespace sim_cuda {
 

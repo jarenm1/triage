@@ -1,5 +1,6 @@
 #include "reference_physics.hpp"
-#include "physics_model.cuh"
+#include "physics_integration.hpp"
+#include "physics_validation.hpp"
 
 namespace sim_cuda {
 

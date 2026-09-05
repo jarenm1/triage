@@ -75,6 +75,8 @@ template <typename Scalar> struct VehicleParameters {
   FixedArray<RotorParameters<Scalar>, kRotorCount> rotors;
 };
 
+// Suffixes identify world (w) and body (b) coordinates. attitude_wb is a
+// scalar-first unit quaternion rotating body-frame vectors into world space.
 template <typename Scalar> struct MultirotorState {
   Vec3<Scalar> position_w;
   Quaternion<Scalar> attitude_wb;

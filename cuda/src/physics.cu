@@ -1,5 +1,6 @@
 #include "physics.cuh"
-#include "physics_model.cuh"
+#include "physics_integration.hpp"
+#include "physics_validation.hpp"
 
 #include <cuda_runtime.h>
 
