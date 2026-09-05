@@ -1,5 +1,5 @@
 #include "benchmark_report.hpp"
-#include "physics.cuh"
+#include "physics_batch.hpp"
 #include "physics_cases.hpp"
 
 #include <cuda_runtime.h>
@@ -18,6 +18,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -215,14 +216,37 @@ Timing summarize(std::array<double, trials> values) {
 
 class Workspace {
 public:
-  explicit Workspace(std::size_t n)
-      : initial(n), states(n), next(n), schedule(n * cases::control_steps),
-        endpoints(samples * cases::control_steps), host_initial(n),
+  Workspace(std::size_t n, const cases::Scenario &scenario,
+            int substeps = production_substeps)
+      : initial(n), parameters(n), schedule(n * cases::control_steps),
+        endpoints(samples * cases::control_steps), mask(n), reset_status(n),
+        indices(samples), export_status(samples * cases::control_steps),
+        host_initial(n), host_parameters(n),
         host_schedule(n * cases::control_steps),
-        trace(samples * cases::control_steps), count(n) {}
+        trace(samples * cases::control_steps), host_reset_status(n),
+        host_export_status(samples * cases::control_steps), count(n) {
+    const std::array<std::uint32_t, samples> selected{
+        0, static_cast<std::uint32_t>(count / 2),
+        static_cast<std::uint32_t>(count - 1)};
+    check(cudaMemcpyAsync(indices.get(), selected.data(), sizeof(selected),
+                          cudaMemcpyHostToDevice, stream.get()),
+          "upload export indices");
+    check(cudaMemsetAsync(mask.get(), 1, count * sizeof(std::uint8_t),
+                          stream.get()),
+          "initialize reset mask");
+    upload(scenario);
+    int device = 0;
+    check(cudaGetDevice(&device), "get batch device");
+    batch = std::make_unique<PhysicsBatch>(
+        BatchConfig{device, count,
+                    static_cast<float>(cases::control_dt / substeps), substeps},
+        DeviceSpan<const State>{initial.get(), count},
+        DeviceSpan<const Parameters>{parameters.get(), count}, stream.get());
+  }
 
   void upload(const cases::Scenario &scenario) {
-    parameters = narrow(scenario.parameters);
+    std::fill(host_parameters.begin(), host_parameters.end(),
+              narrow(scenario.parameters));
     std::fill(host_initial.begin(), host_initial.end(),
               narrow(scenario.initial));
     for (int c = 0; c < cases::control_steps; ++c) {
@@ -236,57 +260,74 @@ public:
                           count * sizeof(State), cudaMemcpyHostToDevice,
                           stream.get()),
           "upload initial states");
+    check(cudaMemcpyAsync(parameters.get(), host_parameters.data(),
+                          count * sizeof(Parameters), cudaMemcpyHostToDevice,
+                          stream.get()),
+          "upload per-environment parameters");
     check(cudaMemcpyAsync(schedule.get(), host_schedule.data(),
                           host_schedule.size() * sizeof(Actions),
                           cudaMemcpyHostToDevice, stream.get()),
           "upload action schedule");
     check(cudaStreamSynchronize(stream.get()), "upload completion");
+    if (batch)
+      reset();
   }
   void reset() {
-    check(cudaMemcpyAsync(states.get(), initial.get(), count * sizeof(State),
-                          cudaMemcpyDeviceToDevice, stream.get()),
-          "reset states");
+    batch->apply_reset({mask.get(), count}, {initial.get(), count},
+                       {parameters.get(), count}, {reset_status.get(), count},
+                       stream.get());
+    check(cudaMemcpyAsync(host_reset_status.data(), reset_status.get(),
+                          count * sizeof(ResetStatus), cudaMemcpyDeviceToHost,
+                          stream.get()),
+          "read reset status");
     check(cudaStreamSynchronize(stream.get()), "reset completion");
+    for (std::size_t i = 0; i < count; ++i)
+      if (host_reset_status[i] != ResetStatus::applied)
+        throw std::runtime_error("batch reset rejected environment " +
+                                 std::to_string(i));
   }
-  void trajectory(int substeps, bool record) {
-    State *current = states.get(), *output = next.get();
-    const std::array<std::size_t, samples> indices{0, count / 2, count - 1};
+  void trajectory(bool record) {
     for (int c = 0; c < cases::control_steps; ++c) {
-      sim_cuda::launch_physics_step(
-          current, schedule.get() + c * count, output, count, parameters,
-          static_cast<float>(cases::control_dt / substeps), substeps,
-          stream.get());
-      std::swap(current, output);
+      batch->step({schedule.get() + c * count, count}, stream.get());
       if (record) {
-        for (std::size_t sample = 0; sample < samples; ++sample)
-          check(cudaMemcpyAsync(endpoints.get() + c * samples + sample,
-                                current + indices[sample], sizeof(State),
-                                cudaMemcpyDeviceToDevice, stream.get()),
-                "record sampled control endpoint");
+        ExportBuffers outputs{};
+        outputs.states = {endpoints.get() + c * samples, samples};
+        outputs.status = {export_status.get() + c * samples, samples};
+        batch->export_state(
+            ExportSelection{SelectionKind::indexed, {indices.get(), samples}},
+            outputs, stream.get());
       }
     }
   }
-  Errors accuracy(int substeps, const std::vector<ReferenceState> &reference) {
+  Errors accuracy(const std::vector<ReferenceState> &reference) {
     reset();
-    trajectory(substeps, true);
+    trajectory(true);
     check(cudaMemcpyAsync(trace.data(), endpoints.get(),
                           trace.size() * sizeof(State), cudaMemcpyDeviceToHost,
                           stream.get()),
           "read accuracy trace");
+    check(cudaMemcpyAsync(host_export_status.data(), export_status.get(),
+                          host_export_status.size() * sizeof(ExportStatus),
+                          cudaMemcpyDeviceToHost, stream.get()),
+          "read export status");
     check(cudaStreamSynchronize(stream.get()), "accuracy completion");
+    for (std::size_t i = 0; i < host_export_status.size(); ++i)
+      if (host_export_status[i] != ExportStatus::exported)
+        throw std::runtime_error("batch export rejected endpoint sample " +
+                                 std::to_string(i));
     return compare(trace, reference);
   }
   report::Measurement measure(const cases::Scenario &scenario,
                               const Errors &errors) {
     reset();
-    trajectory(production_substeps, false);
+    trajectory(false);
     check(cudaStreamSynchronize(stream.get()), "warmup completion");
     std::array<double, trials> gpu{}, wall{};
     for (int t = 0; t < trials; ++t) {
       reset();
       const auto before = std::chrono::steady_clock::now();
       check(cudaEventRecord(start.get(), stream.get()), "record start");
-      trajectory(production_substeps, false);
+      trajectory(false);
       check(cudaEventRecord(stop.get(), stream.get()), "record stop");
       check(cudaEventSynchronize(stop.get()), "timed completion");
       const auto after = std::chrono::steady_clock::now();
@@ -313,27 +354,47 @@ public:
             w.maximum};
   }
   void memory_accounting() const {
-    std::cout << "# environments=" << count
-              << "; owned_device_allocation_bytes="
-              << (3 * count + samples * cases::control_steps) * sizeof(State) +
-                     count * cases::control_steps * sizeof(Actions)
-              << "; host_input_and_endpoint_payload_bytes="
-              << (count + samples * cases::control_steps) * sizeof(State) +
-                     count * cases::control_steps * sizeof(Actions)
-              << '\n';
+    std::cout
+        << "# environments=" << count
+        << "; workspace_device_payload_lower_bound_bytes="
+        << (2 * count + samples * cases::control_steps) * sizeof(State) +
+               2 * count * sizeof(Parameters) +
+               count * cases::control_steps * sizeof(Actions) +
+               count * (sizeof(std::uint8_t) + sizeof(ResetStatus)) +
+               samples * sizeof(std::uint32_t) +
+               samples * cases::control_steps * sizeof(ExportStatus)
+        << "; includes=batch_owned_state_and_per_environment_parameters,"
+           "reset_inputs_mask_status,action_schedule,export_indices_trace_"
+           "status"
+        << "; excludes=batch_private_validation_scratch_and_CUDA_resources"
+        << "; host_input_and_endpoint_payload_bytes="
+        << (count + samples * cases::control_steps) * sizeof(State) +
+               count * sizeof(Parameters) +
+               count * cases::control_steps * sizeof(Actions) +
+               count * sizeof(ResetStatus) +
+               samples * cases::control_steps * sizeof(ExportStatus)
+        << '\n';
   }
 
 private:
   Stream stream;
-  DeviceBuffer<State> initial, states, next;
+  DeviceBuffer<State> initial;
+  DeviceBuffer<Parameters> parameters;
   DeviceBuffer<Actions> schedule;
   DeviceBuffer<State> endpoints;
+  DeviceBuffer<std::uint8_t> mask;
+  DeviceBuffer<ResetStatus> reset_status;
+  DeviceBuffer<std::uint32_t> indices;
+  DeviceBuffer<ExportStatus> export_status;
   std::vector<State> host_initial;
+  std::vector<Parameters> host_parameters;
   std::vector<Actions> host_schedule;
   std::vector<State> trace;
+  std::vector<ResetStatus> host_reset_status;
+  std::vector<ExportStatus> host_export_status;
   Event start, stop;
   std::size_t count;
-  Parameters parameters{};
+  std::unique_ptr<PhysicsBatch> batch;
 };
 
 // FNV-1a over explicitly ordered IEEE scalar bits, least-significant byte
@@ -475,7 +536,7 @@ std::map<std::string, std::string> metadata(std::size_t count) {
     uuid_known |= value != 0;
     uuid << std::setw(2) << static_cast<unsigned>(value);
   }
-  m["suite_version"] = "production-physics-v1";
+  m["suite_version"] = "production-physics-batch-v2";
   m["gpu_uuid"] = uuid_known ? uuid.str() : "unknown";
   m["gpu_name"] = p.name;
   m["gpu_compute_capability"] =
@@ -538,19 +599,29 @@ std::map<std::string, std::string> metadata(std::size_t count) {
                         "s=0.1;quaternion_norm=1e-5;all_finite";
   m["oracle_certification"] =
       "RK4 S=100 vs 200;rigid=1e-8;rotor=1e-6;quaternion_norm=1e-12";
-  m["accuracy_sampling"] = "first,middle,last at every control endpoint";
+  m["accuracy_sampling"] =
+      "PhysicsBatch indexed export first,middle,last at every control endpoint;"
+      "every export status checked; trace/status readback outside timing";
   m["refinement"] = "motor_reversals "
                     "S=16,32,64;velocity<=max(0.6*previous,3e-5);rotor<=max(0."
                     "6*previous,0.005);all accuracy gates";
   m["layout"] =
-      "AoS; homogeneous replicated batch; full control-major per-environment "
-      "actions; D2D initial reset; two distinct pingpong state buffers";
+      "PhysicsBatch-owned in-place AoS state and full per-environment "
+      "parameters;"
+      "homogeneous replicated batch; full control-major per-environment "
+      "actions;"
+      "all-one masked apply_reset state+parameters with checked statuses";
   m["state_bytes"] = std::to_string(sizeof(State));
   m["action_bytes"] = std::to_string(sizeof(Actions));
+  m["parameter_bytes"] = std::to_string(sizeof(Parameters));
+  m["initialization"] =
+      "full device state+parameter construction; batch reused across scenarios;"
+      "checked apply_reset and explicit wait before every timed trial;"
+      "separate fixed-timing batches for S32/S64 refinement";
   m["timed_scope"] =
-      "public launch_physics_step each control; parameter validation and "
-      "launch overhead; completion-inclusive events and wall; no "
-      "reset/upload/readback/allocation/logging";
+      "public PhysicsBatch::step each control; ownership, host span checks and "
+      "stream ordering overhead; completion-inclusive events and wall; no "
+      "creation/reset/upload/export/readback/allocation/logging";
   m["clock_power_policy"] = "uncontrolled; no clock or power query performed";
   m["input_fingerprint"] =
       "FNV1a64; explicit oracle-double and device-float parameter/state/action "
@@ -609,7 +680,8 @@ int main(int argc, char **argv) {
            "# excluded=contacts/collisions, aerodynamic drag, rotor gyroscopic "
            "dynamics, sensors, observations, rewards, resets/termination "
            "policy, rendering, inference, communication\n"
-           "# memory=owned device payload only, excludes CUDA "
+           "# memory=workspace device payload lower bound includes batch-owned "
+           "state/parameters, excludes private validation scratch and CUDA "
            "context/events/driver/code; not whole-GPU peak. Host payload "
            "excludes vector/allocator overhead, oracle storage, runtime and "
            "executable; RSS below includes these and is not device memory.\n"
@@ -645,18 +717,19 @@ int main(int argc, char **argv) {
     bool correct = true;
     bool refined = false;
     {
-      Workspace workspace(config.count);
+      Workspace workspace(config.count, scenarios.front());
       workspace.memory_accounting();
       for (std::size_t s = 0; s < scenarios.size(); ++s) {
-        workspace.upload(scenarios[s]);
-        const auto errors =
-            workspace.accuracy(production_substeps, references[s]);
+        if (s != 0)
+          workspace.upload(scenarios[s]);
+        const auto errors = workspace.accuracy(references[s]);
         auto measurement = workspace.measure(scenarios[s], errors);
         if (scenarios[s].name == "motor_reversals") {
           auto previous = errors;
           bool refinement_pass = true;
           for (const int substeps : {32, 64}) {
-            const auto finer = workspace.accuracy(substeps, references[s]);
+            Workspace refinement(config.count, scenarios[s], substeps);
+            const auto finer = refinement.accuracy(references[s]);
             const bool pass =
                 finer.passes(1e-3, 0.1, 1e-5) &&
                 finer.velocity <= std::max(0.6 * previous.velocity, 3e-5) &&
@@ -680,11 +753,9 @@ int main(int argc, char **argv) {
     for (std::size_t s = 0; s < scenarios.size(); ++s) {
       if (scenarios[s].name != "coupled_attitude")
         continue;
-      Workspace workspace(config.count * 10);
+      Workspace workspace(config.count * 10, scenarios[s]);
       workspace.memory_accounting();
-      workspace.upload(scenarios[s]);
-      const auto errors =
-          workspace.accuracy(production_substeps, references[s]);
+      const auto errors = workspace.accuracy(references[s]);
       auto measurement = workspace.measure(scenarios[s], errors);
       correct &= measurement.accuracy_pass;
       print_measurement(measurement, errors);

@@ -1,4 +1,4 @@
-#include "physics.cuh"
+#include "physics_batch.hpp"
 #include "reference_physics.hpp"
 
 #include <cuda_runtime.h>
@@ -254,58 +254,65 @@ std::vector<sim_cuda::ReferenceState> run_reference_trajectory(
   return states;
 }
 
-float run_cuda_trajectory(
+template <typename T>
+void upload(DeviceBuffer<T> &destination, const std::vector<T> &source,
+            cudaStream_t stream) {
+  if (!source.empty()) {
+    check_cuda(cudaMemcpyAsync(destination.get(), source.data(),
+                               source.size() * sizeof(T),
+                               cudaMemcpyHostToDevice, stream),
+               "upload");
+  }
+}
+
+template <typename T>
+std::vector<T> download(const DeviceBuffer<T> &source, std::size_t count,
+                        cudaStream_t stream) {
+  std::vector<T> result(count);
+  if (count != 0) {
+    check_cuda(cudaMemcpyAsync(result.data(), source.get(), count * sizeof(T),
+                               cudaMemcpyDeviceToHost, stream),
+               "download");
+  }
+  check_cuda(cudaStreamSynchronize(stream), "wait for download");
+  return result;
+}
+
+template <typename F> void require_rejected(F operation) {
+  bool rejected = false;
+  try {
+    operation();
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "invalid public batch operation was accepted");
+}
+
+void run_cuda_trajectory(
     const std::vector<sim_cuda::DeviceState> &initial_states,
     const std::vector<sim_cuda::DeviceActions> &actions,
     const sim_cuda::DeviceVehicleParameters &parameters,
     std::vector<sim_cuda::DeviceState> &result) {
   Stream stream;
-  DeviceBuffer<sim_cuda::DeviceState> state_a(initial_states.size());
-  DeviceBuffer<sim_cuda::DeviceState> state_b(initial_states.size());
-  DeviceBuffer<sim_cuda::DeviceActions> device_actions(actions.size());
-  if (!initial_states.empty()) {
-    check_cuda(
-        cudaMemcpyAsync(state_a.get(), initial_states.data(),
-                        initial_states.size() * sizeof(sim_cuda::DeviceState),
-                        cudaMemcpyHostToDevice, stream.get()),
-        "copy initial states");
-    check_cuda(cudaMemcpyAsync(device_actions.get(), actions.data(),
-                               actions.size() * sizeof(sim_cuda::DeviceActions),
-                               cudaMemcpyHostToDevice, stream.get()),
-               "copy actions");
-  }
-
-  cudaEvent_t start = nullptr;
-  cudaEvent_t stop = nullptr;
-  check_cuda(cudaEventCreate(&start), "create start event");
-  check_cuda(cudaEventCreate(&stop), "create stop event");
-  check_cuda(cudaEventRecord(start, stream.get()), "record start event");
-
-  sim_cuda::DeviceState *current = state_a.get();
-  sim_cuda::DeviceState *next = state_b.get();
+  const auto count = initial_states.size();
+  DeviceBuffer<sim_cuda::DeviceState> initial(count), output(count);
+  DeviceBuffer<sim_cuda::DeviceVehicleParameters> device_parameters(count);
+  DeviceBuffer<sim_cuda::DeviceActions> device_actions(count);
+  const std::vector<sim_cuda::DeviceVehicleParameters> parameter_rows(
+      count, parameters);
+  upload(initial, initial_states, stream.get());
+  upload(device_parameters, parameter_rows, stream.get());
+  upload(device_actions, actions, stream.get());
+  sim_cuda::PhysicsBatch batch(
+      {0, count, static_cast<float>(kPhysicsTimestep), kSubsteps},
+      {initial.get(), count}, {device_parameters.get(), count}, stream.get());
   for (int step = 0; step < kControlSteps; ++step) {
-    sim_cuda::launch_physics_step(
-        current, device_actions.get(), next, initial_states.size(), parameters,
-        static_cast<float>(kPhysicsTimestep), kSubsteps, stream.get());
-    std::swap(current, next);
+    batch.step({device_actions.get(), count}, stream.get());
   }
-
-  check_cuda(cudaEventRecord(stop, stream.get()), "record stop event");
-  check_cuda(cudaEventSynchronize(stop), "synchronize stop event");
-  float elapsed_milliseconds = 0.0F;
-  check_cuda(cudaEventElapsedTime(&elapsed_milliseconds, start, stop),
-             "measure elapsed device time");
-  check_cuda(cudaEventDestroy(start), "destroy start event");
-  check_cuda(cudaEventDestroy(stop), "destroy stop event");
-
-  if (!result.empty()) {
-    check_cuda(cudaMemcpyAsync(result.data(), current,
-                               result.size() * sizeof(sim_cuda::DeviceState),
-                               cudaMemcpyDeviceToHost, stream.get()),
-               "copy final states");
-  }
-  check_cuda(cudaStreamSynchronize(stream.get()), "synchronize result copy");
-  return elapsed_milliseconds;
+  sim_cuda::ExportBuffers outputs;
+  outputs.states = {output.get(), count};
+  batch.export_state({}, outputs, stream.get());
+  result = download(output, count, stream.get());
 }
 
 struct TrajectoryErrors {
@@ -400,12 +407,12 @@ void test_cuda_batch(const std::size_t environment_count) {
   const auto expected_states =
       run_reference_trajectory(initial_states, actions, reference_parameters);
   std::vector<sim_cuda::DeviceState> actual_states(environment_count);
-  const float elapsed_milliseconds = run_cuda_trajectory(
-      initial_states, actions, device_parameters, actual_states);
+  run_cuda_trajectory(initial_states, actions, device_parameters,
+                      actual_states);
   const auto errors = compare_trajectories(actual_states, expected_states);
   std::cout << "physics-only batch: " << environment_count << " environments, "
-            << kControlSteps << " launches x " << kSubsteps << " substeps, "
-            << elapsed_milliseconds << " ms CUDA device time; maximum errors: "
+            << kControlSteps << " steps x " << kSubsteps << " substeps; "
+            << "maximum errors: "
             << "position " << errors.position_m << " m, velocity "
             << errors.velocity_m_per_s << " m/s, angular velocity "
             << errors.angular_velocity_rad_per_s << " rad/s, orientation "
@@ -454,24 +461,375 @@ void test_cuda_analytic_motion() {
   compare_trajectories(actual, {expected});
 }
 
-void test_cuda_motor_stability_limit() {
-  auto parameters = as_device_parameters(sim_cuda::make_reference_quad_x());
-  parameters.rotors[3].time_constant = 0.015625F;
-  const float limit = 2.0F * parameters.rotors[3].time_constant;
-  DeviceBuffer<sim_cuda::DeviceState> states(1);
-  DeviceBuffer<sim_cuda::DeviceActions> actions(1);
-  for (const float dt : {limit, std::nextafter(limit, 1.0F),
-                         std::numeric_limits<float>::infinity()}) {
-    bool rejected = false;
-    try {
-      sim_cuda::launch_physics_step(states.get(), actions.get(), states.get(),
-                                    1, parameters, dt, 100);
-    } catch (const std::invalid_argument &) {
-      rejected = true;
-    }
-    require(rejected,
-            "CUDA launch accepted a non-decaying/unstable motor timestep");
+void require_vec(const sim_cuda::Vec3<float> &a,
+                 const sim_cuda::Vec3<float> &b) {
+  require(a.x == b.x && a.y == b.y && a.z == b.z, "vector changed");
+}
+
+void require_rotors(const sim_cuda::DeviceRotors &a,
+                    const sim_cuda::DeviceRotors &b) {
+  for (std::size_t r = 0; r < sim_cuda::kRotorCount; ++r) {
+    require_vec(a[r].position_b, b[r].position_b);
+    require_vec(a[r].thrust_direction_b, b[r].thrust_direction_b);
+    require(a[r].reaction_torque_sign == b[r].reaction_torque_sign &&
+                a[r].thrust_coefficient == b[r].thrust_coefficient &&
+                a[r].torque_coefficient == b[r].torque_coefficient &&
+                a[r].minimum_speed == b[r].minimum_speed &&
+                a[r].maximum_speed == b[r].maximum_speed &&
+                a[r].time_constant == b[r].time_constant,
+            "rotor parameters changed");
   }
+}
+
+void require_parameters(const sim_cuda::DeviceVehicleParameters &a,
+                        const sim_cuda::DeviceVehicleParameters &b) {
+  require(a.mass == b.mass, "mass changed");
+  require_vec(a.inertia_diagonal_b, b.inertia_diagonal_b);
+  require_vec(a.gravity_w, b.gravity_w);
+  require_rotors(a.rotors, b.rotors);
+}
+
+void require_state(const sim_cuda::DeviceState &a,
+                   const sim_cuda::DeviceState &b) {
+  require_vec(a.position_w, b.position_w);
+  require_vec(a.linear_velocity_w, b.linear_velocity_w);
+  require_vec(a.angular_velocity_b, b.angular_velocity_b);
+  require(a.attitude_wb.w == b.attitude_wb.w &&
+              a.attitude_wb.x == b.attitude_wb.x &&
+              a.attitude_wb.y == b.attitude_wb.y &&
+              a.attitude_wb.z == b.attitude_wb.z,
+          "attitude changed");
+  for (std::size_t r = 0; r < sim_cuda::kRotorCount; ++r) {
+    require(a.rotor_speed[r] == b.rotor_speed[r], "motor state changed");
+  }
+}
+
+void test_batch_contracts() {
+  using namespace sim_cuda;
+  constexpr std::size_t n = 4;
+  constexpr float dt = 0.001F;
+  constexpr int substeps = 16;
+  Stream first, second, third;
+  const auto base = as_device_parameters(make_reference_quad_x());
+  std::vector<DeviceState> initial(n);
+  std::vector<DeviceActions> actions(n);
+  populate_inputs(initial, actions, base);
+  std::vector<DeviceVehicleParameters> parameters(n, base);
+  for (std::size_t i = 0; i < n; ++i) {
+    parameters[i].mass *= 1.0F + 0.25F * i;
+    parameters[i].gravity_w.x = 0.5F * i;
+    parameters[i].rotors[3].time_constant *= 1.0F + 0.1F * i;
+  }
+  DeviceBuffer<DeviceState> state_input(n), before(n), reset_snapshot(n),
+      after(n);
+  DeviceBuffer<DeviceVehicleParameters> parameter_input(n), reset_parameters(n),
+      after_parameters(n);
+  DeviceBuffer<DeviceActions> action_input(n);
+  DeviceBuffer<std::uint8_t> mask_input(n);
+  DeviceBuffer<ResetStatus> reset_status(n);
+  upload(state_input, initial, first.get());
+  upload(parameter_input, parameters, first.get());
+  upload(action_input, actions, first.get());
+  PhysicsBatch batch({0, n, dt, substeps}, {state_input.get(), n},
+                     {parameter_input.get(), n}, first.get());
+
+  std::vector<ReferenceState> expected_before(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    expected_before[i] = step_reference(
+        as_reference_state(initial[i]), as_reference_actions(actions[i]),
+        as_reference_parameters(parameters[i]), dt, substeps);
+  }
+  batch.step({action_input.get(), n}, first.get());
+  ExportBuffers output;
+  output.states = {before.get(), n};
+  batch.export_state({}, output, second.get());
+
+  auto replacement = initial;
+  auto replacement_parameters = parameters;
+  replacement[0].position_w = {4.0F, 5.0F, 6.0F};
+  replacement_parameters[0].mass *= 2.0F;
+  replacement_parameters[0].gravity_w = {3.0F, -2.0F, -1.0F};
+  replacement[1].rotor_speed[3] = -1.0F;
+  replacement_parameters[1].mass *= 3.0F;
+  replacement[2].position_w.x = 42.0F;
+  replacement_parameters[2].rotors[3].time_constant = dt / 2.0F;
+  replacement[3].position_w.x = 99.0F;
+  replacement_parameters[3].mass *= 4.0F;
+  const std::vector<std::uint8_t> mask{2, 1, 255, 0};
+  upload(state_input, replacement, third.get());
+  upload(parameter_input, replacement_parameters, third.get());
+  upload(mask_input, mask, third.get());
+  batch.apply_reset({mask_input.get(), n}, {state_input.get(), n},
+                    {parameter_input.get(), n}, {reset_status.get(), n},
+                    third.get());
+  output.states = {reset_snapshot.get(), n};
+  output.parameters = {reset_parameters.get(), n};
+  batch.export_state({}, output, first.get());
+  batch.step({action_input.get(), n}, second.get());
+  output.states = {after.get(), n};
+  output.parameters = {after_parameters.get(), n};
+  batch.export_state({}, output, third.get());
+  // No host wait between step, snapshot, replacement, and the subsequent step.
+  const auto final = download(after, n, third.get());
+  const auto first_snapshot = download(before, n, second.get());
+  const auto replaced = download(reset_snapshot, n, first.get());
+  const auto replaced_parameters = download(reset_parameters, n, first.get());
+  const auto final_parameters = download(after_parameters, n, third.get());
+  const auto statuses = download(reset_status, n, third.get());
+  require(statuses == std::vector<ResetStatus>{ResetStatus::applied,
+                                               ResetStatus::invalid_state,
+                                               ResetStatus::invalid_parameters,
+                                               ResetStatus::not_selected},
+          "reset statuses");
+  compare_trajectories(first_snapshot, expected_before);
+  require(std::abs(first_snapshot[0].linear_velocity_w.z -
+                   first_snapshot[3].linear_velocity_w.z) > 0.01F,
+          "per-environment mass must affect acceleration");
+  std::vector<ReferenceState> expected_after(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    const auto &expected_state = i == 0 ? replacement[i] : first_snapshot[i];
+    const auto &expected_parameters =
+        i == 0 ? replacement_parameters[i] : parameters[i];
+    require_state(replaced[i], expected_state);
+    require_parameters(replaced_parameters[i], expected_parameters);
+    require_parameters(final_parameters[i], expected_parameters);
+    expected_after[i] = step_reference(
+        as_reference_state(expected_state), as_reference_actions(actions[i]),
+        as_reference_parameters(expected_parameters), dt, substeps);
+  }
+  compare_trajectories(final, expected_after);
+
+  const std::vector<std::uint32_t> indices{3, 0, 3, 4, UINT32_MAX, 1};
+  const auto m = indices.size();
+  DeviceBuffer<std::uint32_t> selector(m);
+  DeviceBuffer<DeviceState> selected(m);
+  DeviceBuffer<DeviceVehicleParameters> selected_parameters(m);
+  DeviceBuffer<Vec3<float>> positions(m);
+  DeviceBuffer<DeviceRotorSpeeds> motors(m);
+  DeviceBuffer<DeviceRotors> rotors(m);
+  DeviceBuffer<float> masses(m);
+  DeviceBuffer<ExportStatus> export_status(m);
+  std::vector<DeviceState> sentinel(m, initial[0]);
+  std::vector<DeviceVehicleParameters> parameter_sentinel(m, base);
+  std::vector<Vec3<float>> position_sentinel(m, {91.0F, 92.0F, 93.0F});
+  std::vector<DeviceRotorSpeeds> motor_sentinel(m, {91, 92, 93, 94});
+  std::vector<DeviceRotors> rotor_sentinel(m, base.rotors);
+  std::vector<float> mass_sentinel(m, -17.0F);
+  upload(selector, indices, first.get());
+  upload(selected, sentinel, first.get());
+  upload(selected_parameters, parameter_sentinel, first.get());
+  upload(positions, position_sentinel, first.get());
+  upload(motors, motor_sentinel, first.get());
+  upload(rotors, rotor_sentinel, first.get());
+  upload(masses, mass_sentinel, first.get());
+  ExportSelection selection{SelectionKind::indexed, {selector.get(), m}};
+  ExportBuffers selected_output;
+  selected_output.states = {selected.get(), m};
+  selected_output.parameters = {selected_parameters.get(), m};
+  selected_output.position_w = {positions.get(), m};
+  selected_output.rotor_speed = {motors.get(), m};
+  selected_output.mass = {masses.get(), m};
+  selected_output.rotors = {rotors.get(), m};
+  selected_output.status = {export_status.get(), m};
+  batch.export_state(selection, selected_output, first.get());
+  const auto selected_states = download(selected, m, first.get());
+  const auto selected_params = download(selected_parameters, m, first.get());
+  const auto selected_positions = download(positions, m, first.get());
+  const auto selected_motors = download(motors, m, first.get());
+  const auto selected_rotors = download(rotors, m, first.get());
+  const auto selected_masses = download(masses, m, first.get());
+  const auto selected_status = download(export_status, m, first.get());
+  for (std::size_t i = 0; i < m; ++i) {
+    const bool valid = indices[i] < n;
+    const auto &s = valid ? final[indices[i]] : sentinel[i];
+    const auto &p =
+        valid ? final_parameters[indices[i]] : parameter_sentinel[i];
+    require(selected_status[i] ==
+                (valid ? ExportStatus::exported : ExportStatus::invalid_index),
+            "selected export status");
+    require_state(selected_states[i], s);
+    require_parameters(selected_params[i], p);
+    require_vec(selected_positions[i],
+                valid ? s.position_w : position_sentinel[i]);
+    require_near(selected_masses[i], valid ? p.mass : mass_sentinel[i], 0,
+                 "selected mass");
+    require_rotors(selected_rotors[i], valid ? p.rotors : rotor_sentinel[i]);
+    for (std::size_t r = 0; r < kRotorCount; ++r) {
+      require_near(selected_motors[i][r],
+                   valid ? s.rotor_speed[r] : motor_sentinel[i][r], 0,
+                   "selected motor");
+    }
+  }
+
+  auto bad = selected_output;
+  bad.mass.size = m - 1;
+  require_rejected(
+      [&] { batch.step({action_input.get(), n - 1}, first.get()); });
+  require_rejected([&] {
+    batch.apply_reset({mask_input.get(), n - 1}, {state_input.get(), n},
+                      {parameter_input.get(), n}, {reset_status.get(), n},
+                      first.get());
+  });
+  require_rejected([&] { batch.export_state(selection, bad, first.get()); });
+  bad = selected_output;
+  bad.mass = {reinterpret_cast<float *>(selected.get()), m};
+  require_rejected([&] { batch.export_state(selection, bad, first.get()); });
+  bad = selected_output;
+  bad.mass = {reinterpret_cast<float *>(selector.get()), m};
+  require_rejected([&] { batch.export_state(selection, bad, first.get()); });
+  bad = selected_output;
+  bad.status = {};
+  require_rejected([&] { batch.export_state(selection, bad, first.get()); });
+  require_rejected([&] {
+    batch.apply_reset({mask_input.get(), n}, {state_input.get(), n},
+                      {parameter_input.get(), n},
+                      {reinterpret_cast<ResetStatus *>(state_input.get()), n},
+                      first.get());
+  });
+  const auto unchanged = download(selected, m, first.get());
+  const auto unchanged_indices = download(selector, m, first.get());
+  const auto unchanged_reset = download(state_input, n, first.get());
+  require(unchanged_indices == indices, "rejected export overwrote selector");
+  for (std::size_t i = 0; i < m; ++i) {
+    require_state(unchanged[i], selected_states[i]);
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    require_state(unchanged_reset[i], replacement[i]);
+  }
+  batch.export_state({SelectionKind::indexed, {}}, {}, second.get());
+
+  PhysicsBatch empty({0, 0, dt, substeps}, {}, {}, first.get());
+  empty.step({}, second.get());
+  empty.apply_reset({}, {}, {}, {}, third.get());
+  empty.export_state({}, {}, first.get());
+  empty.export_state({SelectionKind::indexed, {}}, {}, second.get());
+  empty.export_state(selection, selected_output, first.get());
+  const auto empty_status = download(export_status, m, first.get());
+  const auto empty_states = download(selected, m, first.get());
+  const auto empty_parameters = download(selected_parameters, m, first.get());
+  for (std::size_t i = 0; i < m; ++i) {
+    require(empty_status[i] == ExportStatus::invalid_index,
+            "empty batch indexed export must mark every index invalid");
+    require_state(empty_states[i], selected_states[i]);
+    require_parameters(empty_parameters[i], selected_params[i]);
+  }
+  ExportBuffers nonempty;
+  nonempty.states = {selected.get(), 1};
+  require_rejected([&] { empty.export_state({}, nonempty, first.get()); });
+}
+
+void test_constructor_validation() {
+  using namespace sim_cuda;
+  Stream stream;
+  DeviceBuffer<DeviceState> states(1);
+  DeviceBuffer<DeviceVehicleParameters> parameters(1);
+  const auto base = as_device_parameters(make_reference_quad_x());
+  DeviceState valid{};
+  valid.attitude_wb.w = 1.0F;
+  auto construct = [&](const DeviceState &state,
+                       const DeviceVehicleParameters &params, float dt) {
+    const std::vector<DeviceState> state_rows{state};
+    const std::vector<DeviceVehicleParameters> parameter_rows{params};
+    upload(states, state_rows, stream.get());
+    upload(parameters, parameter_rows, stream.get());
+    PhysicsBatch batch({0, 1, dt, 100}, {states.get(), 1},
+                       {parameters.get(), 1}, stream.get());
+  };
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  for (int fault = 0; fault < 6; ++fault) {
+    auto state = valid;
+    switch (fault) {
+    case 0:
+      state.position_w.z = nan;
+      break;
+    case 1:
+      state.attitude_wb.w = 0.5F;
+      break;
+    case 2:
+      state.linear_velocity_w.y = nan;
+      break;
+    case 3:
+      state.angular_velocity_b.x = nan;
+      break;
+    case 4:
+      state.rotor_speed[3] = -1.0F;
+      break;
+    case 5:
+      state.rotor_speed[3] = nan;
+      break;
+    }
+    require_rejected([&] { construct(state, base, 0.001F); });
+  }
+  for (int fault = 0; fault < 12; ++fault) {
+    auto params = base;
+    auto &last = params.rotors[3];
+    switch (fault) {
+    case 0:
+      params.mass = 0.0F;
+      break;
+    case 1:
+      params.inertia_diagonal_b.y = -1.0F;
+      break;
+    case 2:
+      params.inertia_diagonal_b.z = 10.0F;
+      break;
+    case 3:
+      params.gravity_w.x = nan;
+      break;
+    case 4:
+      last.position_b.y = nan;
+      break;
+    case 5:
+      last.thrust_direction_b.z = 0.5F;
+      break;
+    case 6:
+      last.reaction_torque_sign = 0.0F;
+      break;
+    case 7:
+      last.thrust_coefficient = -1.0F;
+      break;
+    case 8:
+      last.torque_coefficient = nan;
+      break;
+    case 9:
+      last.minimum_speed = -1.0F;
+      break;
+    case 10:
+      last.maximum_speed = last.minimum_speed - 1.0F;
+      break;
+    case 11:
+      last.time_constant = 0.0F;
+      break;
+    }
+    require_rejected([&] { construct(valid, params, 0.001F); });
+  }
+  auto params = base;
+  params.rotors[3].time_constant = 0.015625F;
+  const float limit = 2.0F * params.rotors[3].time_constant;
+  construct(valid, params, std::nextafter(limit, 0.0F));
+  for (float dt : {limit, std::nextafter(limit, 1.0F),
+                   std::numeric_limits<float>::infinity()}) {
+    require_rejected([&] { construct(valid, params, dt); });
+  }
+  // Rotor state is physical memory, not a command subject to command limits.
+  valid.rotor_speed[3] = base.rotors[3].maximum_speed + 10.0F;
+  construct(valid, base, 0.001F);
+  require_rejected([&] {
+    PhysicsBatch batch({0, 1, 0.001F, 1}, {states.get(), 0},
+                       {parameters.get(), 1}, stream.get());
+  });
+  require_rejected([&] {
+    PhysicsBatch batch({0, 1, 0.001F, 1}, {states.get(), 1},
+                       {parameters.get(), 0}, stream.get());
+  });
+  require_rejected([&] {
+    PhysicsBatch batch({0, 1, 0.001F, 1}, {&valid, 1}, {parameters.get(), 1},
+                       stream.get());
+  });
+  require_rejected([&] {
+    PhysicsBatch batch({0, 1, 0.001F, 1}, {states.get(), 1}, {&base, 1},
+                       stream.get());
+  });
 }
 
 } // namespace
@@ -484,7 +842,8 @@ int main() {
       test_cuda_batch(count);
     }
     test_cuda_analytic_motion();
-    test_cuda_motor_stability_limit();
+    test_batch_contracts();
+    test_constructor_validation();
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "CUDA physics batch test failed: " << error.what() << '\n';

@@ -44,7 +44,7 @@ if(SIM_CUDA_ENABLE_CUDA)
     set(SIM_CUDA_INCLUDE_DIR "${CUDAToolkit_INCLUDE_DIRS}")
   endif()
 
-  add_library(sim_cuda_runtime STATIC src/physics.cu src/runtime.cu)
+  add_library(sim_cuda_runtime STATIC src/physics_batch.cu src/runtime.cu)
   target_include_directories(sim_cuda_runtime PUBLIC src "${SIM_CUDA_INCLUDE_DIR}")
   target_compile_options(sim_cuda_runtime PUBLIC
     "$<$<COMPILE_LANGUAGE:CUDA>:-I${SIM_CUDA_INCLUDE_DIR}>"
