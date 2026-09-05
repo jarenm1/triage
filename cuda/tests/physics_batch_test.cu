@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -453,6 +454,26 @@ void test_cuda_analytic_motion() {
   compare_trajectories(actual, {expected});
 }
 
+void test_cuda_motor_stability_limit() {
+  auto parameters = as_device_parameters(sim_cuda::make_reference_quad_x());
+  parameters.rotors[3].time_constant = 0.015625F;
+  const float limit = 2.0F * parameters.rotors[3].time_constant;
+  DeviceBuffer<sim_cuda::DeviceState> states(1);
+  DeviceBuffer<sim_cuda::DeviceActions> actions(1);
+  for (const float dt : {limit, std::nextafter(limit, 1.0F),
+                         std::numeric_limits<float>::infinity()}) {
+    bool rejected = false;
+    try {
+      sim_cuda::launch_physics_step(states.get(), actions.get(), states.get(),
+                                    1, parameters, dt, 100);
+    } catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    require(rejected,
+            "CUDA launch accepted a non-decaying/unstable motor timestep");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -463,6 +484,7 @@ int main() {
       test_cuda_batch(count);
     }
     test_cuda_analytic_motion();
+    test_cuda_motor_stability_limit();
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "CUDA physics batch test failed: " << error.what() << '\n';

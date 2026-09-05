@@ -31,6 +31,12 @@ void validate_parameters(const VehicleParameters<Scalar> &parameters,
             sign_tolerance) {
       throw std::invalid_argument("invalid rotor parameters");
     }
+    // Explicit midpoint's motor mode is non-decaying at dt/tau == 2 and
+    // unstable above it. Substeps each consume timestep; they do not divide it.
+    if (!(timestep / rotor.time_constant < Scalar{2})) {
+      throw std::invalid_argument(
+          "physics timestep must be less than twice every rotor time constant");
+    }
   }
 }
 

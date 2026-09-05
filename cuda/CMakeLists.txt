@@ -18,6 +18,10 @@ if(BUILD_TESTING)
   target_link_libraries(sim_cuda_reference_physics_test PRIVATE sim_cuda_reference)
   add_test(NAME sim_cuda_reference_physics_test
            COMMAND sim_cuda_reference_physics_test)
+
+  add_executable(sim_cuda_midpoint_physics_test tests/midpoint_physics_test.cpp)
+  target_link_libraries(sim_cuda_midpoint_physics_test PRIVATE sim_cuda_reference)
+  add_test(NAME sim_cuda_midpoint_physics_test COMMAND sim_cuda_midpoint_physics_test)
 endif()
 
 if(SIM_CUDA_ENABLE_CUDA)
@@ -51,6 +55,12 @@ if(SIM_CUDA_ENABLE_CUDA)
     CUDA_SEPARABLE_COMPILATION OFF
     POSITION_INDEPENDENT_CODE ON
   )
+
+  add_executable(sim_cuda_integrator_benchmark benchmarks/integrator_benchmark.cu)
+  target_link_libraries(sim_cuda_integrator_benchmark
+    PRIVATE sim_cuda_runtime sim_cuda_reference)
+  target_compile_definitions(sim_cuda_integrator_benchmark
+    PRIVATE SIM_CUDA_BUILD_PROFILE="$<CONFIG>")
 
   if(BUILD_TESTING)
     add_executable(sim_cuda_runtime_smoke tests/runtime_smoke.cu)
