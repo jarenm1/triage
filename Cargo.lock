@@ -2425,6 +2425,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "web-demo"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "console_error_panic_hook",
+ "font8x8",
+ "glam",
+ "js-sys",
+ "serde_json",
+ "sim-graphics",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
