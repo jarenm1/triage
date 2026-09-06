@@ -82,6 +82,30 @@ int triage_hover_reset(void *env, uint64_t seed, void *stream);
 int triage_hover_step(void *env, const float *actions, void *stream);
 void *triage_hover_buffer(void *env, int field);
 int triage_hover_destroy(void *env);
+
+/* Optional visualization staging. Single host caller, env lifetime rules apply.
+ * Configure once outside rollout (1..64 unique host IDs, 2..16 slots).
+ * submit returns 1 if queued, 0 if full (drop), -1 on error. It never waits.
+ * poll returns the oldest completed frame, 0 if not ready, -1 on error.
+ * Output capacity must equal selected count; poll copies only ready pinned
+ * memory and releases that slot. Timings are GPU milliseconds for selected
+ * export+packing and D2H respectively, excluding transfer stream queue delay.
+ * Disable/destruction may wait; never destroy env while a caller uses staging.
+ */
+typedef struct triage_snapshot_vehicle {
+  uint32_t environment_id;
+  uint64_t episode_id;
+  float position_w[3];
+  float attitude_wb[4];
+  float target_w[3];
+} triage_snapshot_vehicle;
+int triage_snapshot_configure(void *env, const uint32_t *ids, size_t count,
+                              size_t slots);
+int triage_snapshot_submit(void *env, uint64_t step, void *stream);
+int triage_snapshot_poll(void *env, triage_snapshot_vehicle *output,
+                         size_t count, uint64_t *step, float *gather_ms,
+                         float *copy_ms);
+int triage_snapshot_disable(void *env);
 /* Last error on this host thread, valid until the next ABI call on the thread.
  * Failures return NULL/-1; destroy(NULL) succeeds. No C++ exception crosses
  * ABI.

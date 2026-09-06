@@ -8,12 +8,16 @@ use sim_graphics::{
 };
 
 mod inspection;
+mod trajectory;
 
 fn main() -> Result<()> {
     pollster::block_on(run())
 }
 
 async fn run() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--trajectory")) {
+        return trajectory::run().await;
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--inspect")) {
         return inspection::run().await;
     }

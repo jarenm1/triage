@@ -1,9 +1,12 @@
 #include "hover_env.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -234,12 +237,127 @@ void test_tracking_schedule_and_switches() {
     require(settling_plan[c * 4 + 3] == 500,
             "settling evaluation must allow exactly 500 controls per target");
 }
+
+// The timeout releases a broken synchronizing implementation instead of hanging
+// the test process. Successful submit/poll must finish while the gate is
+// closed.
+struct StreamGate {
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool released = false, timed_out = false;
+  cudaStream_t stream;
+  explicit StreamGate(cudaStream_t stream) : stream(stream) {
+    cuda_check(cudaLaunchHostFunc(
+        stream,
+        [](void *data) {
+          auto &gate = *static_cast<StreamGate *>(data);
+          std::unique_lock lock(gate.mutex);
+          gate.timed_out = !gate.condition.wait_for(
+              lock, std::chrono::seconds(5), [&] { return gate.released; });
+        },
+        this));
+  }
+  void release() {
+    std::lock_guard lock(mutex);
+    released = true;
+    condition.notify_one();
+  }
+  ~StreamGate() {
+    release();
+    cudaStreamSynchronize(stream);
+  }
+};
+
+void test_snapshot_ordering_and_backpressure() {
+  constexpr std::size_t n = 4;
+  Stream first, second;
+  Actions actions(n);
+  Environment env(n, 1, first.value, true);
+  const std::uint32_t ids[] = {3, 1};
+  check(triage_snapshot_configure(env.value, ids, 2, 2));
+  const auto initial = download<float>(env.value, TRIAGE_HOVER_OBSERVATIONS,
+                                       n * 22, first.value);
+  const auto initial_targets =
+      download<float>(env.value, TRIAGE_TRACKING_TARGETS, n * 3, first.value);
+  triage_snapshot_vehicle rows[2]{};
+  std::uint64_t step = 999;
+  float gather_ms, copy_ms;
+  // Load/instrument the snapshot kernel before testing steady-state readiness;
+  // Compute Sanitizer may synchronize its first instrumented kernel launch.
+  require(triage_snapshot_submit(env.value, 0, first.value) == 1,
+          "snapshot warm-up must queue");
+  cuda_check(cudaDeviceSynchronize());
+  require(triage_snapshot_poll(env.value, rows, 2, &step, &gather_ms,
+                               &copy_ms) == 1,
+          "snapshot warm-up must complete");
+  {
+    StreamGate gate(first.value);
+    require(triage_snapshot_submit(env.value, 0, first.value) == 1,
+            "initial snapshot must queue without waiting");
+    check(triage_hover_step(env.value, actions.value, second.value));
+    require(triage_snapshot_submit(env.value, 1, second.value) == 1,
+            "cross-stream post-reset snapshot must queue");
+    require(triage_snapshot_submit(env.value, 2, first.value) == 0,
+            "full snapshot ring must drop without overwriting");
+    require(triage_snapshot_poll(env.value, rows, 2, &step, &gather_ms,
+                                 &copy_ms) == 0,
+            "snapshot must not expose an unfinished transfer");
+    {
+      std::lock_guard lock(gate.mutex);
+      require(!gate.timed_out,
+              "snapshot operations waited for blocked CUDA work");
+    }
+    gate.release();
+  }
+  const auto reset = download<float>(env.value, TRIAGE_HOVER_OBSERVATIONS,
+                                     n * 22, second.value);
+  const auto reset_targets =
+      download<float>(env.value, TRIAGE_TRACKING_TARGETS, n * 3, second.value);
+  // Mutate live state again before consuming either slot.
+  check(triage_hover_step(env.value, actions.value, first.value));
+  cuda_check(cudaDeviceSynchronize());
+  for (unsigned frame = 0; frame < 2; ++frame) {
+    require(triage_snapshot_poll(env.value, rows, 2, &step, &gather_ms,
+                                 &copy_ms) == 1,
+            "completed snapshots must remain independently readable");
+    require(step == frame, "snapshot order must match submission order");
+    const auto &observations = frame == 0 ? initial : reset;
+    const auto &targets = frame == 0 ? initial_targets : reset_targets;
+    for (unsigned j = 0; j < 2; ++j) {
+      const auto id = ids[j];
+      require(rows[j].environment_id == id && rows[j].episode_id == frame,
+              "snapshot selection and post-reset episode must stay paired");
+      for (unsigned axis = 0; axis < 3; ++axis) {
+        require(rows[j].target_w[axis] == targets[3 * id + axis],
+                "snapshot must retain its current commanded target");
+        require(std::abs(rows[j].position_w[axis] -
+                         (observations[22 * id + axis] +
+                          targets[3 * id + axis])) < 1e-6f,
+                "snapshot pose must precede subsequent live-state mutations");
+      }
+      const auto *q = rows[j].attitude_wb;
+      const float rotation[] = {
+          1 - 2 * (q[2] * q[2] + q[3] * q[3]), 2 * (q[1] * q[2] - q[0] * q[3]),
+          2 * (q[1] * q[3] + q[0] * q[2]),     2 * (q[1] * q[2] + q[0] * q[3]),
+          1 - 2 * (q[1] * q[1] + q[3] * q[3]), 2 * (q[2] * q[3] - q[0] * q[1]),
+          2 * (q[1] * q[3] - q[0] * q[2]),     2 * (q[2] * q[3] + q[0] * q[1]),
+          1 - 2 * (q[1] * q[1] + q[2] * q[2])};
+      for (unsigned k = 0; k < 9; ++k)
+        require(std::abs(rotation[k] - observations[22 * id + 6 + k]) < 1e-6f,
+                "snapshot Hamilton quaternion must match physical attitude");
+    }
+  }
+  require(triage_snapshot_submit(env.value, 2, first.value) == 1,
+          "consumed snapshot slots must be reusable");
+  check(triage_snapshot_disable(env.value));
+}
 } // namespace
 int main() {
   try {
     test_timeout_and_reproducibility();
     test_failure_is_not_timeout();
     test_tracking_schedule_and_switches();
+    test_snapshot_ordering_and_backpressure();
     std::cout
         << "Hover and tracking episode, command, safety, reward, and seed "
            "replay contracts passed\n";

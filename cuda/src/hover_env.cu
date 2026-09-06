@@ -366,6 +366,114 @@ __global__ void publish_observations(Buffers b, std::size_t n) {
               b.tracking ? b.targets + 3 * i : nullptr);
 }
 
+struct SnapshotSlot {
+  Vec3<float> positions[64];
+  Quaternion<float> attitudes[64];
+  ExportStatus status[64];
+  triage_snapshot_vehicle vehicles[64];
+};
+
+__global__ void pack_snapshot(Buffers b, const std::uint32_t *ids,
+                              std::size_t count, SnapshotSlot *slot) {
+  const unsigned j = threadIdx.x;
+  if (j >= count)
+    return;
+  const auto i = ids[j];
+  auto &out = slot->vehicles[j];
+  out.environment_id = i;
+  out.episode_id = b.episode_counts[i];
+  const auto p = slot->positions[j];
+  const auto q = slot->attitudes[j];
+  out.position_w[0] = p.x;
+  out.position_w[1] = p.y;
+  out.position_w[2] = p.z;
+  out.attitude_wb[0] = q.w;
+  out.attitude_wb[1] = q.x;
+  out.attitude_wb[2] = q.y;
+  out.attitude_wb[3] = q.z;
+  for (unsigned axis = 0; axis < 3; ++axis)
+    out.target_w[axis] =
+        b.tracking ? b.targets[3 * i + axis] : (axis == 2 ? 1.0f : 0.0f);
+}
+
+class SnapshotRing {
+public:
+  struct Slot {
+    SnapshotSlot *device = nullptr;
+    triage_snapshot_vehicle *host = nullptr;
+    cudaEvent_t start = nullptr, gathered = nullptr;
+    cudaEvent_t copying = nullptr, ready = nullptr;
+    std::uint64_t step = 0;
+  };
+  SnapshotRing(const std::uint32_t *selection, std::size_t count,
+               std::size_t capacity, std::size_t batch)
+      : count(count), capacity(capacity) {
+    if (!selection || count == 0 || count > 64 || capacity < 2 || capacity > 16)
+      throw std::invalid_argument("snapshot needs 1..64 IDs and 2..16 slots");
+    for (std::size_t i = 0; i < count; ++i) {
+      if (selection[i] >= batch)
+        throw std::invalid_argument("snapshot environment ID out of range");
+      for (std::size_t j = 0; j < i; ++j)
+        if (selection[i] == selection[j])
+          throw std::invalid_argument("snapshot IDs must be unique");
+    }
+    try {
+      check(cudaStreamCreateWithFlags(&transfer, cudaStreamNonBlocking),
+            "create snapshot transfer stream");
+      check(cudaMalloc(reinterpret_cast<void **>(&ids), count * sizeof(*ids)),
+            "allocate snapshot IDs");
+      check(cudaMemcpy(ids, selection, count * sizeof(*ids),
+                       cudaMemcpyHostToDevice),
+            "upload snapshot IDs");
+      for (std::size_t i = 0; i < capacity; ++i) {
+        auto &s = slots[i];
+        check(cudaMalloc(reinterpret_cast<void **>(&s.device),
+                         sizeof(SnapshotSlot)),
+              "allocate snapshot slot");
+        check(cudaMallocHost(reinterpret_cast<void **>(&s.host),
+                             count * sizeof(*s.host)),
+              "pin snapshot slot");
+        check(cudaEventCreate(&s.start), "create snapshot start");
+        check(cudaEventCreate(&s.gathered), "create snapshot gathered");
+        check(cudaEventCreate(&s.copying), "create snapshot copying");
+        check(cudaEventCreate(&s.ready), "create snapshot ready");
+      }
+    } catch (...) {
+      release();
+      throw;
+    }
+  }
+  ~SnapshotRing() { release(); }
+  std::size_t count, capacity, head = 0, tail = 0, pending = 0;
+  std::uint32_t *ids = nullptr;
+  cudaStream_t transfer = nullptr;
+  Slot slots[16]{};
+
+private:
+  void release() noexcept {
+    if (transfer)
+      cudaStreamSynchronize(transfer);
+    for (auto &s : slots) {
+      if (s.device)
+        cudaFree(s.device);
+      if (s.host)
+        cudaFreeHost(s.host);
+      if (s.start)
+        cudaEventDestroy(s.start);
+      if (s.gathered)
+        cudaEventDestroy(s.gathered);
+      if (s.copying)
+        cudaEventDestroy(s.copying);
+      if (s.ready)
+        cudaEventDestroy(s.ready);
+    }
+    if (ids)
+      cudaFree(ids);
+    if (transfer)
+      cudaStreamDestroy(transfer);
+  }
+};
+
 class HoverEnv {
 public:
   HoverEnv(int device, std::size_t n, std::uint64_t seed, int max_steps,
@@ -477,6 +585,87 @@ public:
     }
   }
 
+  void configure_snapshot(const std::uint32_t *ids, std::size_t count,
+                          std::size_t slots) {
+    DeviceGuard guard(device_);
+    if (snapshots_)
+      throw std::invalid_argument("snapshot ring already configured");
+    snapshots_ = std::make_unique<SnapshotRing>(ids, count, slots, n_);
+  }
+
+  void disable_snapshot() {
+    DeviceGuard guard(device_);
+    wait();
+    snapshots_.reset();
+  }
+
+  int submit_snapshot(std::uint64_t step, cudaStream_t stream) {
+    DeviceGuard guard(device_);
+    if (!snapshots_)
+      throw std::invalid_argument("snapshot ring is not configured");
+    auto &ring = *snapshots_;
+    if (ring.pending == ring.capacity)
+      return 0;
+    begin(stream);
+    auto &s = ring.slots[ring.tail];
+    try {
+      check(cudaEventRecord(s.start, stream), "start snapshot gather");
+      ExportBuffers out{};
+      out.position_w = {s.device->positions, ring.count};
+      out.attitude_wb = {s.device->attitudes, ring.count};
+      out.status = {s.device->status, ring.count};
+      physics_->export_state({SelectionKind::indexed, {ring.ids, ring.count}},
+                             out, stream);
+      pack_snapshot<<<1, 64, 0, stream>>>(b_, ring.ids, ring.count, s.device);
+      check(cudaGetLastError(), "pack snapshot");
+      check(cudaEventRecord(s.gathered, stream), "record snapshot gather");
+      // Only the compact slot is read by transfer. Future physics can mutate
+      // live state immediately after packing; it never waits for D2H.
+      finish(stream);
+      check(cudaStreamWaitEvent(ring.transfer, s.gathered, 0),
+            "order snapshot transfer");
+      check(cudaEventRecord(s.copying, ring.transfer), "start snapshot copy");
+      check(cudaMemcpyAsync(s.host, s.device->vehicles,
+                            ring.count * sizeof(*s.host),
+                            cudaMemcpyDeviceToHost, ring.transfer),
+            "copy snapshot");
+      check(cudaEventRecord(s.ready, ring.transfer), "record snapshot ready");
+      s.step = step;
+      ring.tail = (ring.tail + 1) % ring.capacity;
+      ++ring.pending;
+      return 1;
+    } catch (...) {
+      recover(stream);
+      // Fatal CUDA-error cleanup is outside the nonblocking success path.
+      cudaStreamSynchronize(ring.transfer);
+      throw;
+    }
+  }
+
+  int poll_snapshot(triage_snapshot_vehicle *output, std::size_t count,
+                    std::uint64_t *step, float *gather_ms, float *copy_ms) {
+    DeviceGuard guard(device_);
+    if (!snapshots_ || count != snapshots_->count || !output || !step ||
+        !gather_ms || !copy_ms)
+      throw std::invalid_argument("invalid snapshot poll output");
+    auto &ring = *snapshots_;
+    if (!ring.pending)
+      return 0;
+    auto &s = ring.slots[ring.head];
+    const auto status = cudaEventQuery(s.ready);
+    if (status == cudaErrorNotReady)
+      return 0;
+    check(status, "query snapshot readiness");
+    check(cudaEventElapsedTime(gather_ms, s.start, s.gathered), "time gather");
+    check(cudaEventElapsedTime(copy_ms, s.copying, s.ready), "time D2H");
+    for (std::size_t i = 0; i < count; ++i)
+      output[i] = s.host[i];
+    *step = s.step;
+    ring.head = (ring.head + 1) % ring.capacity;
+    --ring.pending;
+    return 1;
+  }
+
   void *buffer(int field) {
     if (field >= TRIAGE_TRACKING_TARGETS && !b_.tracking)
       throw std::invalid_argument(
@@ -544,6 +733,7 @@ private:
   std::size_t allocation_bytes_[27]{};
   unsigned allocation_count_ = 0;
   std::unique_ptr<PhysicsBatch> physics_;
+  std::unique_ptr<SnapshotRing> snapshots_;
   cudaEvent_t completion_ = nullptr;
   bool pending_ = false;
 
@@ -629,6 +819,7 @@ private:
       return;
     if (pending_)
       cudaEventSynchronize(completion_);
+    snapshots_.reset();
     physics_.reset();
     for (unsigned j = 0; j < allocation_count_; ++j)
       cudaFree(allocations_[j]);
@@ -733,3 +924,50 @@ extern "C" int triage_hover_destroy(void *env) {
 }
 
 extern "C" const char *triage_hover_error(void) { return last_error; }
+
+extern "C" int triage_snapshot_configure(void *env, const uint32_t *ids,
+                                         size_t count, size_t slots) {
+  last_error[0] = '\0';
+  try {
+    environment(env).configure_snapshot(ids, count, slots);
+    return 0;
+  } catch (...) {
+    capture_error();
+    return -1;
+  }
+}
+
+extern "C" int triage_snapshot_submit(void *env, uint64_t step, void *stream) {
+  last_error[0] = '\0';
+  try {
+    return environment(env).submit_snapshot(step,
+                                            static_cast<cudaStream_t>(stream));
+  } catch (...) {
+    capture_error();
+    return -1;
+  }
+}
+
+extern "C" int triage_snapshot_poll(void *env, triage_snapshot_vehicle *output,
+                                    size_t count, uint64_t *step,
+                                    float *gather_ms, float *copy_ms) {
+  last_error[0] = '\0';
+  try {
+    return environment(env).poll_snapshot(output, count, step, gather_ms,
+                                          copy_ms);
+  } catch (...) {
+    capture_error();
+    return -1;
+  }
+}
+
+extern "C" int triage_snapshot_disable(void *env) {
+  last_error[0] = '\0';
+  try {
+    environment(env).disable_snapshot();
+    return 0;
+  } catch (...) {
+    capture_error();
+    return -1;
+  }
+}
