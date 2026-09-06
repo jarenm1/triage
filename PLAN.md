@@ -711,6 +711,21 @@ After the GPU presentation cutover, the headless geometry/replay checks still pa
 
 This slice establishes inspectable sensor output and scene replay. Procedural scene distributions, large dataset batches, perception-model comparisons, physical camera motion and sim-to-real improvement remain separate milestones.
 
+#### Embeddable WASM canvas showcase
+
+`apps/web-demo` is a canvas-only WebGPU showcase with deterministic courtyard and calibration scenes. RGB, depth, uint32 instance IDs and comparison use the same sensor camera. Gates share an ID across their component meshes; both scenes include ID `4,000,000,001`. GPU-rendered buttons select outputs, switch scenes, reset the view, toggle orbit and zoom. Control state and hit testing live in WASM; the small `app.js` harness supplies DOM pointer/keyboard events and animation scheduling, not a surrounding website UI.
+
+Depth **display colors** auto-range between the nearest and farthest visible foreground samples each frame. A GPU workgroup reduction ignores background IDs and invalid depths; a constant-depth surface uses the palette midpoint. Nearest is red, farthest blue, and background black. The underlying optical-Z depth remains in metres. The overlay is added only after sensor rendering, so its buttons never enter sensor labels. Sensor textures use five bounded resolution tiers up to 960×720; neither normal presentation nor relative-depth reduction reads images back to the CPU.
+
+```sh
+nix develop --command trunk build --config apps/web-demo/Trunk.toml --release --locked
+nix develop --command trunk serve --config apps/web-demo/Trunk.toml
+```
+
+The release bundle is in `apps/web-demo/dist/`. A host imports `web-demo.js`, calls its default WASM initializer, then `create_renderer(canvas)`. Keep `web-demo_bg.wasm` beside the generated JS module; `web-demo.d.ts` supplies TypeScript declarations. `Engine.render(width, height, pixel_ratio, delta_seconds)` draws into the supplied canvas; dimensions are backing pixels, UI pointer coordinates use those same pixels, and camera drag deltas use CSS pixels. Reuse the bundled `app.js` as the minimal event/render-loop example. No global renderer variable or fixed canvas ID is required by the WASM module. Serve via HTTPS or localhost in a WebGPU-enabled browser; CUDA physics and trained policies are not part of this browser demo.
+
+Verification: real browser RGB/depth/ID/comparison output and GPU buttons were inspected. Output selection, scene switching, zoom, orbit start/stop, reset and cancelled GUI drag-out were exercised; selecting outputs or cancelling a GUI gesture did not move the camera. The user also verified the canvas and relative-depth presentation. The shared attachment-sampling change passed the four existing rendering tests and the 76,800-pixel native analytical depth/occlusion and exact scene-replay smoke check.
+
 ### Phase 4: Synthetic data and transfer evaluation
 
 **Goal:** Produce auditable datasets and answer whether they improve performance on held-out real data.

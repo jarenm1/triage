@@ -1,0 +1,10 @@
+[build]
+target = "index.html"
+release = true
+public_url = "./"
+filehash = false
+pattern_script = ""
+
+[serve]
+port = 8081
+open = false

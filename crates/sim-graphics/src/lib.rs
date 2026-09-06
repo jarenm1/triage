@@ -174,7 +174,13 @@ impl Renderer {
             })
             .unwrap_or(COLOR_FORMAT);
         let limits = if cfg!(target_arch = "wasm32") {
-            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits())
+            // WebGL2 has no compute/storage buffers; WebGPU retains its baseline capabilities.
+            if adapter.get_info().backend == wgpu::Backend::Gl {
+                wgpu::Limits::downlevel_webgl2_defaults()
+            } else {
+                wgpu::Limits::default()
+            }
+            .using_resolution(adapter.limits())
         } else {
             wgpu::Limits::default()
         };
@@ -361,7 +367,7 @@ impl Renderer {
         &self.queue
     }
 
-    /// Output of the last execution, valid until the next execution reuses the pool.
+    /// Sampleable/copyable output of the last execution, valid until the next execution reuses the pool.
     pub fn output_texture(&self, key: ViewKey, output: OutputKind) -> Option<&wgpu::Texture> {
         let view = self.compiled_views.iter().find(|view| view.request.key == key)?;
         let index = match output {
@@ -535,8 +541,9 @@ impl Renderer {
                     }
                     ViewKind::Sensor => {
                         profiling::scope!("allocate transient resources");
-                        let usage =
-                            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+                        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::COPY_SRC
+                            | wgpu::TextureUsages::TEXTURE_BINDING;
                         let mut acquire = |format| {
                             self.texture_pool.acquire(
                                 &self.device,
