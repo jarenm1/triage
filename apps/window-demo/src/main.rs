@@ -18,11 +18,27 @@ const COLLISION_RADIUS: f32 = 0.85;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod inspection;
+#[cfg(not(target_arch = "wasm32"))]
+mod trajectory;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref() == Some(std::ffi::OsStr::new("--inspect")) {
+    let mode = args.next();
+    if matches!(
+        mode.as_deref().and_then(|s| s.to_str()),
+        Some("--trajectory" | "--live")
+    ) {
+        let value = args.next().ok_or_else(|| {
+            anyhow::anyhow!("usage: window-demo --trajectory FILE | --live HOST:PORT")
+        })?;
+        anyhow::ensure!(args.next().is_none(), "unexpected trajectory arguments");
+        return trajectory::run(
+            mode.as_deref() == Some(std::ffi::OsStr::new("--live")),
+            value,
+        );
+    }
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--inspect")) {
         let path = args.next().map(std::path::PathBuf::from);
         anyhow::ensure!(args.next().is_none(), "usage: window-demo --inspect [scene.json]");
         return inspection::run(path);

@@ -3,6 +3,7 @@ members = [
   "crates/sim-graphics",
   "crates/sim-graphics-winit",
   "crates/sim-inspection",
+  "crates/sim-trajectory",
   "apps/render-smoke",
   "apps/window-demo",
   "apps/web-demo",

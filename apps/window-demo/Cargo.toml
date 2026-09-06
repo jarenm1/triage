@@ -13,7 +13,9 @@ sim-graphics-winit = { path = "../../crates/sim-graphics-winit" }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 anyhow.workspace = true
 pollster.workspace = true
+parking_lot = "0.12"
 sim-inspection = { path = "../../crates/sim-inspection" }
+sim-trajectory = { path = "../../crates/sim-trajectory" }
 wgpu.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
