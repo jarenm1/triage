@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Triage canvas</title>
+  <link rel="icon" href="data:,">
+  <link data-trunk rel="rust" href="Cargo.toml" data-typescript>
+  <link data-trunk rel="copy-file" href="app.js">
+  <style>
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #141c24; }
+    canvas { display: block; width: 100%; height: 100%; touch-action: none; outline: none; }
+  </style>
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <canvas id="triage-canvas" tabindex="0" aria-label="Loading Triage renderer" title="1 RGB · 2 Depth · 3 Instances · 4 Compare · S scene · Drag / arrows to orbit · Scroll / pinch to zoom · Space auto-orbit · Double-click to reset"></canvas>
+</body>
+</html>

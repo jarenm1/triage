@@ -5,6 +5,7 @@ members = [
   "crates/sim-inspection",
   "apps/render-smoke",
   "apps/window-demo",
+  "apps/web-demo",
 ]
 resolver = "3"
 
