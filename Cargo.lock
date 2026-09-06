@@ -1689,6 +1689,7 @@ dependencies = [
  "pollster",
  "sim-graphics",
  "sim-inspection",
+ "sim-trajectory",
  "wgpu",
 ]
 
@@ -1887,6 +1888,17 @@ dependencies = [
  "sim-graphics",
  "tempfile",
  "wgpu",
+]
+
+[[package]]
+name = "sim-trajectory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam",
+ "serde",
+ "serde_json",
+ "sim-graphics",
 ]
 
 [[package]]
@@ -2435,6 +2447,7 @@ dependencies = [
  "js-sys",
  "serde_json",
  "sim-graphics",
+ "sim-trajectory",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -2659,10 +2672,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "glam",
+ "parking_lot",
  "pollster",
  "sim-graphics",
  "sim-graphics-winit",
  "sim-inspection",
+ "sim-trajectory",
  "wasm-bindgen",
  "wgpu",
 ]

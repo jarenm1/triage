@@ -12,6 +12,9 @@ pub struct Controls {
     pub pitch: f32,
     pub distance: f32,
     pub auto_orbit: bool,
+    pub trajectory: bool,
+    pub playing: bool,
+    pub mounted: bool,
     buttons: Vec<Button>,
     captured: bool,
     pressed: Option<usize>,
@@ -26,7 +29,10 @@ impl Controls {
             pitch: 0.5,
             distance: 18.0,
             auto_orbit: false,
-            buttons: Vec::with_capacity(9),
+            trajectory: false,
+            playing: false,
+            mounted: false,
+            buttons: Vec::with_capacity(10),
             captured: false,
             pressed: None,
         }
@@ -38,28 +44,38 @@ impl Controls {
             "DEPTH",
             "IDS",
             "COMPARE",
-            if self.scene == 0 {
+            if self.trajectory {
+                "SHOWCASE"
+            } else if self.scene == 0 {
                 "COURTYARD"
             } else {
                 "CUBES"
             },
             "RESET",
-            if self.auto_orbit {
+            if self.trajectory && self.playing {
+                "PAUSE"
+            } else if self.trajectory {
+                "PLAY"
+            } else if self.auto_orbit {
                 "ORBIT ON"
             } else {
                 "ORBIT OFF"
             },
             "-",
             "+",
+            if self.mounted { "MOUNTED" } else { "ORBIT" },
         ];
         let available = width as f32 / pixel_ratio;
         let mut x = 12.0;
         let mut y = 12.0;
         self.buttons.clear();
         for (index, label) in labels.into_iter().enumerate() {
+            if index == 9 && !self.trajectory {
+                break;
+            }
             // Keep state-dependent labels at a stable size while a pointer is held.
             let characters = match index {
-                4 | 6 => 9,
+                4 | 6 | 9 => 9,
                 _ => label.len(),
             };
             let button_width = (characters as f32 * 8.0 + 24.0).max(44.0);
@@ -77,7 +93,13 @@ impl Controls {
                 label,
                 active: index == self.mode as usize
                     || index == 4
-                    || (index == 6 && self.auto_orbit),
+                    || (index == 6
+                        && if self.trajectory {
+                            self.playing
+                        } else {
+                            self.auto_orbit
+                        })
+                    || (index == 9 && self.mounted),
                 pressed: self.pressed == Some(index),
             });
             x += button_width + 6.0;
@@ -118,11 +140,26 @@ impl Controls {
         if let Some(index) = pressed.filter(|index| self.hit(x, y) == Some(*index)) {
             match index {
                 0..=3 => self.set_mode(index as u32),
-                4 => self.set_scene(1 - self.scene),
+                4 => {
+                    if self.trajectory {
+                        self.trajectory = false;
+                        self.playing = false;
+                        self.reset();
+                    } else {
+                        self.set_scene(1 - self.scene);
+                    }
+                }
                 5 => self.reset(),
-                6 => self.auto_orbit = !self.auto_orbit,
+                6 => {
+                    if self.trajectory {
+                        self.playing = !self.playing;
+                    } else {
+                        self.auto_orbit = !self.auto_orbit;
+                    }
+                }
                 7 => self.zoom(1.1),
                 8 => self.zoom(1.0 / 1.1),
+                9 => self.mounted = !self.mounted,
                 _ => unreachable!(),
             }
         }
@@ -153,6 +190,7 @@ impl Controls {
     }
 
     pub fn reset(&mut self) {
+        self.mounted = false;
         self.yaw = 0.65;
         self.pitch = 0.5;
         self.distance = 18.0;
@@ -164,6 +202,8 @@ impl Controls {
     }
 
     pub fn set_scene(&mut self, scene: u32) {
+        self.trajectory = false;
+        self.playing = false;
         if self.scene != scene {
             self.scene = scene;
             self.reset();
@@ -178,7 +218,9 @@ impl Controls {
             "4" => self.set_mode(3),
             "s" | "S" => self.set_scene(1 - self.scene),
             "r" | "R" => self.reset(),
+            " " if self.trajectory => self.playing = !self.playing,
             " " => self.auto_orbit = !self.auto_orbit,
+            "c" | "C" => self.mounted = !self.mounted,
             "ArrowLeft" => self.yaw -= 0.08,
             "ArrowRight" => self.yaw += 0.08,
             "ArrowUp" => self.pitch = (self.pitch + 0.06).clamp(0.08, 1.45),

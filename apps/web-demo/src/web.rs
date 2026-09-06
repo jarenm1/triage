@@ -12,6 +12,7 @@ use glam::Vec3;
 use sim_graphics::{
     Camera, Frame, OutputKind, RenderView, Renderer, ViewKey, ViewKind, ViewOutputs,
 };
+use sim_trajectory::{CameraMode, GROUND_OBJECT_ID, Recording, TrajectoryScene};
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
@@ -57,6 +58,10 @@ pub struct Engine {
     controls: controls::Controls,
     gui: gui::Gui,
     depth_range: depth_range::DepthRange,
+    trajectory_scene: TrajectoryScene,
+    recording: Option<Recording>,
+    playback_time: f64,
+    environment_index: usize,
 }
 
 impl Engine {
@@ -89,6 +94,8 @@ impl Engine {
                 )));
             });
         let scenes = scene::build(&mut renderer).map_err(error)?;
+        let mut trajectory_scene = TrajectoryScene::new();
+        trajectory_scene.initialize(&mut renderer).map_err(error)?;
         let device = renderer.device();
         let depth_range = depth_range::DepthRange::new(device);
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -212,6 +219,10 @@ impl Engine {
             controls: controls::Controls::new(),
             gui,
             depth_range,
+            trajectory_scene,
+            recording: None,
+            playback_time: 0.0,
+            environment_index: 0,
         })
     }
 
@@ -306,20 +317,40 @@ impl Engine {
             yaw.cos() * pitch.cos(),
         ) * distance;
         self.frame.begin();
-        for &primitive in &selected.primitives {
-            self.frame.draw(primitive);
-        }
+        let camera =
+            if let Some(recording) = self.recording.as_ref().filter(|_| self.controls.trajectory) {
+                let snapshot = recording.sample(self.playback_time);
+                self.trajectory_scene.draw(&mut self.frame, snapshot);
+                let mode = if self.controls.mounted {
+                    CameraMode::Mounted {
+                        environment_id: recording.header.environment_ids[self.environment_index],
+                    }
+                } else {
+                    CameraMode::Orbit {
+                        azimuth: yaw,
+                        elevation: pitch,
+                        distance,
+                    }
+                };
+                self.trajectory_scene
+                    .camera(&recording.header, snapshot, mode)
+            } else {
+                for &primitive in &selected.primitives {
+                    self.frame.draw(primitive);
+                }
+                Camera {
+                    eye: selected.target + offset,
+                    target: selected.target,
+                    up: Vec3::Y,
+                    vertical_fov_radians: FOV_DEGREES.to_radians(),
+                    near: NEAR,
+                    far: FAR,
+                }
+            };
         self.frame.add_view(RenderView {
             key: SENSOR,
             kind: ViewKind::Sensor,
-            camera: Camera {
-                eye: selected.target + offset,
-                target: selected.target,
-                up: Vec3::Y,
-                vertical_fov_radians: FOV_DEGREES.to_radians(),
-                near: NEAR,
-                far: FAR,
-            },
+            camera,
             width: dimensions[0],
             height: dimensions[1],
             outputs: ViewOutputs::COLOR | ViewOutputs::DEPTH | ViewOutputs::OBJECT_ID,
@@ -464,6 +495,19 @@ impl Engine {
                 "Invalid canvas dimensions, pixel ratio, or frame interval.",
             ));
         }
+        if self.controls.trajectory && self.controls.playing {
+            if let Some(recording) = &self.recording {
+                let end = recording
+                    .snapshots
+                    .last()
+                    .expect("validated recording")
+                    .time_seconds;
+                self.playback_time = (self.playback_time + f64::from(delta_seconds)).min(end);
+                if self.playback_time >= end {
+                    self.controls.playing = false;
+                }
+            }
+        }
         self.controls.advance(delta_seconds);
         self.controls.layout(width, height, pixel_ratio);
         self.render_frame(width, height, pixel_ratio)
@@ -482,7 +526,12 @@ impl Engine {
         if !x.is_finite() || !y.is_finite() {
             return self.controls.pointer_cancel();
         }
-        self.controls.pointer_up(x, y)
+        let was_playing = self.controls.playing;
+        let consumed = self.controls.pointer_up(x, y);
+        if !was_playing && self.controls.playing {
+            self.play();
+        }
+        consumed
     }
 
     pub fn pointer_cancel(&mut self) -> bool {
@@ -495,6 +544,9 @@ impl Engine {
             return Err(error("Camera drag must be finite."));
         }
         self.controls.orbit_by(dx, dy);
+        if dx != 0.0 || dy != 0.0 {
+            self.controls.mounted = false;
+        }
         Ok(())
     }
 
@@ -508,11 +560,39 @@ impl Engine {
     }
 
     pub fn key(&mut self, key: &str) -> bool {
+        if self.controls.trajectory {
+            match key {
+                "Home" => {
+                    self.restart();
+                    return true;
+                }
+                "[" => {
+                    let _ = self.seek(self.playback_time - 1.0);
+                    return true;
+                }
+                "]" => {
+                    let _ = self.seek(self.playback_time + 1.0);
+                    return true;
+                }
+                "n" | "N" => {
+                    if let Some(recording) = &self.recording {
+                        self.environment_index =
+                            (self.environment_index + 1) % recording.header.environment_ids.len();
+                    }
+                    return true;
+                }
+                " " if !self.controls.playing => {
+                    self.play();
+                    return true;
+                }
+                _ => {}
+            }
+        }
         self.controls.key(key)
     }
 
     pub fn is_animating(&self) -> bool {
-        self.controls.auto_orbit
+        self.controls.auto_orbit || (self.controls.trajectory && self.controls.playing)
     }
 
     pub fn mode(&self) -> u32 {
@@ -543,11 +623,84 @@ impl Engine {
         self.controls.reset();
     }
 
+    /// Parse completely before replacing the active scene. Loading starts paused.
+    pub fn load_trajectory(&mut self, ndjson: &str) -> Result<(), JsValue> {
+        let recording = Recording::parse(ndjson).map_err(error)?;
+        self.playback_time = recording.snapshots[0].time_seconds;
+        self.environment_index = 0;
+        self.recording = Some(recording);
+        self.controls.reset();
+        self.controls.trajectory = true;
+        self.controls.playing = false;
+        Ok(())
+    }
+
+    /// Seek to an absolute recording timestamp, clamped to the recorded range.
+    pub fn seek(&mut self, time_seconds: f64) -> Result<(), JsValue> {
+        if !time_seconds.is_finite() {
+            return Err(error("Playback timestamp must be finite."));
+        }
+        let recording = self
+            .recording
+            .as_ref()
+            .filter(|_| self.controls.trajectory)
+            .ok_or_else(|| error("Load a trajectory before seeking."))?;
+        self.playback_time = time_seconds.clamp(
+            recording.snapshots[0].time_seconds,
+            recording
+                .snapshots
+                .last()
+                .expect("validated recording")
+                .time_seconds,
+        );
+        Ok(())
+    }
+
+    pub fn play(&mut self) {
+        if self.controls.trajectory {
+            if let Some(recording) = &self.recording {
+                if self.playback_time
+                    >= recording
+                        .snapshots
+                        .last()
+                        .expect("validated recording")
+                        .time_seconds
+                {
+                    self.playback_time = recording.snapshots[0].time_seconds;
+                }
+                self.controls.playing = true;
+            }
+        }
+    }
+
+    pub fn pause(&mut self) {
+        self.controls.playing = false;
+    }
+
+    pub fn restart(&mut self) {
+        if self.controls.trajectory {
+            if let Some(recording) = &self.recording {
+                self.playback_time = recording.snapshots[0].time_seconds;
+            }
+        }
+    }
+
+    pub fn set_camera_mode(&mut self, mode: &str) -> Result<(), JsValue> {
+        self.controls.mounted = match mode {
+            "orbit" => false,
+            "mounted" => true,
+            _ => return Err(error("Camera mode must be orbit or mounted.")),
+        };
+        self.controls.auto_orbit = false;
+        Ok(())
+    }
+
     pub fn info(&self) -> String {
         let scene = &self.scenes[self.scene];
-        serde_json::json!({
+        let mut info = serde_json::json!({
             "backend": "WebGPU",
             "depth_visualization": "relative_visible_range",
+            "playback": { "active": false, "playing": false },
             "view": {
                 "mode": self.controls.mode, "scene": self.controls.scene,
                 "yaw": self.controls.yaw, "pitch": self.controls.pitch,
@@ -563,7 +716,42 @@ impl Engine {
             "objects": scene.objects.iter().map(|object| serde_json::json!({
                 "id": object.id, "name": object.name, "color": scene::palette(object.id),
             })).collect::<Vec<_>>(),
-        })
-        .to_string()
+        });
+        if let Some(recording) = self.recording.as_ref().filter(|_| self.controls.trajectory) {
+            let snapshot = recording.sample(self.playback_time);
+            info["scene_name"] = "trajectory".into();
+            info["object_count"] = (1 + snapshot.vehicles.len() * 2).into();
+            info["primitive_count"] = self.frame.primitives().len().into();
+            info["playback"] = serde_json::json!({
+                "active": true,
+                "playing": self.controls.playing,
+                "time_seconds": self.playback_time,
+                "start_seconds": recording.snapshots[0].time_seconds,
+                "end_seconds": recording.snapshots.last().expect("validated recording").time_seconds,
+                "sample_count": recording.snapshots.len(),
+                "camera_mode": if self.controls.mounted { "mounted" } else { "orbit" },
+                "environment_id": recording.header.environment_ids[self.environment_index],
+                "snapshot": snapshot,
+            });
+            info["camera"] = serde_json::json!({
+                "near": recording.header.camera.near,
+                "far": recording.header.camera.far,
+                "fov_vertical_degrees": recording.header.camera.vertical_fov_radians.to_degrees(),
+                "width": self.sensor_size[0], "height": self.sensor_size[1],
+            });
+            let mut objects = vec![serde_json::json!({"id": GROUND_OBJECT_ID, "name": "ground"})];
+            for vehicle in &snapshot.vehicles {
+                objects.push(serde_json::json!({
+                    "id": vehicle.drone_object_id(), "name": "drone",
+                    "environment_id": vehicle.environment_id,
+                }));
+                objects.push(serde_json::json!({
+                    "id": vehicle.target_object_id(), "name": "target",
+                    "environment_id": vehicle.environment_id,
+                }));
+            }
+            info["objects"] = objects.into();
+        }
+        info.to_string()
     }
 }

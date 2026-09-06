@@ -654,10 +654,10 @@ This completes the agreed fixed-vehicle target-tracking slice, not the remaining
 
 **Goal:** Add visualization and bounded visual sensing without coupling renderer cadence to training cadence.
 
-- [ ] **Define and implement `RenderSnapshot`**
+- [x] **Define and implement `RenderSnapshot`**
   - Select environment IDs and include timestamped poses, object identities, cameras, and scene version.
   - Apply the documented ENU/FLU-to-renderer transform once.
-- [ ] **Ship the staged-copy adapter first**
+- [x] **Ship the staged-copy adapter first**
   - Use bounded double/triple buffering and explicit backpressure.
   - Measure gather, transfer, `queue.write_buffer`, and render costs separately.
 - [ ] **Resolve the native interop experiment**
@@ -666,14 +666,54 @@ This completes the agreed fixed-vehicle target-tracking slice, not the remaining
 - [ ] **Extend `sim-graphics` for calibrated sensor batches**
   - Budget camera count, resolution, and output set explicitly.
   - Verify color transfer, optical z-depth, object-ID stability, occlusion, and background semantics.
-- [ ] **Build the decoupled viewer**
+- [x] **Build the decoupled viewer**
   - Free/orbit and vehicle-mounted views at a display-rate target such as 60 FPS.
   - Drop stale snapshots rather than delaying simulation.
-- [ ] **Add versioned trajectory recording and replay**
+- [x] **Add versioned trajectory recording and replay**
   - Record conventions, schema version, timestamps, scenario identity, and enough state for reproducible, timestamp-aligned visual replay; bit-exact pixels are required only where a renderer/backend explicitly guarantees them.
   - Support native and web replay through the same logical recording schema.
 
 **Exit gate:** A trained trajectory can be viewed live and replayed; the headless step path remains render-independent; visual correctness fixtures pass; throughput impact is measured rather than assumed.
+
+#### Current trained-policy trajectory bridge
+
+JJ change `rtywlmus` connects saved hover/tracking policies to selected-state staging, a native live viewer, and native/WebGPU recording playback. `rl/view_policy.py` uses the existing checkpoint loader and deterministic policy means; it does not change the learner, task, or ordinary headless training path. This completes the fixed-scene trajectory-viewing slice, not batched camera sensing or the entire Phase 3 exit gate. Visual inspection of the new viewer/playback controls is explicitly left to the user.
+
+The optional native snapshot ring exports actual selected `PhysicsBatch` positions and Hamilton quaternions, then packs current targets and episode IDs on the producing stream. A separate nonblocking stream copies only these immutable compact slots to pinned host memory. Completion events gate polling and slot reuse; later physics never waits for the D2H transfer. Selection is 1–64 unique environments; 2–16 slots are allocated once, with four by default. Full rings drop submissions. Python copies ready rows into a bounded worker queue; JSON encoding, recording and localhost TCP writes belong to the worker, not the control call. A slow network client retains at most one partial line and the latest pending snapshot in application storage; it cannot hold a CUDA slot or block stepping. Teardown may drain/wait, but never waits for a viewer. Recording files must not already exist.
+
+`sim-trajectory` owns the version-1 NDJSON schema, validation, timestamp sampling, coordinate conversion, fixed drone/target/ground geometry and cameras for both native and WASM consumers:
+
+- The first line records schema/scene versions, ENU/FLU and scalar-first quaternion conventions, task, seed, checkpoint path, 10 ms control interval, requested sampling cadence, ordered environment selection and camera FOV/near/far calibration. Scene version 1 is illustrative quadrotor geometry and target markers above a ground plane, not a physical collision asset.
+- Each subsequent complete line records global control step/time and selected vehicles' environment IDs, episode IDs, world positions, body-to-world quaternions and active targets. These are **current post-autoreset** poses, not terminal-transition poses. Absolute simulation time never resets.
+- Replay sample-holds at the recorded timestamps, including dropped samples; it never interpolates across an episode reset. Recordings preserve realized poses rather than promising simulator restoration or bit-identical pixels across devices.
+- ENU `(x,y,z)` becomes renderer `(x,z,-y)` through one proper basis rotation. The mounted camera is 0.5 m forward and 0.12 m up in FLU, looking forward with body up; orbit uses world up. These mounts and geometry are part of scene version 1.
+- Background ID is `0`, ground is `4,294,967,295`, and vehicle/target IDs are `2*environment_id+1` / `2*environment_id+2`. Shared identity definitions drive both rendered labels and browser metadata.
+
+Inside `nix develop`, after building the CUDA library and creating the existing policy checkpoints:
+
+```sh
+# Record 40 simulated seconds, independent of wall-clock playback speed.
+cuda/build/rl-venv/bin/python rl/view_policy.py --task tracking --checkpoint cuda/build/tracking-final-seed11.pt --environment-ids 0,7,31 --steps 4000 --record cuda/build/tracking-view.ndjson
+cargo run -p window-demo -- --trajectory cuda/build/tracking-view.ndjson
+
+# Live: start the producer, then the viewer in another terminal.
+cuda/build/rl-venv/bin/python rl/view_policy.py --task tracking --checkpoint cuda/build/tracking-final-seed11.pt --environment-ids 0,7,31 --steps 6000 --listen 127.0.0.1:9876 --realtime
+cargo run -p window-demo -- --live 127.0.0.1:9876
+
+# Native headless geometry/label/depth smoke and diagnostic captures.
+cargo run -p render-smoke -- --trajectory cuda/build/tracking-view.ndjson --output target/tracking-view
+
+# Browser: select the same NDJSON file in the supplied page.
+trunk serve --config apps/web-demo/Trunk.toml
+```
+
+Native controls: Space pauses, R restarts recorded playback, C switches orbit/mounted cameras, N selects the mounted vehicle, arrows orbit and wheel zooms. The live viewer consumes the latest complete snapshot without waiting for network IO and preserves its last pose on disconnect. Start a new viewer to reconnect. Browser loading starts paused; GPU buttons control play/pause and camera mode. Space toggles playback, Home restarts, `[`/`]` seek one second, C switches cameras, N selects the vehicle, and S returns to the showcase. Embedders can call `load_trajectory(ndjson)`, `play()`, `pause()`, `restart()`, `seek(absolute_seconds)` and `set_camera_mode("orbit"|"mounted")`; invalid loads preserve the existing recording. RGB/depth/ID/comparison modes remain available. Browser replay needs no CUDA or Python.
+
+Verification on the RTX 2070 SUPER: all five native CTests, six Rust tests and four Python regressions passed; the release WASM bundle built. The native regression covers blocked-stream nonblocking submission/polling, full-ring drops, cross-stream ordering, selected pose/attitude/target correspondence, post-reset episode identity and independence from later state mutations. Compute Sanitizer reported zero errors after warming its snapshot-kernel instrumentation before the blocked-stream check. Shared tests cover sample-hold through timestamp gaps/resets and physical yaw/mounted-camera basis conversion. A real 25-second tracking rollout recorded all 501 requested samples. A separate 64-environment live stream delivered 4,901 increasing complete snapshots, each matched exactly against the simultaneously recorded frame. A deliberately non-reading client still completed all 5,000 controls while replacing 4,981 network snapshots. The received recording then passed native parsing and six headless RGB/depth/ID renders (first/middle/last, orbit/mounted), including finite optical depth, far-valued background and identity-map checks. No visual sign-off is claimed.
+
+Measured staging impact, **not learner-update or live-viewer frame-rate performance**: three sequential paired runs used tracking seed 10001, checkpoint seed 11, 1,024 environments, 100 warm-up controls followed by reset, 10,000 measured controls, selection `[0,7,31]`, and one sample per five controls. Policy inference, full environment and optional recording/worker activity are inside the wall interval; checkpoint loading, construction, warm-up/reset and final recording drain are outside. Unpaced baseline median was 2.240 s (range 2.188–2.338), versus 2.639 s (2.612–2.674) with staging/recording: about 4.57 versus 3.88 million environment transitions/s, or a 15.1% throughput reduction. All three recording runs retained 2,001 samples without ring/worker drops. Average GPU gather/packing was 5.11–5.21 microseconds per selected snapshot; D2H was 2.12–2.14 microseconds, timed separately with CUDA events. These are uncontrolled-clock Linux/i7-9700K/RTX-2070-SUPER measurements with driver 595.99.02, Release CUDA and float32 physics/policy; ranges are not confidence intervals.
+
+For a three-vehicle, 960×540 RGB/depth/ID headless scene, six debug-build samples measured CPU scene preparation at 11–20 microseconds, upload-plus-render CPU submission at 141–295 microseconds, and GPU-completed wall time at 309–673 microseconds. The latter includes submission/polling and is **not** a GPU timestamp measurement. Separate temporary instrumentation measured the two `queue.write_buffer` CPU calls together at 7.8–36.5 microseconds on the six GPU-only submissions; that measures CPU staging, not isolated GPU transfer time. Explicit render/readback took 65.6–72.6 ms and remains outside interactive rendering. The probe and transport/performance driver were removed after measurement; the CLI retains stage counters/timings and a `--disabled` paired-baseline mode. Concurrent learner-plus-viewer throughput, display latency, visual inspection and the optional native-interoperation decision remain unclaimed.
 
 #### Current sensor-inspection slice
 

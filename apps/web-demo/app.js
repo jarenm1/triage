@@ -9,12 +9,42 @@ const pointers = new Map();
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 const modes = ['RGB', 'relative depth', 'instance IDs', 'comparison'];
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+const recordingInput = document.getElementById('trajectory-file');
+const recordingStatus = document.getElementById('trajectory-status');
+const recordingError = document.getElementById('trajectory-error');
+let recordingName = '';
+let loadGeneration = 0;
+let lastStatusTime = 0;
+
+recordingInput.addEventListener('change', async () => {
+  const file = recordingInput.files[0];
+  const generation = ++loadGeneration;
+  if (!file || !renderer || failed) return;
+  try {
+    const text = await file.text();
+    if (generation !== loadGeneration) return;
+    renderer.load_trajectory(text);
+    recordingName = file.name;
+    recordingError.textContent = '';
+    previousTime = 0;
+    canvas.focus();
+    requestRender();
+  } catch (error) {
+    if (generation === loadGeneration) {
+      recordingError.textContent = `Could not load ${file.name}: ${String(error?.message || error)}. Previous scene retained.`;
+    }
+  } finally {
+    recordingInput.value = '';
+  }
+});
 
 function fail(error) {
   failed = true;
   cancelAnimationFrame(frame);
   console.error(error);
   const message = String(error?.message || error);
+  recordingInput.disabled = true;
+  recordingStatus.textContent = message;
   const replacement = canvas.cloneNode(false);
   canvas.replaceWith(replacement);
   canvas = replacement;
@@ -53,7 +83,16 @@ function render(time) {
   const delta = previousTime ? (time - previousTime) / 1000 : 0;
   try {
     renderer.render(Math.max(1, Math.round(width * scale)), Math.max(1, Math.round(height * scale)), scale, delta);
-    canvas.setAttribute('aria-label', `Triage — ${modes[renderer.mode()]} — ${renderer.scene_index() ? 'calibration cubes' : 'courtyard'}. Canvas controls; keys 1–4 select representation, S switches scene, R resets, Space toggles orbit, arrows rotate, plus and minus zoom.`);
+    if (time - lastStatusTime >= 250 || !previousTime || !renderer.is_animating()) {
+      const info = JSON.parse(renderer.info());
+      const playback = info.playback;
+      const scene = playback.active ? `trajectory ${recordingName}` : info.scene_name;
+      canvas.setAttribute('aria-label', `Triage — ${modes[renderer.mode()]} — ${scene}. ${canvas.title}`);
+      recordingStatus.textContent = playback.active
+        ? `${recordingName} · ${playback.playing ? 'Playing' : 'Paused'} · ${playback.time_seconds.toFixed(2)} / ${playback.end_seconds.toFixed(2)} s · ${playback.camera_mode} · environment ${playback.environment_id}`
+        : 'Showcase · Choose a sampled trajectory recording to replay. Space toggles auto-orbit.';
+      lastStatusTime = time;
+    }
   } catch (error) { fail(error); return; }
   previousTime = renderer.is_animating() ? time : 0;
   if (renderer.is_animating()) requestRender();
@@ -165,13 +204,15 @@ document.addEventListener('visibilitychange', () => {
 });
 reducedMotion.addEventListener('change', event => {
   if (event.matches && renderer && !failed && renderer.is_animating()) {
-    renderer.key(' ');
+    renderer.pause();
+    if (JSON.parse(renderer.info()).view.auto_orbit) renderer.key(' ');
     requestRender();
   }
 });
 try {
   await init();
   renderer = await create_renderer(canvas);
+  recordingInput.disabled = false;
   if (reducedMotion.matches && renderer.is_animating()) renderer.key(' ');
   requestRender();
 } catch (error) { fail(error); }

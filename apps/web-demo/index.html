@@ -10,10 +10,20 @@
   <style>
     html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #141c24; }
     canvas { display: block; width: 100%; height: 100%; touch-action: none; outline: none; }
+    aside { position: absolute; bottom: 12px; left: 12px; right: 12px; color: #f3f1ea; font: 13px sans-serif; pointer-events: none; }
+    aside label { display: inline-block; padding: 8px; background: #141c24e8; pointer-events: auto; border-radius: 4px; }
+    aside p { margin: 4px 0; text-shadow: 0 1px 3px #000; }
   </style>
   <script type="module" src="./app.js"></script>
 </head>
 <body>
-  <canvas id="triage-canvas" tabindex="0" aria-label="Loading Triage renderer" title="1 RGB · 2 Depth · 3 Instances · 4 Compare · S scene · Drag / arrows to orbit · Scroll / pinch to zoom · Space auto-orbit · Double-click to reset"></canvas>
+  <canvas id="triage-canvas" tabindex="0" aria-label="Loading Triage renderer" title="1–4 RGB / Depth / IDs / Compare · S showcase · Drag / arrows orbit · Scroll / pinch zoom · Space play or auto-orbit · C mounted/orbit · N next vehicle · [ / ] seek 1s · Home restart · R reset view"></canvas>
+  <aside aria-label="Trajectory recording loader and keyboard help">
+    <label>Load trajectory <input id="trajectory-file" type="file" accept=".ndjson,.jsonl,.json,application/json" disabled></label>
+    <p id="trajectory-status" role="status">WebGPU initializing…</p>
+    <p id="trajectory-error" role="alert"></p>
+    <p>1–4 RGB / Depth / IDs / Compare · S showcase · Drag / arrows orbit · Scroll / pinch zoom</p>
+    <p>Recording: Space play/pause · C mounted/orbit · N next vehicle · [ / ] seek 1s · Home restart · R reset camera</p>
+  </aside>
 </body>
 </html>
