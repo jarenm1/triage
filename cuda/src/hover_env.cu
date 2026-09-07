@@ -116,6 +116,19 @@ __device__ void select_command(Buffers b, std::size_t i,
 
 __device__ void generate_plan(Buffers b, std::size_t i, std::uint64_t seed,
                               std::uint64_t episode) {
+  if (b.schedule == 2) {
+    // Playback-only long-flight v1: six held waypoints, not a training profile.
+    const float route[6][3] = {{10, 0, 2},    {10, 10, 2},  {-10, 10, 2},
+                               {-10, -10, 2}, {10, -10, 2}, {0, 0, 2}};
+    for (int command = 0; command < plan_commands; ++command) {
+      float *entry = b.command_plan + (i * plan_commands + command) * 4;
+      for (int axis = 0; axis < 3; ++axis)
+        entry[axis] = route[command % 6][axis];
+      entry[3] = 1000.0f;
+    }
+    select_command(b, i, 0);
+    return;
+  }
   float previous[3] = {0.0f, 0.0f, 1.0f};
   for (int command = 0; command < plan_commands; ++command) {
     std::uint64_t rng = mix(seed ^ 0xa0761d6478bd642fULL) ^
@@ -308,10 +321,12 @@ __global__ void finish_transition(Buffers b, std::size_t n, std::uint64_t seed,
   const float rate2 = out[15] * out[15] + out[16] * out[16] + out[17] * out[17];
   const float tilt = acosf(fminf(1.0f, fmaxf(-1.0f, out[14])));
   const auto position = b.states[i].position_w;
-  const bool outside = b.tracking
-                           ? fabsf(position.x) > 3.0f ||
-                                 fabsf(position.y) > 3.0f || position.z > 3.0f
-                           : distance2 > 4.0f;
+  const float arena_xy = b.schedule == 2 ? 20.0f : 3.0f;
+  const float arena_z = b.schedule == 2 ? 5.0f : 3.0f;
+  const bool outside = b.tracking ? fabsf(position.x) > arena_xy ||
+                                        fabsf(position.y) > arena_xy ||
+                                        position.z > arena_z
+                                  : distance2 > 4.0f;
   const bool failed = !finite || b.invalid_actions[i] || position.z < .05f ||
                       outside || tilt > .8f;
   const float reward = failed ? -1.0f
@@ -484,11 +499,13 @@ public:
           "hover environment count must be in [1, UINT32_MAX]");
     if (max_steps <= 0 || max_steps > (1 << 24))
       throw std::invalid_argument("max_steps must be in [1, 16777216]");
-    if (tracking && max_steps > 2000)
-      throw std::invalid_argument("tracking max_steps must be in [1, 2000]");
-    if (tracking && schedule != 0 && schedule != 1)
+    const int tracking_limit = schedule == 2 ? 6000 : 2000;
+    if (tracking && max_steps > tracking_limit)
       throw std::invalid_argument(
-          "tracking schedule must be 0 (mixed) or 1 (fixed500)");
+          "tracking episode exceeds its schedule limit");
+    if (tracking && schedule != 0 && schedule != 1 && schedule != 2)
+      throw std::invalid_argument("tracking schedule must be 0 (mixed), 1 "
+                                  "(fixed500), or 2 (long-flight-v1)");
     b_.tracking = tracking;
     b_.schedule = schedule;
     DeviceGuard guard(device_);

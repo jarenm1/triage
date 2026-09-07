@@ -244,10 +244,16 @@ class TrackingEnv(HoverEnv):
     def __init__(
         self, n=1024, seed=1, max_steps=2000, device=0, library=None, schedule="mixed"
     ):
-        if schedule not in ("mixed", "settling"):
-            raise ValueError("schedule must be mixed or settling")
-        if not 0 < max_steps <= 2000:
-            raise ValueError("tracking max_steps must be in [1,2000]")
+        schedules = {
+            "mixed": (0, 2000),
+            "settling": (1, 2000),
+            "long-flight-v1": (2, 6000),
+        }
+        if schedule not in schedules:
+            raise ValueError("schedule must be mixed, settling, or long-flight-v1")
+        native_schedule, limit = schedules[schedule]
+        if not 0 < max_steps <= limit:
+            raise ValueError(f"{schedule} max_steps must be in [1,{limit}]")
         self.schedule = schedule
         super().__init__(
             n,
@@ -255,5 +261,5 @@ class TrackingEnv(HoverEnv):
             max_steps,
             device,
             library,
-            _schedule=0 if schedule == "mixed" else 1,
+            _schedule=native_schedule,
         )

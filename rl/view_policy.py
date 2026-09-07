@@ -33,6 +33,9 @@ def main():
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--sample-every", type=int, default=5)
+    parser.add_argument(
+        "--scenario", choices=("trained", "long-flight-v1"), default="trained"
+    )
     parser.add_argument("--slots", type=int, default=4)
     parser.add_argument("--record")
     parser.add_argument("--listen", help="localhost TCP listener, e.g. 127.0.0.1:9876")
@@ -69,6 +72,8 @@ def main():
         parser.error("slots must be in [2,16]")
     if not args.disabled and not (args.record or args.listen):
         parser.error("provide --record and/or --listen (or --disabled for baseline)")
+    if args.scenario != "trained" and args.task != "tracking":
+        parser.error("long-flight-v1 requires a tracking checkpoint")
     seed_all(args.seed, args.device)
     policy, checkpoint = load_policy(args.checkpoint, args.task, args.device)
     policy.requires_grad_(False)
@@ -77,7 +82,7 @@ def main():
         "scene_version": 1,
         "frame": "ENU_FLU",
         "quaternion": "wxyz",
-        "task": args.task,
+        "task": args.task if args.scenario == "trained" else "tracking-long-flight-v1",
         "seed": args.seed,
         "control_dt": 0.01,
         "sample_every": args.sample_every,
@@ -87,12 +92,16 @@ def main():
     }
     env_type = TrackingEnv if args.task == "tracking" else HoverEnv
     producer = None
+    scenario_options = (
+        {"schedule": "long-flight-v1"} if args.scenario != "trained" else {}
+    )
     with env_type(
         n=args.batch,
         seed=args.seed,
         device=args.device,
-        max_steps=checkpoint["task"]["max_steps"],
+        max_steps=6000 if scenario_options else checkpoint["task"]["max_steps"],
         library=args.library,
+        **scenario_options,
     ) as env:
         with torch.inference_mode():
             for _ in range(args.warmup):
@@ -134,6 +143,7 @@ def main():
     report = {
         "task": args.task,
         "checkpoint": args.checkpoint,
+        "scenario": args.scenario,
         "disabled": args.disabled,
         "batch": args.batch,
         "steps": args.steps,

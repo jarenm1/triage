@@ -48,7 +48,10 @@ impl Header {
             "unsupported pose convention"
         );
         ensure!(
-            matches!(self.task.as_str(), "hover" | "tracking"),
+            matches!(
+                self.task.as_str(),
+                "hover" | "tracking" | "tracking-long-flight-v1"
+            ),
             "unsupported task"
         );
         ensure!(
