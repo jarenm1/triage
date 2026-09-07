@@ -75,6 +75,12 @@ void *triage_hover_create(int device, size_t n, uint64_t seed, int max_steps,
  * with initial final_observations, and restarts episode/command indices at 0.
  * Evaluators needing the terminated episode's future commands must clone its
  * initial plan before stepping; autoreset replaces it in-place.
+ * Playback-only schedule 2 is long-flight-v1: max_steps in [1,6000], targets
+ * (10,0,2),(10,10,2),(-10,10,2),(-10,-10,2),(10,-10,2),(0,0,2),
+ * each held 1000 controls. Its arena is x/y [-20,20], z [.05,5];
+ * tilt/nonfinite checks are unchanged.
+ * This out-of-training-distribution scenario is not a tracking acceptance
+ * suite.
  */
 void *triage_tracking_create(int device, size_t n, uint64_t seed, int max_steps,
                              int schedule, void *stream);

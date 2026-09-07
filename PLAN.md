@@ -715,6 +715,19 @@ Measured staging impact, **not learner-update or live-viewer frame-rate performa
 
 For a three-vehicle, 960×540 RGB/depth/ID headless scene, six debug-build samples measured CPU scene preparation at 11–20 microseconds, upload-plus-render CPU submission at 141–295 microseconds, and GPU-completed wall time at 309–673 microseconds. The latter includes submission/polling and is **not** a GPU timestamp measurement. Separate temporary instrumentation measured the two `queue.write_buffer` CPU calls together at 7.8–36.5 microseconds on the six GPU-only submissions; that measures CPU staging, not isolated GPU transfer time. Explicit render/readback took 65.6–72.6 ms and remains outside interactive rendering. The probe and transport/performance driver were removed after measurement; the CLI retains stage counters/timings and a `--disabled` paired-baseline mode. Concurrent learner-plus-viewer throughput, display latency, visual inspection and the optional native-interoperation decision remain unclaimed.
 
+#### Large-jump playback stress scenario
+
+`rl/view_policy.py --scenario long-flight-v1 --task tracking` loads the **same unchanged tracking checkpoint** but commands abrupt targets `(10,0,2)`, `(10,10,2)`, `(-10,10,2)`, `(-10,-10,2)`, `(10,-10,2)` and `(0,0,2)` in metres, held for 10 seconds each. The route contains 10 m and 20 m horizontal jumps; it is not a smoothed target trajectory or a scripted flight controller. The episode limit is 60 seconds and the arena is widened to horizontal ±20 m and altitude `[0.05,5]` m so the original ±3 m arena does not reject the requested destinations. Tilt, nonfinite-action/state and ground failure checks, motor mapping, physics and same-step autoreset are unchanged. A failure restarts the route at its first target.
+
+This is an out-of-training-distribution stress scenario, not a new training task or acceptance claim. Existing mixed/settling schedules and checkpoint contracts are unchanged. Recordings identify it as `tracking-long-flight-v1` rather than ordinary `tracking`, and native/web readers support that identity.
+
+```sh
+cuda/build/rl-venv/bin/python rl/view_policy.py --task tracking --scenario long-flight-v1 --checkpoint cuda/build/tracking-final-seed11.pt --batch 1 --environment-ids 0 --steps 6000 --record cuda/build/tracking-large-jumps.ndjson
+cargo run -p window-demo -- --trajectory cuda/build/tracking-large-jumps.ndjson
+```
+
+Observed with environment seed 10001 and policy seed 11: all 1,201 requested samples were recorded over 60 simulated seconds, with 240 episode resets. The policy failed on the first 10 m command before reaching later route points; the recording retains those failures rather than substituting a successful or smoothed flight. Five native tests, the two shared replay tests, four Python regressions and the release WASM build passed after adding the scenario.
+
 #### Current sensor-inspection slice
 
 JJ change `uunkvlmu` starts the visual/data path independently of drone training. `sim-inspection` supplies a shared version-1 scene configuration: explicit axis-aligned boxes with stable nonzero uint32 IDs, names, positions, scales and linear colors, plus camera pose, vertical field of view, clipping planes and resolution. Both the native window inspector and headless renderer consume this configuration. Coordinates are explicitly right-handed **Y-up, in metres**, matching the renderer; this is not yet the ENU/FLU physics `RenderSnapshot` adapter.
