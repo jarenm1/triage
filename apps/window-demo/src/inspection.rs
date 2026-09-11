@@ -10,7 +10,8 @@ use sim_graphics_winit::winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
-use sim_inspection::{GpuInspector, SceneConfig};
+use sim_inspection::GpuInspector;
+use sim_scene::SceneConfig;
 
 pub fn run(path: Option<PathBuf>) -> Result<()> {
     let path = path.unwrap_or_else(|| PathBuf::from("target/inspection-scene.json"));

@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 sim-graphics = { path = "../../crates/sim-graphics" }
+sim-scene = { path = "../../crates/sim-scene" }
 sim-trajectory = { path = "../../crates/sim-trajectory" }
 wgpu.workspace = true
 glam.workspace = true

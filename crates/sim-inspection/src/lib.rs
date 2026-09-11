@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     fs,
     io::Write,
     path::Path,
@@ -10,233 +10,39 @@ use anyhow::{Context, Result, bail, ensure};
 use font8x8::UnicodeFonts;
 use glam::{Mat4, Quat, Vec3};
 use image::{Rgba, RgbaImage};
-use serde::{Deserialize, Serialize};
 use sim_graphics::{
     Camera, Frame, MeshData, MeshHandle, ReadbackData, RenderPrimitive, RenderView, Renderer,
     ViewKey, ViewKind, ViewOutputs,
 };
+use sim_scene::{ONTOLOGY_VERSION, SceneConfig, SceneObject, SensorConfig};
 
 mod gpu;
 pub use gpu::GpuInspector;
 
-pub const SCENE_VERSION: u32 = 1;
+#[cfg(test)]
+mod tests;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SensorConfig {
-    pub eye: [f32; 3],
-    pub target: [f32; 3],
-    pub up: [f32; 3],
-    pub vertical_fov_radians: f32,
-    pub near: f32,
-    pub far: f32,
-    pub width: u32,
-    pub height: u32,
-}
-
-impl SensorConfig {
-    pub fn camera(&self) -> Camera {
-        Camera {
-            eye: self.eye.into(),
-            target: self.target.into(),
-            up: self.up.into(),
-            vertical_fov_radians: self.vertical_fov_radians,
-            near: self.near,
-            far: self.far,
-        }
-    }
-
-    /// Pixel coordinates have origin at the upper-left image edge; centers are (i+.5,j+.5).
-    pub fn intrinsics(&self) -> [[f32; 3]; 3] {
-        let f = self.height as f32 / (2.0 * (self.vertical_fov_radians * 0.5).tan());
-        [
-            [f, 0.0, self.width as f32 * 0.5],
-            [0.0, f, self.height as f32 * 0.5],
-            [0.0, 0.0, 1.0],
-        ]
-    }
-
-    /// Optical coordinates: x right, y down, z forward. Returned matrix is column-major.
-    pub fn world_to_optical(&self) -> [[f32; 4]; 4] {
-        (Mat4::from_scale(Vec3::new(1.0, -1.0, -1.0)) * self.camera().view()).to_cols_array_2d()
+fn sensor_camera(s: &SensorConfig) -> Camera {
+    Camera {
+        eye: s.eye.into(),
+        target: s.target.into(),
+        up: s.up.into(),
+        vertical_fov_radians: s.vertical_fov_radians,
+        near: s.near,
+        far: s.far,
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SceneObject {
-    pub id: u32,
-    pub name: String,
-    pub position: [f32; 3],
-    pub scale: [f32; 3],
-    pub color: [f32; 4],
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SceneConfig {
-    pub version: u32,
-    pub sensor: SensorConfig,
-    pub objects: Vec<SceneObject>,
-}
-
-impl Default for SceneConfig {
-    fn default() -> Self {
-        Self {
-            version: SCENE_VERSION,
-            sensor: SensorConfig {
-                eye: [0.0, 2.0, 7.0],
-                target: [0.0, 0.8, 0.0],
-                up: [0.0, 1.0, 0.0],
-                vertical_fov_radians: 55_f32.to_radians(),
-                near: 0.1,
-                far: 18.0,
-                width: 640,
-                height: 480,
-            },
-            objects: vec![
-                SceneObject {
-                    id: 11,
-                    name: "front red".into(),
-                    position: [-0.45, 0.7, 1.1],
-                    scale: [1.4, 1.4, 1.4],
-                    color: [0.7, 0.08, 0.04, 1.0],
-                },
-                SceneObject {
-                    id: 257,
-                    name: "rear green".into(),
-                    position: [0.35, 0.9, -0.9],
-                    scale: [1.8, 1.8, 1.8],
-                    color: [0.08, 0.6, 0.13, 1.0],
-                },
-                SceneObject {
-                    id: 65539,
-                    name: "right blue".into(),
-                    position: [2.1, 0.5, 0.1],
-                    scale: [1.0, 1.0, 1.0],
-                    color: [0.06, 0.18, 0.8, 1.0],
-                },
-            ],
-        }
+fn object_center(object: &SceneObject) -> Vec3 {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for part in &object.parts {
+        let position = Vec3::from(part.position);
+        let radius = Vec3::from(part.scale) * 0.5;
+        min = min.min(position - radius);
+        max = max.max(position + radius);
     }
-}
-
-impl SceneConfig {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.version == SCENE_VERSION,
-            "unsupported scene version {}; expected {}",
-            self.version,
-            SCENE_VERSION
-        );
-        let s = &self.sensor;
-        ensure!(
-            (1..=2048).contains(&s.width) && (1..=2048).contains(&s.height),
-            "sensor width and height must each be 1..=2048"
-        );
-        ensure!(
-            s.eye
-                .iter()
-                .chain(&s.target)
-                .chain(&s.up)
-                .all(|v| v.is_finite() && v.abs() <= 1e6),
-            "sensor vectors must be finite and within +/-1000000"
-        );
-        let forward = Vec3::from(s.target) - Vec3::from(s.eye);
-        let up = Vec3::from(s.up);
-        ensure!(forward.length() > 1e-5, "sensor eye and target must differ");
-        ensure!(
-            up.length() > 1e-5 && forward.normalize().cross(up.normalize()).length() > 1e-4,
-            "sensor up must be nonzero and not parallel to viewing direction"
-        );
-        ensure!(
-            s.vertical_fov_radians.is_finite() && (0.01..3.13).contains(&s.vertical_fov_radians),
-            "sensor vertical_fov_radians must be in [0.01,3.13)"
-        );
-        ensure!(
-            s.near.is_finite()
-                && s.far.is_finite()
-                && s.near >= 0.001
-                && s.far > s.near
-                && s.far <= 1e6,
-            "sensor clipping planes require 0.001 <= near < far <= 1000000"
-        );
-        ensure!(
-            s.camera().view().is_finite()
-                && s.camera()
-                    .view_projection(s.width as f32 / s.height as f32)
-                    .is_finite(),
-            "sensor camera produces a non-finite view/projection matrix"
-        );
-        ensure!(
-            self.objects.len() <= 1024,
-            "at most 1024 objects are supported"
-        );
-        let mut ids = HashSet::new();
-        for o in &self.objects {
-            ensure!(
-                o.id != 0 && ids.insert(o.id),
-                "object ID {} must be unique and nonzero (0 is background)",
-                o.id
-            );
-            ensure!(
-                !o.name.trim().is_empty()
-                    && o.name.len() <= 128
-                    && !o.name.chars().any(char::is_control),
-                "object {} requires a nonempty name of at most 128 bytes without control characters",
-                o.id
-            );
-            ensure!(
-                o.position.iter().all(|v| v.is_finite() && v.abs() <= 1e6),
-                "object {} position must be finite and within +/-1000000",
-                o.id
-            );
-            ensure!(
-                o.scale
-                    .iter()
-                    .all(|v| v.is_finite() && *v >= 0.001 && *v <= 1e6),
-                "object {} scale must be finite in [0.001,1000000]",
-                o.id
-            );
-            ensure!(
-                o.color
-                    .iter()
-                    .all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
-                "object {} color must be finite in [0,1]",
-                o.id
-            );
-        }
-        Ok(())
-    }
-
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let config: Self = serde_json::from_reader(
-            fs::File::open(path).with_context(|| format!("opening scene {}", path.display()))?,
-        )
-        .with_context(|| format!("decoding scene {}", path.display()))?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        self.validate()?;
-        atomic_write(path.as_ref(), &serde_json::to_vec_pretty(self)?)
-    }
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
-    file.persist(path)
-        .with_context(|| format!("saving {}", path.display()))?;
-    Ok(())
+    (min + max) * 0.5
 }
 
 pub struct Inspector {
@@ -274,16 +80,18 @@ impl Inspector {
     fn scene(&mut self, config: &SceneConfig) {
         self.frame.begin();
         for o in &config.objects {
-            self.frame.draw(RenderPrimitive {
-                mesh: self.cube,
-                transform: Mat4::from_scale_rotation_translation(
-                    o.scale.into(),
-                    Quat::IDENTITY,
-                    o.position.into(),
-                ),
-                color: o.color,
-                object_id: o.id,
-            });
+            for part in &o.parts {
+                self.frame.draw(RenderPrimitive {
+                    mesh: self.cube,
+                    transform: Mat4::from_scale_rotation_translation(
+                        part.scale.into(),
+                        Quat::IDENTITY,
+                        part.position.into(),
+                    ),
+                    color: part.color,
+                    object_id: o.id,
+                });
+            }
         }
     }
 
@@ -359,10 +167,12 @@ impl Inspector {
             max = max.max(p);
         }
         for o in &config.objects {
-            let p = Vec3::from(o.position);
-            let r = Vec3::from(o.scale) * 0.5;
-            min = min.min(p - r);
-            max = max.max(p + r);
+            for part in &o.parts {
+                let p = Vec3::from(part.position);
+                let r = Vec3::from(part.scale) * 0.5;
+                min = min.min(p - r);
+                max = max.max(p + r);
+            }
         }
         let center = (min + max) * 0.5;
         let radius = ((max - min).length() * 0.5).max(1.0);
@@ -406,7 +216,7 @@ impl Inspector {
         let mut color = None;
         let mut depth = None;
         let mut object_ids = None;
-        for data in self.render(s.camera(), s.width, s.height, true)? {
+        for data in self.render(sensor_camera(s), s.width, s.height, true)? {
             match data {
                 ReadbackData::Color(v) => color = Some(v),
                 ReadbackData::Depth(v) => depth = Some(v),
@@ -440,7 +250,7 @@ impl Inspector {
             label_world(
                 &mut overview,
                 observer,
-                o.position.into(),
+                object_center(o),
                 &format!("{} {}", o.id, o.name),
                 id_color(o.id),
                 [8, (16 + index as u32 * 18).min(420)],
@@ -483,7 +293,7 @@ impl Inspector {
 }
 
 fn frustum_corners(s: &SensorConfig) -> [Vec3; 8] {
-    let c = s.camera();
+    let c = sensor_camera(s);
     let forward = (c.target - c.eye).normalize();
     let right = forward.cross(c.up).normalize();
     let up = right.cross(forward);
@@ -526,6 +336,16 @@ impl Capture {
                 && self.object_ids.len() == count,
             "capture payload dimensions no longer match configuration"
         );
+        let classes: HashMap<u32, u32> = config
+            .objects
+            .iter()
+            .map(|object| (object.id, object.class.id()))
+            .chain([(0, 0)])
+            .collect();
+        ensure!(
+            self.object_ids.iter().all(|id| classes.contains_key(id)),
+            "capture instance mask contains an ID absent from the realized scene"
+        );
         let directory = directory.as_ref();
         // Publish the whole bundle with one rename: never overwrite an earlier capture
         // with a half-written mixture of frames. Existing empty output dirs are accepted.
@@ -544,6 +364,12 @@ impl Capture {
         let staging = tempfile::tempdir_in(parent)?;
         self.preview.save(staging.path().join("preview.png"))?;
         fs::write(staging.path().join("color.rgba8"), &self.color)?;
+        display_color(&self.color, config.sensor.width, config.sensor.height)?
+            .save(staging.path().join("color.png"))?;
+        write_words(
+            &staging.path().join("semantic_classes.u32le"),
+            self.object_ids.iter().map(|id| classes[id].to_le_bytes()),
+        )?;
         write_words(
             &staging.path().join("depth.f32le"),
             self.depth.iter().map(|v| v.to_le_bytes()),
@@ -554,15 +380,24 @@ impl Capture {
         )?;
         config.save(staging.path().join("scene.json"))?;
         let metadata = serde_json::json!({
-            "version": 1, "scene": config,
+            "version": 2, "scene": config,
             "width": config.sensor.width, "height": config.sensor.height,
             "layout": "row-major, top row first, no row padding", "world": "right-handed, Y up; metres",
             "intrinsics": config.sensor.intrinsics(), "pixel_coordinates": "origin upper-left edge; pixel centers (column+0.5,row+0.5)",
             "world_to_optical_column_major": config.sensor.world_to_optical(),
             "optical_axes": "X right, Y down, Z forward", "distortion": "none",
             "color": {"file":"color.rgba8", "format":"RGBA8 UNORM", "transfer_function":"linear (not sRGB); shader lit_color clamped and quantized to 8-bit UNORM", "channels":4},
+            "color_srgb": {"file":"color.png", "format":"RGBA8 PNG", "transfer_function":"sRGB", "source":"color.rgba8: the same clipped, quantized linear LDR sensor output; not HDR"},
             "depth": {"file":"depth.f32le", "format":"IEEE754 float32 little-endian", "quantity":"optical +Z, not Euclidean range", "units":"metres", "background":config.sensor.far},
             "object_ids": {"file":"object_ids.u32le", "format":"uint32 little-endian", "background":0},
+            "semantic_classes": {"file":"semantic_classes.u32le", "format":"uint32 little-endian", "background":0},
+            "semantic_ontology": {"version": ONTOLOGY_VERSION, "classes": [
+                {"id":0, "name":"background"}, {"id":1, "name":"ground"},
+                {"id":2, "name":"gate"}, {"id":3, "name":"obstacle"}
+            ]},
+            "instances": config.objects.iter().map(|object| serde_json::json!({
+                "id":object.id, "name":object.name, "class":object.class, "class_id":object.class.id()
+            })).collect::<Vec<_>>(),
             "preview": "preview.png is diagnostic only: linear RGB encoded to sRGB for display; depth normalized near..far; ID palette is not truth; observer gizmos excluded from all sensor payloads"
         });
         fs::write(

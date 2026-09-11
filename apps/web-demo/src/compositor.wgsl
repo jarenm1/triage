@@ -43,10 +43,11 @@ fn palette(id: u32) -> vec3<f32> {
             pixel.y -= f32(mode) * size.y;
         }
     }
-    let fitted = vec2(min(size.x, size.y * 4. / 3.), min(size.y, size.x * 3. / 4.));
+    let dimensions = textureDimensions(rgb);
+    let aspect = f32(dimensions.x) / f32(dimensions.y);
+    let fitted = vec2(min(size.x, size.y * aspect), min(size.y, size.x / aspect));
     let uv = (pixel - (size - fitted) * .5) / fitted;
     if any(uv < vec2(0.)) || any(uv >= vec2(1.)) { return vec4(0., 0., 0., 1.); }
-    let dimensions = textureDimensions(rgb);
     let p = vec2<i32>(min(vec2<u32>(uv * vec2<f32>(dimensions)), dimensions - vec2<u32>(1u)));
     var c = textureLoad(rgb, p, 0).rgb;
     if mode == 1u {

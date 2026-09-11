@@ -10,19 +10,30 @@ use std::sync::{
 
 use glam::Vec3;
 use sim_graphics::{
-    Camera, Frame, OutputKind, RenderView, Renderer, ViewKey, ViewKind, ViewOutputs,
+    Camera, Frame, MeshData, MeshHandle, OutputKind, RenderView, Renderer, ViewKey, ViewKind,
+    ViewOutputs,
 };
+use sim_scene::{GeneratorRecipe, SceneConfig};
 use sim_trajectory::{CameraMode, GROUND_OBJECT_ID, Recording, TrajectoryScene};
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
-const NEAR: f32 = 0.1;
-const FAR: f32 = 80.0;
-const FOV_DEGREES: f32 = 50.0;
 const SENSOR: ViewKey = ViewKey(1);
 
 fn error(message: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&message.to_string())
+}
+
+/// Pure shared generation: callable even when WebGPU is unavailable.
+#[wasm_bindgen]
+pub fn generate_scene(seed: u32, sample_index: u32) -> Result<String, JsValue> {
+    let scene = GeneratorRecipe {
+        seed,
+        ..Default::default()
+    }
+    .generate(sample_index)
+    .map_err(error)?;
+    serde_json::to_string_pretty(&scene).map_err(error)
 }
 
 #[wasm_bindgen]
@@ -51,8 +62,8 @@ pub struct Engine {
     uniform: wgpu::Buffer,
     bindings: Option<wgpu::BindGroup>,
     sensor_size: [u32; 2],
-    scenes: [scene::Scene; 2],
-    scene: usize,
+    generated: scene::Scene,
+    cube: MeshHandle,
     frame: Frame,
     healthy: Arc<AtomicBool>,
     controls: controls::Controls,
@@ -93,7 +104,16 @@ impl Engine {
                     "WebGPU device lost ({reason:?}): {message}. Reload to reconnect."
                 )));
             });
-        let scenes = scene::build(&mut renderer).map_err(error)?;
+        let scene_config = GeneratorRecipe {
+            seed: 42,
+            ..Default::default()
+        }
+        .generate(0)
+        .map_err(error)?;
+        let cube = renderer.register_mesh(MeshData::cube()).map_err(error)?;
+        let mut controls = controls::Controls::new();
+        controls.calibrate(&scene_config.sensor);
+        let generated = scene::Scene::new(scene_config, cube);
         let mut trajectory_scene = TrajectoryScene::new();
         trajectory_scene.initialize(&mut renderer).map_err(error)?;
         let device = renderer.device();
@@ -212,11 +232,11 @@ impl Engine {
             uniform,
             bindings: None,
             sensor_size: [0, 0],
-            scenes,
-            scene: 0,
+            generated,
+            cube,
             frame: Frame::with_capacity(32, 1),
             healthy,
-            controls: controls::Controls::new(),
+            controls,
             gui,
             depth_range,
             trajectory_scene,
@@ -226,13 +246,52 @@ impl Engine {
         })
     }
 
+    fn generated_camera(&self) -> Camera {
+        let sensor = &self.generated.config.sensor;
+        let target = Vec3::from(sensor.target);
+        let eye = if self.controls.camera_changed {
+            let yaw = self.controls.yaw;
+            let pitch = self.controls.pitch.clamp(0.08, 1.45);
+            target
+                + Vec3::new(
+                    yaw.sin() * pitch.cos(),
+                    pitch.sin(),
+                    yaw.cos() * pitch.cos(),
+                ) * self.controls.distance.clamp(4.0, 50.0)
+        } else {
+            Vec3::from(sensor.eye)
+        };
+        Camera {
+            eye,
+            target,
+            up: sensor.up.into(),
+            vertical_fov_radians: sensor.vertical_fov_radians,
+            near: sensor.near,
+            far: sensor.far,
+        }
+    }
+
+    fn current_sensor(&self) -> sim_scene::SensorConfig {
+        let mut sensor = self.generated.config.sensor.clone();
+        let camera = self.generated_camera();
+        sensor.eye = camera.eye.to_array();
+        sensor.target = camera.target.to_array();
+        sensor.up = camera.up.to_array();
+        sensor
+    }
+
+    fn realized_scene(&self) -> SceneConfig {
+        let mut config = self.generated.config.clone();
+        config.sensor = self.current_sensor();
+        config
+    }
+
     fn render_frame(&mut self, width: u32, height: u32, pixel_ratio: f32) -> Result<(), JsValue> {
-        let (mode, yaw, pitch, distance, scene) = (
+        let (mode, yaw, pitch, distance) = (
             self.controls.mode,
             self.controls.yaw,
             self.controls.pitch,
             self.controls.distance,
-            self.controls.scene,
         );
         if !self.healthy.load(Ordering::Relaxed) {
             return Err(error("WebGPU device is unavailable. Reload to reconnect."));
@@ -242,13 +301,12 @@ impl Engine {
             || width > 2048
             || height > 2048
             || mode > 3
-            || scene > 1
             || !yaw.is_finite()
             || !pitch.is_finite()
             || !distance.is_finite()
         {
             return Err(error(
-                "Invalid render dimensions, mode, scene, or camera parameters.",
+                "Invalid render dimensions, mode, or camera parameters.",
             ));
         }
         if [width, height] != [self.config.width, self.config.height] {
@@ -307,15 +365,17 @@ impl Engine {
             .into_iter()
             .find(|&units| units >= demand)
             .unwrap_or(240);
-        let dimensions = [units * 4, units * 3];
-        let selected = &self.scenes[scene as usize];
+        // Generated scenes retain recipe resolution and calibration on every canvas size.
+        let dimensions = if self.controls.trajectory {
+            [units * 4, units * 3]
+        } else {
+            [
+                self.generated.config.sensor.width,
+                self.generated.config.sensor.height,
+            ]
+        };
         let pitch = pitch.clamp(0.08, 1.45);
         let distance = distance.clamp(4.0, 50.0);
-        let offset = Vec3::new(
-            yaw.sin() * pitch.cos(),
-            pitch.sin(),
-            yaw.cos() * pitch.cos(),
-        ) * distance;
         self.frame.begin();
         let camera =
             if let Some(recording) = self.recording.as_ref().filter(|_| self.controls.trajectory) {
@@ -335,17 +395,10 @@ impl Engine {
                 self.trajectory_scene
                     .camera(&recording.header, snapshot, mode)
             } else {
-                for &primitive in &selected.primitives {
+                for &primitive in &self.generated.primitives {
                     self.frame.draw(primitive);
                 }
-                Camera {
-                    eye: selected.target + offset,
-                    target: selected.target,
-                    up: Vec3::Y,
-                    vertical_fov_radians: FOV_DEGREES.to_radians(),
-                    near: NEAR,
-                    far: FAR,
-                }
+                self.generated_camera()
             };
         self.frame.add_view(RenderView {
             key: SENSOR,
@@ -466,7 +519,6 @@ impl Engine {
             self.surface.configure(self.renderer.device(), &self.config);
         }
         self.sensor_size = dimensions;
-        self.scene = scene as usize;
         Ok(())
     }
 }
@@ -599,10 +651,6 @@ impl Engine {
         self.controls.mode
     }
 
-    pub fn scene_index(&self) -> u32 {
-        self.controls.scene
-    }
-
     pub fn set_mode(&mut self, mode: u32) -> Result<(), JsValue> {
         if mode > 3 {
             return Err(error("Sensor mode must be 0 through 3."));
@@ -611,12 +659,31 @@ impl Engine {
         Ok(())
     }
 
-    pub fn set_scene(&mut self, scene: u32) -> Result<(), JsValue> {
-        if scene > 1 {
-            return Err(error("Scene must be 0 or 1."));
+    /// Replace the generated scene atomically and restore its exact calibrated sensor camera.
+    pub fn load_generated_scene(&mut self, seed: u32, sample_index: u32) -> Result<(), JsValue> {
+        let config = GeneratorRecipe {
+            seed,
+            ..Default::default()
         }
-        self.controls.set_scene(scene);
+        .generate(sample_index)
+        .map_err(error)?;
+        self.controls.calibrate(&config.sensor);
+        self.generated = scene::Scene::new(config, self.cube);
         Ok(())
+    }
+
+    pub fn show_generated_scene(&mut self) {
+        self.controls.show_generated();
+    }
+
+    /// Realized boxes plus the current camera. The recipe remains original provenance.
+    pub fn scene_json(&self) -> Result<String, JsValue> {
+        if self.controls.trajectory {
+            return Err(error(
+                "Trajectory playback is not a generated scene. Return to the showcase before downloading.",
+            ));
+        }
+        serde_json::to_string_pretty(&self.realized_scene()).map_err(error)
     }
 
     pub fn reset_view(&mut self) {
@@ -696,25 +763,34 @@ impl Engine {
     }
 
     pub fn info(&self) -> String {
-        let scene = &self.scenes[self.scene];
+        let scene = &self.generated;
+        let sensor = self.current_sensor();
         let mut info = serde_json::json!({
             "backend": "WebGPU",
             "depth_visualization": "relative_visible_range",
             "playback": { "active": false, "playing": false },
             "view": {
-                "mode": self.controls.mode, "scene": self.controls.scene,
+                "mode": self.controls.mode,
                 "yaw": self.controls.yaw, "pitch": self.controls.pitch,
                 "distance": self.controls.distance, "auto_orbit": self.controls.auto_orbit,
             },
-            "scene_name": scene.name,
-            "object_count": scene.objects.len(),
+            "scene_name": "Seeded obstacles",
+            "generation": scene.config.generation,
+            "ontology_version": sim_scene::ONTOLOGY_VERSION,
+            "object_count": scene.config.objects.len(),
             "primitive_count": scene.primitives.len(),
             "camera": {
-                "near": NEAR, "far": FAR, "fov_vertical_degrees": FOV_DEGREES,
-                "width": self.sensor_size[0], "height": self.sensor_size[1],
+                "near": sensor.near, "far": sensor.far,
+                "fov_vertical_degrees": sensor.vertical_fov_radians.to_degrees(),
+                "width": sensor.width, "height": sensor.height,
+                "eye": sensor.eye, "target": sensor.target, "up": sensor.up,
+                "intrinsics": sensor.intrinsics(),
+                "world_to_optical": sensor.world_to_optical(),
+                "modified": self.controls.camera_changed,
             },
-            "objects": scene.objects.iter().map(|object| serde_json::json!({
-                "id": object.id, "name": object.name, "color": scene::palette(object.id),
+            "objects": scene.config.objects.iter().map(|object| serde_json::json!({
+                "id": object.id, "name": object.name, "class": object.class,
+                "semantic_id": object.class.id(), "color": scene::palette(object.id),
             })).collect::<Vec<_>>(),
         });
         if let Some(recording) = self.recording.as_ref().filter(|_| self.controls.trajectory) {

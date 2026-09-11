@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Triage · Native capture · seed 42 / sample 0</title>
+  <style>
+    body { max-width: 72rem; margin: 3rem auto; padding: 0 1.5rem; background: #141c24; color: #edf2f6; font: 1rem/1.6 system-ui, sans-serif; }
+    a { color: #88d6cb; } img { max-width: 100%; height: auto; } code { overflow-wrap: anywhere; }
+    ul { padding-left: 1.3rem; } .note { color: #b4c3cf; }
+  </style>
+</head>
+<body>
+  <a href="../../">← Triage showcase</a>
+  <h1>A real native capture</h1>
+  <p>Generator seed <strong>42</strong>, sample <strong>0</strong>. This bundle was rendered by Triage’s native headless capture command, not produced by the website or an image mockup.</p>
+  <img src="color.png" alt="Native RGB rendering of the generated ground, gates and box obstacles" width="640" height="480">
+  <h2>Download the sample</h2>
+  <ul>
+    <li><a href="scene.json" download>Realized scene JSON</a> — replay without running the generator.</li>
+    <li><a href="metadata.json" download>Metadata JSON</a> — camera calibration, identities, semantic ontology and output formats.</li>
+    <li><a href="color.png" download>sRGB color PNG</a> and <a href="color.rgba8" download>linear RGBA8 raw color</a>.</li>
+    <li><a href="depth.f32le" download>Optical-Z depth</a> — float32 little-endian metres, not Euclidean range.</li>
+    <li><a href="object_ids.u32le" download>Instance IDs</a> and <a href="semantic_classes.u32le" download>semantic classes</a> — uint32 little-endian.</li>
+    <li><a href="preview.png" download>Diagnostic panel preview</a> — display colors and annotations, not training labels.</li>
+  </ul>
+  <p class="note">Color originates from a clipped, quantized linear RGBA8 attachment; sRGB conversion does not recover HDR detail. Background ID/class is 0; ground is class 1, gate 2, obstacle 3. Each gate’s three boxes share one instance ID. World coordinates are right-handed Y-up in metres; optical coordinates are X-right, Y-down, Z-forward.</p>
+  <h2>Replay locally</h2>
+  <p>From the repository root, inside <code>nix develop</code>:</p>
+  <pre><code>cargo run -p render-smoke -- --inspect \
+  --scene examples/seed-42-sample-0/scene.json \
+  --output target/example-replay --verify</code></pre>
+  <p class="note">Exact scene data is reproducible. Pixel-identical rendering across different GPU devices/backends is not promised. This example demonstrates generation and labelled capture, not measured sim-to-real improvement.</p>
+</body>
+</html>
