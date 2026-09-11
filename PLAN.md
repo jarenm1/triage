@@ -783,9 +783,36 @@ Verification: real browser RGB/depth/ID/comparison output and GPU buttons were i
 
 **Goal:** Produce auditable datasets and answer whether they improve performance on held-out real data.
 
-- [ ] **Implement the versioned scene schema and procedural generator**
-  - Start with gates, towers, terrain/ground, clutter, obstacles, lights, materials, and weather parameters.
-  - Preserve generator version, seed, and realized parameters.
+#### Seeded obstacle generation and static showcase (2026-09-10)
+
+The first Phase 4 slice is implemented in JJ change `rvsmtnov`. `sim-scene` is the shared, GPU-independent Rust scene/generator module used by native inspection and WASM. Scene schema **v2** replaces the earlier inspection v1 schema: each instance owns a unique nonzero uint32 ID, name, semantic class and one or more world-space axis-aligned box parts. Unsupported versions reject; there are no v1 compatibility aliases. Right-handed Y-up metres and optical X-right/Y-down/Z-forward calibration remain unchanged. A saved realized scene replays without calling the generator.
+
+Generator recipe v1 samples ground, two three-part gates and box obstacles. The complete recipe records seed, image dimensions, inclusive integer distributions for obstacle count/size and gate width/height, obstacle spread and camera jitter. Placement uses shuffled cells with bounded jitter, colors and camera FOV also vary, and each sample has its own seed/index-derived integer RNG. Sample order and batch boundaries do not affect scene data. Gates share one instance ID across all three parts; full-width IDs exercise values above signed int32. Ontology v1 defines background 0, ground 1, gate 2 and obstacle 3. These are bounded geometric scenes, not realistic materials or a general asset/weather generator.
+
+```sh
+cargo run -p render-smoke -- --generate --seed 42 --count 3 --output target/dataset
+cargo run -p render-smoke -- --generate --seed 42 --start-index 2 --scene-only
+cargo run -p render-smoke -- --inspect --scene target/dataset/sample-0000000000/scene.json --output target/replay --verify
+NO_COLOR=true trunk build --config apps/web-demo/Trunk.toml --release --locked
+```
+
+`--recipe FILE` excludes `--seed`, `--width` and `--height`; duplicate/unknown flags, zero count, invalid dimensions and sample-index overflow reject. Batch output must be absent. One inspector captures all samples into a temporary sibling directory; the dataset manifest and all samples publish together. Linux/Android use no-replace rename; other platforms check before standard rename (a concurrent empty-directory creation can be replaced on other Unix, never an existing populated dataset). This is a synchronous, small-batch exporter, not the planned asynchronous pipeline.
+
+Each sample includes exact `scene.json`, metadata v2 with provenance/calibration/ontology/instance mapping, optical-Z `depth.f32le`, uint32 `object_ids.u32le`, uint32 `semantic_classes.u32le`, raw linear `color.rgba8`, sRGB `color.png`, and diagnostic `preview.png`. PNG conversion uses the same clipped/quantized linear LDR source; it does not restore HDR information. Mask IDs are checked against the scene before publishing. The batch manifest names every sample and its scene/metadata paths.
+
+`apps/web-demo` now wraps the reusable WebGPU canvas in a static showcase, replacing its independent hardcoded scene builder with the shared generator. Seed/sample selection, output modes, calibrated camera reset, instance/class legend, calibration/provenance and realized JSON download are available. Scene downloads reflect the current interacted camera; recipe provenance remains the original generation recipe. Sensor resolution remains recipe-defined when the canvas resizes. Recorded trajectory playback remains supported. The GPU-free `generate_scene(seed, sample_index)` WASM export also works without WebGPU. `examples/seed-42-sample-0/` is a real native capture with downloadable payloads and a static fallback page; update it alongside future generator/sensor changes. No CUDA physics runs in the browser.
+
+Verification: Rust workspace **13 tests**, Python **4 tests**, CPU physics **2 CTests** and CUDA physics **5 CTests** passed; release WASM built. Three 640×480 samples passed independent per-pixel instance/class/depth checks (**921,600 pixels**); all four classes and uint32 IDs above int32 were visible. Native replay matched raw color/depth/IDs/classes and sRGB PNG exactly, and the existing **76,800-pixel** analytical projection/depth/occlusion check passed. Five native/WASM scene comparisons, including seed/index `u32::MAX`, were exactly equal as parsed scene data. Browser generation, comparison display, camera modification/reset, downloaded-scene native replay, trajectory seek/mounted-camera controls and a 390px-wide WebGPU-unavailable fallback were exercised; live WebGPU and fallback screenshots were inspected. Cross-GPU pixel equality and sim-to-real improvement are not claimed.
+
+Two-axis review found one CLI regression: the new help check converted a Unix filename through `std::env::args()`. It was corrected to fallible conversion from `args_os()`; an actual non-UTF-8 output filename changed from a panic to a successful 401-instance PNG render, and focused review cleared the correction. The checkout also lacked the already-declared embedded window skybox; its original Poly Haven CC0 asset was restored and checksum-verified. The ignored Python environment was rebuilt from its lock after its Nix-store interpreter disappeared.
+
+The remaining Phase 4 roadmap below still includes richer scene families, camera/image effects, asynchronous export, downstream dataset adapters and real-data evaluation. This slice does not satisfy the full Phase 4 exit gate.
+
+#### Remaining Phase 4 work
+
+- [ ] **Extend the versioned scene schema and procedural generator beyond the bounded box family**
+  - Add towers, terrain, richer clutter/obstacles, asset references, lights, materials and weather parameters.
+  - Retain generator version, seed and realized parameters across those additions.
 - [ ] **Implement camera and image-domain variation**
   - Intrinsics/extrinsics, exposure, transfer function, distortion, noise, blur, rolling shutter, and compression as explicit, independently testable stages.
 - [ ] **Implement the asynchronous exporter**

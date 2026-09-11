@@ -238,7 +238,7 @@ impl GpuInspector {
         self.inspector.frame.add_view(RenderView {
             key: ViewKey(1),
             kind: ViewKind::Sensor,
-            camera: s.camera(),
+            camera: sensor_camera(s),
             width: s.width,
             height: s.height,
             outputs: ViewOutputs::COLOR | ViewOutputs::DEPTH | ViewOutputs::OBJECT_ID,
@@ -450,7 +450,7 @@ impl GpuInspector {
         for (index, object) in scene.objects.iter().enumerate() {
             self.callout(
                 observer,
-                object.position.into(),
+                object_center(object),
                 &format!("{} {}", object.id, object.name),
                 id_color(object.id),
                 [648.0, 544.0 + (16.0 + index as f32 * 18.0).min(420.0)],

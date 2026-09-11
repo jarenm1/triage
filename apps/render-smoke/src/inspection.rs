@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
-use sim_inspection::{Inspector, SceneConfig};
+use sim_inspection::Inspector;
+use sim_scene::SceneConfig;
 
 pub async fn run() -> Result<()> {
     let mut args = std::env::args_os().skip(2);
@@ -75,10 +76,10 @@ fn verify_geometry(inspector: &mut Inspector) -> Result<()> {
         "verification needs two scene objects"
     );
     config.objects.truncate(2);
-    config.objects[0].position = [0.4, 0.3, 1.0];
-    config.objects[0].scale = [1.0, 1.0, 1.0];
-    config.objects[1].position = [0.0, 0.0, -1.0];
-    config.objects[1].scale = [3.0, 3.0, 1.0];
+    config.objects[0].parts[0].position = [0.4, 0.3, 1.0];
+    config.objects[0].parts[0].scale = [1.0, 1.0, 1.0];
+    config.objects[1].parts[0].position = [0.0, 0.0, -1.0];
+    config.objects[1].parts[0].scale = [3.0, 3.0, 1.0];
     let front_id = config.objects[0].id;
     let rear_id = config.objects[1].id;
     let capture = inspector.capture(&config)?;

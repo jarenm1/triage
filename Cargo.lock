@@ -1687,9 +1687,14 @@ dependencies = [
  "glam",
  "image",
  "pollster",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
  "sim-graphics",
  "sim-inspection",
+ "sim-scene",
  "sim-trajectory",
+ "tempfile",
  "wgpu",
 ]
 
@@ -1883,11 +1888,22 @@ dependencies = [
  "font8x8",
  "glam",
  "image",
- "serde",
  "serde_json",
  "sim-graphics",
+ "sim-scene",
  "tempfile",
  "wgpu",
+]
+
+[[package]]
+name = "sim-scene"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2447,6 +2463,7 @@ dependencies = [
  "js-sys",
  "serde_json",
  "sim-graphics",
+ "sim-scene",
  "sim-trajectory",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -2677,6 +2694,7 @@ dependencies = [
  "sim-graphics",
  "sim-graphics-winit",
  "sim-inspection",
+ "sim-scene",
  "sim-trajectory",
  "wasm-bindgen",
  "wgpu",

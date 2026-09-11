@@ -7,6 +7,7 @@ use sim_graphics::{
     ViewKey, ViewKind, ViewOutputs,
 };
 
+mod generation;
 mod inspection;
 mod trajectory;
 
@@ -15,6 +16,26 @@ fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--generate")) {
+        return generation::run().await;
+    }
+    if matches!(
+        std::env::args_os()
+            .nth(1)
+            .as_deref()
+            .and_then(std::ffi::OsStr::to_str),
+        Some("--help" | "-h")
+    ) {
+        println!(
+            "render-smoke [output.png]\n\
+             render-smoke --generate [--seed U32] [--start-index U32] [--count U32] [--width U32] [--height U32] --output DIR\n\
+             render-smoke --generate --scene-only [--recipe FILE] [--start-index U32] [--output FILE]\n\
+             render-smoke --generate --help\n\
+             render-smoke --inspect [--scene scene.json] [--output directory] [--verify]\n\
+             render-smoke --trajectory FILE --output DIR"
+        );
+        return Ok(());
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--trajectory")) {
         return trajectory::run().await;
     }

@@ -1,4 +1,4 @@
-import init, { create_renderer } from './web-demo.js';
+import init, { create_renderer, generate_scene } from './web-demo.js';
 
 let canvas = document.getElementById('triage-canvas');
 let renderer;
@@ -16,6 +16,118 @@ let recordingName = '';
 let loadGeneration = 0;
 let lastStatusTime = 0;
 
+const sceneForm = document.getElementById('scene-form');
+const seedInput = document.getElementById('seed');
+const sampleInput = document.getElementById('sample-index');
+const sceneStatus = document.getElementById('scene-status');
+const sceneError = document.getElementById('scene-error');
+const downloadButton = document.getElementById('download-scene');
+const outputMode = document.getElementById('output-mode');
+const fallback = document.getElementById('fallback');
+const backendStatus = document.getElementById('backend-status');
+let generatedJson = '';
+
+function updateDetails(info) {
+  outputMode.value = String(info.view.mode);
+  downloadButton.disabled = info.playback.active;
+  document.getElementById('calibration').textContent = JSON.stringify({
+    generation: info.generation,
+    ontology_version: info.ontology_version,
+    camera: info.camera,
+  }, null, 2);
+  document.getElementById('camera-status').textContent = info.playback.active
+    ? 'Trajectory camera active. Return to the generated scene to download its realized geometry and camera.'
+    : `${info.camera.width} × ${info.camera.height} sensor pixels · ${info.camera.fov_vertical_degrees.toFixed(2)}° vertical field of view · ${info.camera.modified ? 'interacted camera (included in download)' : 'original calibrated recipe camera'}. Canvas resizing does not change sensor resolution.`;
+  const legend = document.getElementById('instance-legend');
+  legend.replaceChildren(...info.objects.map(object => {
+    const item = document.createElement('li');
+    if (object.color) {
+      const swatch = document.createElement('span');
+      swatch.className = 'swatch';
+      swatch.style.backgroundColor = object.color;
+      swatch.setAttribute('aria-hidden', 'true');
+      item.append(swatch);
+    }
+    item.append(document.createTextNode(`${object.id} · ${object.name}${object.class ? ` · ${object.class} (class ${object.semantic_id})` : ''}`));
+    return item;
+  }));
+}
+
+function generateSelected() {
+  if (!sceneForm.reportValidity()) return;
+  const seed = Number(seedInput.value), sample = Number(sampleInput.value);
+  if (![seed, sample].every(value => Number.isInteger(value) && value >= 0 && value <= 4294967295)) {
+    sceneError.textContent = 'Seed and sample index must be unsigned 32-bit integers.';
+    return;
+  }
+  try {
+    // Geometry, variation and camera are always generated in shared Rust, never JavaScript.
+    const json = generate_scene(seed, sample);
+    if (renderer && !failed) {
+      renderer.load_generated_scene(seed, sample);
+      updateDetails(JSON.parse(renderer.info()));
+    } else {
+      const scene = JSON.parse(json);
+      document.getElementById('calibration').textContent = JSON.stringify({
+        generation: scene.generation, sensor: scene.sensor,
+      }, null, 2);
+      document.getElementById('camera-status').textContent = 'GPU-independent generation: the download uses the original calibrated recipe camera. The static image remains seed 42 / sample 0.';
+      document.getElementById('instance-legend').replaceChildren(...scene.objects.map(object => {
+        const item = document.createElement('li');
+        item.textContent = `${object.id} · ${object.name} · ${object.class}`;
+        return item;
+      }));
+    }
+    generatedJson = json;
+    downloadButton.disabled = false;
+    sceneStatus.textContent = `Shared recipe · seed ${seed} · sample ${sample}. ${renderer && !failed ? 'Scene and calibrated camera loaded.' : 'Realized JSON is ready; static preview remains seed 42 / sample 0.'}`;
+    sceneError.textContent = '';
+    previousTime = 0;
+    requestRender();
+  } catch (error) {
+    sceneError.textContent = `Generation failed; previous scene retained. ${String(error?.message || error)}`;
+  }
+}
+
+sceneForm.addEventListener('submit', event => { event.preventDefault(); generateSelected(); });
+document.getElementById('next-sample').addEventListener('click', () => {
+  if (!sceneForm.reportValidity()) return;
+  const sample = Number(sampleInput.value);
+  if (sample >= 4294967295) {
+    sceneError.textContent = 'The maximum sample index is 4294967295. Choose another index or seed.';
+    return;
+  }
+  sampleInput.value = String(sample + 1);
+  generateSelected();
+});
+downloadButton.addEventListener('click', () => {
+  try {
+    const json = renderer && !failed ? renderer.scene_json() : generatedJson;
+    if (!json) return;
+    const { generation } = JSON.parse(json);
+    const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `seed-${generation.recipe.seed}-sample-${generation.sample_index}.scene.json`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) { sceneError.textContent = String(error?.message || error); }
+});
+outputMode.addEventListener('change', () => {
+  if (!renderer || failed) return;
+  renderer.set_mode(Number(outputMode.value));
+  requestRender();
+});
+document.getElementById('reset-camera').addEventListener('click', () => {
+  if (!renderer || failed) return;
+  renderer.reset_view();
+  requestRender();
+});
+document.getElementById('show-generated').addEventListener('click', () => {
+  if (!renderer || failed) return;
+  renderer.show_generated_scene();
+  requestRender();
+});
 recordingInput.addEventListener('change', async () => {
   const file = recordingInput.files[0];
   const generation = ++loadGeneration;
@@ -41,33 +153,17 @@ recordingInput.addEventListener('change', async () => {
 function fail(error) {
   failed = true;
   cancelAnimationFrame(frame);
+  frame = 0;
   console.error(error);
   const message = String(error?.message || error);
   recordingInput.disabled = true;
-  recordingStatus.textContent = message;
-  const replacement = canvas.cloneNode(false);
-  canvas.replaceWith(replacement);
-  canvas = replacement;
-  canvas.width = Math.max(320, canvas.clientWidth);
-  canvas.height = Math.max(160, canvas.clientHeight);
-  canvas.setAttribute('aria-label', `Renderer unavailable: ${message}`);
-  canvas.title = message;
-  const context = canvas.getContext('2d');
-  context.fillStyle = '#141c24';
-  context.fillRect(0, 0, canvas.width, canvas.height);
-  context.fillStyle = '#f3f1ea';
-  context.font = '16px sans-serif';
-  context.fillText('Triage requires WebGPU on HTTPS or localhost.', 24, 42);
-  context.font = '13px sans-serif';
-  let line = '', y = 72;
-  for (const word of message.split(/\s+/)) {
-    if (context.measureText(`${line} ${word}`).width > canvas.width - 48) {
-      context.fillText(line, 24, y);
-      y += 20;
-      line = word;
-    } else line += `${line ? ' ' : ''}${word}`;
-  }
-  context.fillText(line, 24, y);
+  document.getElementById('view-controls').disabled = true;
+  recordingStatus.textContent = `Interactive rendering unavailable: ${message}`;
+  backendStatus.textContent = 'Static native preview · seed 42 / sample 0';
+  canvas.hidden = true;
+  fallback.hidden = false;
+  document.getElementById('fallback-message').textContent = `WebGPU rendering is unavailable: ${message}. This is the native seed 42 / sample 0 preview, not a rendering of changed controls. The native capture link remains usable.`;
+  if (generatedJson) generateSelected();
 }
 
 function requestRender() {
@@ -85,12 +181,13 @@ function render(time) {
     renderer.render(Math.max(1, Math.round(width * scale)), Math.max(1, Math.round(height * scale)), scale, delta);
     if (time - lastStatusTime >= 250 || !previousTime || !renderer.is_animating()) {
       const info = JSON.parse(renderer.info());
+      updateDetails(info);
       const playback = info.playback;
       const scene = playback.active ? `trajectory ${recordingName}` : info.scene_name;
       canvas.setAttribute('aria-label', `Triage — ${modes[renderer.mode()]} — ${scene}. ${canvas.title}`);
       recordingStatus.textContent = playback.active
         ? `${recordingName} · ${playback.playing ? 'Playing' : 'Paused'} · ${playback.time_seconds.toFixed(2)} / ${playback.end_seconds.toFixed(2)} s · ${playback.camera_mode} · environment ${playback.environment_id}`
-        : 'Showcase · Choose a sampled trajectory recording to replay. Space toggles auto-orbit.';
+        : 'Generated showcase · Load a sampled trajectory recording to replay. Space toggles auto-orbit.';
       lastStatusTime = time;
     }
   } catch (error) { fail(error); return; }
@@ -211,8 +308,21 @@ reducedMotion.addEventListener('change', event => {
 });
 try {
   await init();
-  renderer = await create_renderer(canvas);
-  recordingInput.disabled = false;
-  if (reducedMotion.matches && renderer.is_animating()) renderer.key(' ');
-  requestRender();
-} catch (error) { fail(error); }
+  document.getElementById('controls').disabled = false;
+  generateSelected();
+  try {
+    renderer = await create_renderer(canvas);
+    const { generation } = JSON.parse(generatedJson);
+    renderer.load_generated_scene(generation.recipe.seed, generation.sample_index);
+    recordingInput.disabled = false;
+    document.getElementById('view-controls').disabled = false;
+    canvas.hidden = false;
+    fallback.hidden = true;
+    backendStatus.textContent = 'Live WebGPU · shared Rust generator';
+    if (reducedMotion.matches && renderer.is_animating()) renderer.key(' ');
+    requestRender();
+  } catch (error) { fail(error); }
+} catch (error) {
+  fail(error);
+  sceneError.textContent = 'The WebAssembly module could not load. Use the static native capture; scene generation and downloads require WebAssembly.';
+}
