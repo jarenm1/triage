@@ -2,6 +2,7 @@
 
 The renderer and the Python learner do not share device memory yet. Actions are
 staged CUDA -> host, and RGB observations are staged host -> learner device.
+Native history storage is frame-major; this adapter converts it to learner NHWC.
 This is deliberate E000 instrumentation rather than a zero-copy contract.
 """
 
