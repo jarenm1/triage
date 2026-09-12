@@ -32,6 +32,8 @@ class PuffeRL:
         self._vec = vec
         self.policy = policy
         self.total_agents = n = vec.n
+        self.observation_shape = tuple(getattr(vec, "observation_shape", (22,)))
+        self.action_size = int(getattr(vec, "action_size", 4))
         horizon = config["horizon"]
         self.batch_size = n * horizon
         self.minibatch_segments = config["minibatch_size"] // horizon
@@ -44,8 +46,8 @@ class PuffeRL:
         def buffer(*shape):
             return torch.zeros(*shape, device=self.device)
 
-        self.observations = buffer(horizon, n, 22)
-        self.actions = buffer(horizon, n, 4)
+        self.observations = buffer(horizon, n, *self.observation_shape)
+        self.actions = buffer(horizon, n, self.action_size)
         self.values = buffer(horizon, n)
         self.logprobs = buffer(horizon, n)
         self.rewards = buffer(horizon, n)
