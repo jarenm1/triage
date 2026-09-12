@@ -2,6 +2,7 @@ use std::{
     cell::RefCell,
     ffi::{c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -59,6 +60,9 @@ pub struct RgbEnv {
     cube: sim_graphics::MeshHandle,
     plane: sim_graphics::MeshHandle,
     frame: Frame,
+    last_dynamics_ms: f64,
+    last_render_ms: f64,
+    last_history_ms: f64,
 }
 
 impl RgbEnv {
@@ -107,6 +111,9 @@ impl RgbEnv {
             cube,
             plane,
             frame: Frame::with_capacity(n * 4, n),
+            last_dynamics_ms: 0.0,
+            last_render_ms: 0.0,
+            last_history_ms: 0.0,
         };
         env.reset_internal(seed)?;
         Ok(env)
@@ -123,7 +130,11 @@ impl RgbEnv {
         for state in &mut self.states {
             *state = State::default();
         }
+        self.last_dynamics_ms = 0.0;
+        self.last_history_ms = 0.0;
+        let render_start = Instant::now();
         self.render_batch()?;
+        self.last_render_ms = render_start.elapsed().as_secs_f64() * 1_000.0;
         for env in 0..self.n {
             self.fill_history_from_current(env);
         }
@@ -143,6 +154,7 @@ impl RgbEnv {
         self.completed_returns.fill(0.0);
         self.completed_lengths.fill(0.0);
 
+        let dynamics_start = Instant::now();
         let mut done = vec![false; self.n];
         for env in 0..self.n {
             let state = &mut self.states[env];
@@ -174,7 +186,13 @@ impl RgbEnv {
             done[env] = collision || success || timeout;
         }
 
+        self.last_dynamics_ms = dynamics_start.elapsed().as_secs_f64() * 1_000.0;
+        self.last_render_ms = 0.0;
+        self.last_history_ms = 0.0;
+        let render_start = Instant::now();
         self.render_batch()?;
+        self.last_render_ms += render_start.elapsed().as_secs_f64() * 1_000.0;
+        let history_start = Instant::now();
         for env in 0..self.n {
             self.append_current_frame(env);
             if done[env] {
@@ -190,14 +208,19 @@ impl RgbEnv {
                 };
             }
         }
+        self.last_history_ms += history_start.elapsed().as_secs_f64() * 1_000.0;
 
         if done.iter().any(|value| *value) {
+            let render_start = Instant::now();
             self.render_batch()?;
+            self.last_render_ms += render_start.elapsed().as_secs_f64() * 1_000.0;
+            let history_start = Instant::now();
             for (env, is_done) in done.into_iter().enumerate() {
                 if is_done {
                     self.fill_history_from_current(env);
                 }
             }
+            self.last_history_ms += history_start.elapsed().as_secs_f64() * 1_000.0;
         }
         for env in 0..self.n {
             self.current_returns[env] = self.states[env].return_;
@@ -331,6 +354,13 @@ impl RgbEnv {
         }
         checksum
     }
+    fn timings(&self, values: &mut [f64]) -> Result<()> {
+        ensure!(values.len() >= 3, "timing buffer is too small");
+        values[0] = self.last_dynamics_ms;
+        values[1] = self.last_render_ms;
+        values[2] = self.last_history_ms;
+        Ok(())
+    }
 }
 
 fn obstacles() -> [(Vec3, Vec3); 3] {
@@ -427,6 +457,24 @@ pub extern "C" fn triage_rgb_step(env: *mut c_void, actions: *const f32) -> i32 
         let env = unsafe { (env as *mut RgbEnv).as_mut() }.context("null RGB environment")?;
         let actions = unsafe { std::slice::from_raw_parts(actions, env.n * ACTIONS) };
         env.step_internal(actions)
+    });
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            set_error(error);
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn triage_rgb_timings(env: *mut c_void, values: *mut f64) -> i32 {
+    clear_error();
+    let result = call(|| {
+        let env = unsafe { (env as *mut RgbEnv).as_ref() }.context("null RGB environment")?;
+        ensure!(!values.is_null(), "null timing buffer");
+        let values = unsafe { std::slice::from_raw_parts_mut(values, 3) };
+        env.timings(values)
     });
     match result {
         Ok(()) => 0,
