@@ -80,8 +80,8 @@ def write_png(path, rgb):
     path.write_bytes(payload)
 
 
-def latest_rgb(observations):
-    array = observations[0, :, :, -3:].detach().to("cpu").numpy()
+def latest_rgb(observations, environment=0):
+    array = observations[environment, :, :, -3:].detach().to("cpu").numpy()
     return np.clip(array, 0, 255).astype(np.uint8)
 
 
@@ -219,7 +219,11 @@ def record_run(args, output):
                 env.step(warmup_actions)
             env.reset(args.seed)
             reset_checksum = env.checksum()
-            write_png(output / "sample-reset-env-000.png", latest_rgb(env.observations))
+            for environment in range(min(2, args.num_envs)):
+                write_png(
+                    output / f"sample-reset-env-{environment:03d}.png",
+                    latest_rgb(env.observations, environment),
+                )
 
             for step in range(args.steps):
                 action_tensor, action_values = fixed_action(step, args.num_envs, env.device)
@@ -260,8 +264,15 @@ def record_run(args, output):
                         }
                     )
 
-            write_png(output / "sample-terminal-env-000.png", latest_rgb(env.final_observations))
-            write_png(output / "sample-autoreset-env-000.png", latest_rgb(env.observations))
+            for environment in range(min(2, args.num_envs)):
+                write_png(
+                    output / f"sample-terminal-env-{environment:03d}.png",
+                    latest_rgb(env.final_observations, environment),
+                )
+                write_png(
+                    output / f"sample-autoreset-env-{environment:03d}.png",
+                    latest_rgb(env.observations, environment),
+                )
     finally:
         stop_memory_sampler(memory_process, memory_stream)
 
