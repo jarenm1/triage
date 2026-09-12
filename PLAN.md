@@ -16,7 +16,7 @@ Start with slow, local navigation through opaque obstacles, at fixed altitude an
 
 - **First engineering slice: E000, a reproducible RGB closed-loop experiment harness.** Connect observations to actions, collisions, resets, saved runs, and replay before expanding the procedural grammar.
 - **First research experiment: E001, procedural visual transfer.** Compare narrow appearance randomization, broad randomization, and broad randomization plus paired-render consistency under the same control architecture and budget.
-- Use the existing Rust rendering and CUDA/Python infrastructure first. Start with 16 rendered environments and staged copies. Increase parallelism only after measuring the entire loop.
+- Use the existing Rust rendering and CUDA/Python infrastructure first. Benchmark 256 rendered environments with staged copies. Increase parallelism based on the measured full-loop profile.
 - Use high-level planar velocity commands for the new navigation task. Do not simultaneously solve visual transfer and raw-motor control.
 - Use a small CNN and recurrent policy for the research baseline; a four-frame CNN is sufficient for the E000 integration smoke test.
 - Spend the first real-world effort on camera/latency checks and a small closed-loop course, not on collecting a large passive video dataset.
@@ -151,7 +151,7 @@ For the first recurrent learner, use within-rollout PPO epochs and disable cross
 
 ### 8 GB memory and throughput discipline
 
-Start E000 at 16 environments. Try 64, 128, and 256 only after collecting a full-loop profile. Thousands of state-only environments are not evidence that thousands of camera environments fit or improve time-to-solution.
+Start E000's full-loop benchmark at 256 environments. Keep the batch size configurable and use the profile to decide whether to test 512, 1,024, or larger batches. Measure rendering, transfers, collection, and learner updates together rather than extrapolating from state-only environment throughput.
 
 At 256 environments, 64 rollout steps, and 64x64 RGB uint8, one stored image rollout is **192 MiB**. A complete second appearance view doubles that image storage; materializing it all as float32 multiplies each copy's image storage by four. Store uint8 observations and normalize only minibatches. Generate paired views for a subset of sequences if necessary.
 
@@ -367,7 +367,7 @@ The deliverable is a small working experiment, not a new general simulator or a 
 
 - A separately named `visual_nav_v0` task with planar motion, velocity-response dynamics, finite footprint, and swept collision checks.
 - A short, straight course with randomized offset box/cylinder obstacles and openings, plus empty-course and unavoidable-collision fixtures for diagnostics.
-- 64x64 RGB at a declared camera rate, starting with 16 environments and the existing renderer/readback path.
+- 64x64 RGB at a declared camera rate, with an initial benchmark batch of 256 environments and the existing renderer/readback path.
 - Two continuous velocity commands. Version the speed/acceleration limits, task deadline, success predicate, collision margin, and reward in one resolved task configuration.
 - A four-frame CNN policy and visual critic for integration; no privileged obstacle/depth inputs. Implement a scripted controller for fixed-action replay and comparison.
 - One PPO-style collection/update cycle, checkpoint reload/evaluation, per-episode output, and end-to-end profile.
@@ -393,7 +393,7 @@ For control observations, backpressure or an explicitly simulated stale-frame po
 - A visual rollout completes, a learning update produces finite losses and nonzero encoder gradients, and a saved checkpoint can be reloaded for evaluation.
 - A short fixed-fixture learning diagnostic shows the RGB path affects behavior; include an image-shuffle or blank-image diagnostic where geometry varies. A gradient alone is not evidence that vision is used.
 - Inspect actual rendered images and a replay visually. Confirm obstacle/collider alignment and camera orientation on known fixtures.
-- Record measured peak VRAM, stage timings, copying costs, and total artifact size. The 16-environment harness fits the 8 GB device without assuming later scale.
+- Record measured peak VRAM, stage timings, copying costs, and total artifact size at 256 environments. Demonstrate that the full harness fits the 8 GB device budget; record an explicit failed gate if it does not.
 - Validate manifest/schema references and every required artifact checksum; preserve the failed-run manifest if any gate fails.
 
 Use a pilot compute cap of 2 GPU-hours for E000 smoke/profiling runs. If full-loop cost makes even a tiny learning diagnostic impractical, identify the bottleneck and make one focused rendering/batching change before E001. Do not spend weeks optimizing an unmeasured interoperability design.
