@@ -108,6 +108,8 @@ class HoverEnv:
             )
         self.device = torch.device("cuda", device)
         self.n = n
+        self.observation_shape = (22,)
+        self.action_size = 4
         self.max_steps = max_steps
         self.seed = seed
         self.handle = None

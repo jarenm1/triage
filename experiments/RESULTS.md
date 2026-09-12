@@ -2,13 +2,13 @@
 
 Use [PLAN.md](../PLAN.md) for experiment definitions, acceptance gates, artifact schemas, and reproducibility contracts. This ledger records plans, evidence, and decisions; it does not replace per-run artifacts.
 
-Updated: 2026-09-12. No experiments under the new visual-transfer protocol have been run. Historical state-policy and sensor results are preserved in [the archived engineering plan](../docs/archive/plan-2026-09-12.md).
+Updated: 2026-09-12. No claim-bearing visual-transfer experiments have been run. E000 now has a native staged RGB/PufferLib integration smoke; full replay and provenance evidence remain unfinished.
 
 ## Experiment register
 
 | ID / spec | Status | Question / scope | Runs and evidence | Decision |
 | :--- | :--- | :--- | :--- | :--- |
-| E000 / 2 | planned, selected next | Can we collect, learn from, and replay a small closed-loop RGB navigation task with complete provenance? | Not run; metrics not measured | Implement and benchmark the 256-environment RGB harness and result/replay contract before expanding geometry |
+| E000 / 2 | partial | Can we collect, learn from, and replay a small closed-loop RGB navigation task with complete provenance? | Renderer benchmark and a 256-environment staged RGB/PufferLib PPO smoke passed; full replay/provenance evidence not complete | Finish fixed-action replay, artifact records, and visual inspection before E001 |
 | E001 / draft | planned, conditional on E000 | Does broad procedural RGB randomization transfer, and does paired-history consistency improve it? | Not run; metrics not measured | Freeze exact task/splits/seeds/budgets after E000 profiling, before main runs |
 | E002 / draft | planned, conditional | Do recurrence and action-conditioned prediction improve dynamic/occluded-obstacle control? | Not run | Proceed after static transfer is diagnosed |
 | E003 / draft | planned, conditional | Does prioritized/mutated world sampling outperform uniform sampling at equal total compute? | Not run | Keep final generator families out of mining |
@@ -31,6 +31,27 @@ Updated: 2026-09-12. No experiments under the new visual-transfer protocol have 
 - Configuration freeze: commit numeric dynamics, camera, reward, success, and tolerance definitions before recorded acceptance runs. During integration these may change, but bump the specification when its declared behavior changes.
 - Acceptance: satisfy the section 11 evidence checklist, report stage timings and peak total device memory, and inspect rendered frames/replay.
 - Interpretation: passing E000 establishes integration and measurement capability, not sim-to-real transfer.
+
+## E000 / 2 observed benchmark result
+
+**Status: partial, renderer benchmark and RGB policy smoke complete; full E000 evidence not complete.**
+
+- Implementation revision: `2dbb72a6d3e2ba044b66e1c7937270bf91c0d7a9`.
+- Claim run: `target/experiments/e000-rgb-benchmark-256-claim/`; manifest SHA-256 `62e27f1caa2b594bfce1b46d2f9758b02158f8bf4b32807e9a2c1ee25c1c3630`; artifact-set checksum `424824499b926258c21c5ad1235609ede0540ce66de1715c3d62b64a5de74665`.
+- Configuration: 256 independent RGB views, 64x64, 10 measured steps after 2 warmup steps, staged `wgpu` readback, Vulkan on an NVIDIA GeForce RTX 2070 SUPER.
+- Mean measured step: **49.09 ms**, composed of **35.85 ms** submission/render work and **13.22 ms** readback. Throughput: **5,214 rendered environment-frames/s**, or **21.36 million pixels/s**.
+- Each step read back 4,194,304 RGBA bytes. The first three replay checksums matched exactly between fresh processes: `8db6a2f833b04e53`, `2e3904cb83916842`, `a5039d508ff6ab70`.
+- 100-step profile: `target/experiments/e000-rgb-benchmark-256-profile/`; mean step **50.56 ms**, **5,064 environment-frames/s**; observed peak GPU memory from 20 ms `nvidia-smi` polling: **956 MiB**. Profile artifact-set checksum: `f779c9c59f215bf9551570f216fb4ec82eb9f9e69120b15d2ce9ee6def306170`.
+- Exploratory scale probes before the claim run measured approximately **2,982 frames/s at 512 views** and **1,642 frames/s at 1,024 views**. They are not claim-bearing because their manifests predate the implementation commit.
+- Interpretation: the staged renderer path fits comfortably within 8 GB at 256 views and is fast enough to justify continuing. The renderer benchmark and policy smoke now exercise native actions, RGB observations, PufferLib rollout storage, and one CNN PPO update. This is integration evidence, not sim-to-real transfer.
+
+## E000 / 2 RGB/PufferLib integration smoke
+
+- Native bridge: `apps/rgb-env` renders 256 64x64 views, stages actions host-side, converts RGBA readbacks to four-frame RGB histories, and exposes rewards, termination flags, terminal observations, and episode metrics through `rl/rgb_environment.py`.
+- Smoke command: `nix develop --command cuda/build/rl-venv/bin/python rl/rgb_train.py --num-envs 256 --horizon 4 --steps 1024 --device 0 --library target/release/librgb_env.so`.
+- Result: one 1,024-transition rollout and PPO update completed with finite losses, checksum `6143592202583394605`, 456,901 policy parameters, and PyTorch peak allocated memory of 742,236,160 bytes.
+- Fresh-process seed-29 repeats produced the same checksum: `7993221089584785578` on both runs.
+- This smoke does not claim fixed-action replay, saved checkpoints, full-loop stage timings, total device memory, or visual dependence.
 
 ## Per-experiment result entry
 
