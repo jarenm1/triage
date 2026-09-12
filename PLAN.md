@@ -1,909 +1,556 @@
-# GPU-Native Multirotor RL Environment and Synthetic Data Simulator
+# Triage: procedural visual control and sim-to-real transfer
 
-## Architecture, Theoretical Contracts, and Evidence-Gated Roadmap
+Updated: 2026-09-12. Status: research direction and implementation plan, not a report of demonstrated visual transfer.
 
-> **Status:** Living engineering plan. The physical conventions, observable semantics, and measurement definitions below are architectural contracts. Kernel decomposition, storage packing, integrator, ML library, model family, and file formats remain implementation choices until measured.
+## 1. Direction and immediate decision
 
----
+Build Triage around a testable question:
 
-## 1. Mission and Scope
+**Can a small recurrent RGB policy learn transferable collision avoidance from cheap, diverse procedural simulation, with little deployment-domain data and no manually labeled perception dataset?**
 
-Build a simulation and synthetic-data system for autonomous multirotors that can:
+The main training path is `synthetic RGB history -> learned representation -> RL policy -> control`; deployment substitutes real camera observations. Simulator state can support rewards, diagnostics, auxiliary targets, and a critic experiment. It does not define the canonical visual latent or an obligatory privileged teacher.
 
-1. **Run state-based RL at high throughput.** Keep simulation state, policy inputs, actions, rewards, and reset work on one GPU during the training critical path.
-2. **Render calibrated synthetic sensors.** Produce RGB, metric camera depth, and stable object/instance identifiers through `sim-graphics` for selected environments at an independently configured sensor rate.
-3. **Measure sim-to-real transfer.** Compare training and evaluation regimes on labeled, held-out real data. The system can quantify and improve transfer; it cannot guarantee zero-shot transfer.
-4. **Generate and search structured scenarios.** Represent scenes and disturbances as validated, replayable data rather than generating raw pixels.
-5. **Support learned dynamics only when justified by evidence.** Add bounded force/torque residuals or latent predictive models only if they improve held-out prediction or policy outcomes over analytical baselines.
+Start with slow, local navigation through opaque obstacles, at fixed altitude and approximately fixed heading. Add dynamic obstacles after static transfer works. General navigation, open-world semantics, and aggressive six-degree-of-freedom flight are later claims requiring separate evidence.
 
-### Initial product boundary
+### Decisions
 
-The first physics implementation is a **single free-flying multirotor rigid body with rotor dynamics and terminal ground contact**. Contact-rich cars, rovers, articulated bodies, wheel/tire models, and general rigid-body contact require different state and solver contracts; they are future vehicle-family adapters, not swappable kernels inside the first multirotor module.
+- **First engineering slice: E000, a reproducible RGB closed-loop experiment harness.** Connect observations to actions, collisions, resets, saved runs, and replay before expanding the procedural grammar.
+- **First research experiment: E001, procedural visual transfer.** Compare narrow appearance randomization, broad randomization, and broad randomization plus paired-render consistency under the same control architecture and budget.
+- Use the existing Rust rendering and CUDA/Python infrastructure first. Start with 16 rendered environments and staged copies. Increase parallelism only after measuring the entire loop.
+- Use high-level planar velocity commands for the new navigation task. Do not simultaneously solve visual transfer and raw-motor control.
+- Use a small CNN and recurrent policy for the research baseline; a four-frame CNN is sufficient for the E000 integration smoke test.
+- Spend the first real-world effort on camera/latency checks and a small closed-loop course, not on collecting a large passive video dataset.
+- Record every experiment, including failed runs, in [the results ledger](experiments/RESULTS.md). Commit specifications and compact reports; retain large artifacts outside Git with checksums and a backup.
 
-### Explicit non-goals
+All resource budgets, model sizes, performance targets, and data-hour schedules below are proposed starting points. Measure them on the actual GPU and deployment platform.
 
-- Simulating every aerodynamic effect from first principles.
-- Rendering a camera for every headless RL environment on every control step.
-- Treating synthetic labels as evidence of real-world accuracy.
-- Promising portable zero-copy sharing between CUDA and WebGPU resources.
-- Committing to RK4, PPO, Dreamer, RSSM, Mamba, ONNX, or a particular dataset container before comparative measurements.
-- Making CUDA physics cross-platform. Initial physics acceleration targets NVIDIA GPUs; rendering and recorded replay remain cross-platform goals.
+### Existing work and document authority
 
----
+The previous plan is preserved in [the engineering archive](docs/archive/plan-2026-09-12.md), originating at Git commit `839125f`. Use it for detailed physical conventions, implemented interfaces, historical measurements, and replay/sensor contracts. This document supersedes its research priorities and milestone ordering. Treat historical performance numbers as historical, not as new measurements.
 
-## 2. Repository Starting Point
+## 2. What is sound, and what needs correction
 
-The repository already contains useful rendering infrastructure:
+### Sound parts
 
-- `sim-graphics`: Rust/`wgpu` renderer with instanced primitives, display views, sensor color, `R32Float` depth, `R32Uint` object IDs, pooled targets, and asynchronous staging-buffer readback.
-- `sim-graphics-winit`: native window integration.
-- `window-demo` and `render-smoke`: interactive and offscreen examples, including WebAssembly/WebGPU-oriented workspace support.
+1. Control rewards provide a reason to preserve information useful for action rather than reconstruct every pixel.
+2. Procedural geometry can cover many collision-relevant structures without naming or modeling every semantic object class.
+3. Rendering the same physical history with different appearances provides unusually strong, cheap counterfactual supervision.
+4. Temporal observations are essential for ego-motion, moving obstacles, and reasoning about recently occluded space.
+5. Holding out generator families is more informative than holding out seeds from a single grammar.
+6. A fast physical pathway and slower semantic context are compatible with an externally RGB-to-action system.
+7. A modest GPU can support useful visual-control experiments if image storage, batch sizes, and auxiliary models are bounded.
 
-The current renderer consumes CPU-authored `Frame` vectors and uploads instance data with `wgpu::Queue::write_buffer`. Each sensor view currently owns separate 2D targets. Therefore, GPU-authored transforms, true batched camera rendering, and CUDA/renderer interoperation are roadmap work—not existing capabilities.
+### Assumptions to reject or qualify
 
----
+**Support inclusion is insufficient.** “Real geometry is contained in the training distribution” is not an operational guarantee. Relevant situations must occur with enough probability and at useful difficulty. A huge distribution of mostly irrelevant or impossible worlds can reduce sample efficiency. Measure coverage of control-relevant encounters, not generator variety alone.
 
-## 3. Architecture and Seams
+**Geometry coverage does not imply observation coverage.** Projection, texture statistics, aliasing, exposure, motion blur, rolling shutter, transparency, and actuator delay can break transfer even when the obstacle shapes are covered. Cheap rendering should preserve useful visual evidence, not merely silhouettes.
 
-```mermaid
-flowchart TB
-    subgraph ML[Python / ML orchestration]
-        POLICY[PyTorch policy and trainer]
-        GYM[Gymnasium adapter]
-        EVAL[Dataset and transfer evaluation]
-        SEARCH[Scenario search and curricula]
-    end
+**Invariance is conditional on the task, history, and available evidence.** A wall's hue may be irrelevant; a signal's hue may change the reward or permitted action. Lighting that hides an obstacle changes uncertainty and may require slowing down. Those observations need not map to identical states.
 
-    subgraph SIM[Simulation module]
-        CONTRACT[MultirotorBatch interface]
-        CUDA[CUDA implementation]
-        REF[Reference implementation]
-    end
+**RGB cannot reveal unobservable quantities.** A single monocular frame generally cannot establish metric distance or velocity without additional assumptions. Motion, known ego-action effects, and optional onboard inertial measurements help, but do not remove every ambiguity. Completely hidden actors require risk-aware behavior, not clairvoyance.
 
-    subgraph BRIDGE[RenderSnapshot seam]
-        STAGED[Portable staged-copy adapter]
-        NATIVE[Optional native CUDA/Vulkan adapter]
-    end
+**Low resolution creates physical limits.** For a 64-pixel-wide, 90-degree horizontal-FOV camera, focal length is approximately 32 pixels. A 2 cm obstacle at 3 m spans about 0.21 pixels. No representation objective can reliably recover an obstacle absent from the sampled image. Increase resolution, reduce speed, change optics, or narrow the task envelope when necessary.
 
-    subgraph GFX[Rust / wgpu rendering]
-        RENDER[sim-graphics]
-        VIEWER[sim-graphics-winit viewer]
-        SENSOR[Offscreen sensor outputs]
-        READBACK[Asynchronous export ring]
-    end
+**Aggressive randomization can destroy useful cues.** Redrawing textures independently every frame corrupts motion evidence. Erasing all texture can remove parallax cues. Randomize persistent surface appearance over episodes; vary exposure and illumination with plausible temporal continuity. Treat sensor noise separately.
 
-    POLICY <-->|device tensors| CONTRACT
-    GYM --> CONTRACT
-    CONTRACT --> CUDA
-    CONTRACT --> REF
-    CUDA -->|selected poses and cameras| STAGED
-    CUDA -. feasibility gated .-> NATIVE
-    STAGED --> RENDER
-    NATIVE -. native only .-> RENDER
-    RENDER --> VIEWER
-    RENDER --> SENSOR
-    SENSOR --> READBACK
-    READBACK --> EVAL
-    SEARCH --> GYM
-```
+**Unlimited simulation is not unlimited learning.** Rendering, encoder training, rollout memory, and experiment iteration will probably dominate simple physics stepping.
 
-### 3.1 Simulation seam
+**Direct RGB learning does not universally beat privileged learning.** A state teacher can fail because of partial observability or imitation mismatch, but privileged critics, auxiliary labels, and teacher/student policies can also be strong. Keep them as measured baselines rather than assuming either architecture wins.
 
-The simulation is a deep module. Callers should need only a validated configuration and a small batched interface:
+**Passive video does not identify action consequences by itself.** Without actions or a valid causal model, observing a transition does not tell us what a different control command would have done. Log commands and timestamps whenever collection permits; that is cheap instrumentation, not manual action annotation.
 
-```text
-reset(mask?, seed?) -> ResetResult
-step(actions)        -> StepResult
-snapshot(selection)  -> RenderSnapshot
-```
+### Research contribution to pursue
 
-The interface includes tensor shapes and devices, frame conventions, reset behavior, error modes, determinism guarantees, and stream-ordering requirements. Internal kernel count, memory packing, and fusion are implementation details.
+The components individually have substantial prior art. The defensible contribution is evidence that a particular combination of **procedural encounter coverage, task-valid appearance interventions, and temporal visual control** improves real closed-loop outcomes per GPU-hour and per hour of deployment data.
 
-The initial ML adapter is PyTorch-specific. A later JAX or framework-neutral adapter may use DLPack or another FFI mechanism, but it must separately define ownership, lifetime, device, and producer/consumer stream synchronization. A tensor pointer alone is not a complete interoperation contract.
+A useful result would include:
 
-### 3.2 CUDA-to-`wgpu` seam
+- Generalization across held-out geometry families, render styles, and motion families, followed by real closed-loop evaluation.
+- An ablation showing whether paired interventions or temporal learning improve over ordinary domain randomization.
+- A measured data/compute/latency frontier on an 8 GB GPU.
+- A reproducible benchmark and failure corpus showing where the approach stops working.
 
-There are two render adapters behind the same logical `RenderSnapshot` interface:
+A benchmark-only or negative result is credible if the controls isolate the failure. “A broad generator plus several known losses” is not, by itself, a novel method claim.
 
-1. **Portable staged-copy adapter — required.** Gather only selected environments, copy asynchronously through bounded staging memory, tolerate one or more frames of latency, and drop visualization frames rather than stall training.
-2. **Native external-memory adapter — optional and feasibility-gated.** On a supported NVIDIA/Vulkan platform, a proof of concept may allocate exportable Vulkan memory, import it into CUDA, verify that CUDA and Vulkan select the same physical device, and synchronize ownership with external semaphores. Integrating such resources through `wgpu` requires unsafe, backend-specific HAL access and is not a portable WebGPU feature.
+## 3. Closest research and what to borrow
 
-Failure of the native adapter must not block the simulator, viewer, offline renderer, or web replay. Wasm replay consumes recorded data; it does not share CUDA memory.
-
-### 3.3 Scene seam
-
-A versioned scene description owns geometry references, transforms, semantic identities, lights, weather, and scenario parameters. Physics consumes only collision/query representations it explicitly supports. Rendering consumes visual assets. A mesh present in `wgpu` memory does not automatically exist in a CUDA ray-query structure.
-
----
-
-## 4. Fixed Physical Conventions
-
-These conventions are fixed across reference physics, CUDA physics, logs, tasks, and exported metadata. Renderer-specific coordinates are converted at the `RenderSnapshot` seam.
-
-### 4.1 Frames, units, and attitude
-
-- All physical quantities use SI units: metres, seconds, kilograms, radians, newtons, and newton-metres.
-- World frame $W$: right-handed East-North-Up (ENU), with gravity
-  $$
-  \mathbf g_W = [0, 0, -g]^T, \qquad g \approx 9.80665\ \mathrm{m/s^2}.
-  $$
-- Body frame $B$: right-handed Forward-Left-Up (FLU), fixed to the vehicle centre of mass.
-- Camera optical frame $C$: right-handed $x$ right, $y$ down, $z$ forward. Every camera has calibrated intrinsics and an explicit rigid transform between $B$ and $C$.
-- $\mathbf q_{WB} = [w,x,y,z]$ is a scalar-first Hamilton unit quaternion whose active rotation $R_{WB}$ maps body-frame vectors into the world frame.
-- $\mathbf v_W$ is world-frame linear velocity. $\boldsymbol\omega_B$ is body-frame angular velocity.
-- Exported timestamps use simulation time. Physics advances on a fixed timestep and control uses an integer number of physics substeps. Other simulated sensors use deterministic, timestamped schedules; display and export consumers may run asynchronously.
-
-The renderer currently uses a right-handed, Y-up graphics convention. The render adapter performs one documented basis change from ENU/FLU into renderer coordinates; physics never adopts graphics coordinates implicitly.
-
-### 4.2 Multirotor equations of motion
-
-For position $\mathbf p_W$, velocity $\mathbf v_W$, body angular velocity $\boldsymbol\omega_B$, body inertia $I_B$, total body force $\mathbf F_B$, world-frame external force $\mathbf F_W^{ext}$, and total body torque $\boldsymbol\tau_B$:
-
-$$
-\dot{\mathbf p}_W = \mathbf v_W
-$$
-
-$$
-m\dot{\mathbf v}_W = m\mathbf g_W + R_{WB}\mathbf F_B + \mathbf F_W^{ext}
-$$
-
-$$
-I_B\dot{\boldsymbol\omega}_B = \boldsymbol\tau_B - \boldsymbol\omega_B \times (I_B\boldsymbol\omega_B)
-$$
-
-$$
-\dot{\mathbf q}_{WB} = \frac{1}{2}\mathbf q_{WB}\otimes[0,\boldsymbol\omega_B].
-$$
-
-Numerical integration must maintain a normalized attitude representation. Quaternion renormalization, exponential-map updates, and integrator selection are implementation choices subject to convergence and stability tests.
-
-### 4.3 Rotor and actuator model
-
-The initial model has $M=4$ rotors in a validated Quad-X configuration, while the equations remain defined for fixed $M$:
-
-$$
-\dot\Omega_i = \frac{\Omega_{i,cmd}-\Omega_i}{\tau_i},
-\qquad
-\mathbf F_{i,B} = k_{f,i}\Omega_i^2\mathbf d_{i,B},
-$$
-
-$$
-\boldsymbol\tau_{i,B}
-= \mathbf r_{i,B}\times\mathbf F_{i,B}
-+ s_i k_{m,i}\Omega_i^2\mathbf d_{i,B},
-$$
-
-where $\mathbf r_{i,B}$ is rotor position, $\mathbf d_{i,B}$ is its thrust direction, and $s_i\in\{-1,+1\}$ is the signed reaction-torque direction on the body. Rotor ordering, position, direction, physical spin, derived torque sign, limits, and coefficients are named configuration—not undocumented tensor columns.
-
-A normalized action is converted to commanded rotor speed through a monotonic, configurable actuator map. The first implementation may use an affine map. Saturation is part of the model and occurs before integration.
-
-This is a calibrated quadratic rotor model, not blade-element momentum theory. Higher-order inflow, ground effect, battery sag, downwash, and wake interactions are later analytical or learned corrections.
-
-### 4.4 Aerodynamics and environment
-
-The baseline supports wind-relative empirical drag. With $\mathbf v_{rel,W}=\mathbf v_W-\mathbf v_{wind,W}$, drag is evaluated in a documented frame using validated linear and/or quadratic coefficients. The exact parameterization is replaceable; its units, sign, and frame are not.
-
-Phase 1 ground interaction is a termination condition against an analytic plane or height function. Bounce, friction, resting contact, wheels, and general collision response require a contact solver and are outside the initial module.
-
-### 4.5 Time integration
-
-The physical model is fixed; the integrator is not. Phase 0 compares at least a simple baseline and a higher-order method—for example semi-implicit Euler, midpoint/RK2, and RK4 or a Lie-group attitude update—at equal control quality and stability.
-
-The selected method must:
-
-- use a fixed, explicit physics timestep for reproducibility;
-- integrate coupled rotor and rigid-body state consistently;
-- support an integer number of physics substeps per control step;
-- demonstrate the expected convergence trend on smooth trajectories;
-- remain stable over the declared parameter and action envelope; and
-- define behavior at discontinuities such as saturation, termination, and reset.
-
-RK4 is therefore a candidate, not an architectural requirement.
-
-#### Current integration selection (2026-09-04)
-
-Production CPU and CUDA stepping use coupled explicit midpoint/RK2, including motor speeds at both stages and normalized stage/output attitude. The discarded semi-implicit implementation and its selection experiment are preserved in JJ revision `vpommxpy` (`319431e2`), not in current source. Each supplied physics timestep must be strictly less than twice **every** rotor time constant; validation rejects the non-decaying motor limit and larger steps without silently subdividing time. This is a motor stability condition, not a general rigid-body stability or accuracy guarantee.
-
-The original selection experiment swept 1–2,048 physics substeps per 10 ms control interval against double-precision RK4 traces. Its measurements below are historical evidence for the selection, not a retained alternative implementation or a baseline directly comparable to the current production-path benchmark.
-
-On the RTX 2070 SUPER, a 10,000-environment **homogeneous replicated** batch over 100 control calls passed all four scenarios—hover, motor command reversals, coupled attitude motion, and unequal-inertia torque-free rotation—with midpoint at **16 substeps (0.625 ms)**. Maximum errors across these traces were approximately 0.107 mm position, 0.192 mm/s velocity, 0.000146 rad/s angular rate, 0.0000116 rad attitude, and 0.0422 rad/s rotor speed. The provisional gates are 1 mm, 1 mm/s, 0.001 rad/s, 0.001 rad, and 0.1 rad/s respectively. No tested baseline substep count passed every gate across all four scenarios; fine-step float32 error is not monotonically decreasing.
-
-That experiment's Release-build median device times for the selected configuration were 3.2–6.9 ms per 100-control-call trajectory, depending on scenario, with uncontrolled clocks/power. These are physics-only measurements, not full-environment or training throughput, and do not establish a matched-accuracy speedup ratio when no baseline configuration passes. The retained scenario/parameter envelope is defined in `cuda/benchmarks/physics_cases.hpp`; 0.625 ms is a measured starting point, not a universal timestep default or proof of the broader flight envelope.
-
-#### Current native physics batch
-
-`cuda/src/physics_batch.hpp` defines `PhysicsBatch`, which owns per-environment float32 physical state and vehicle parameters on a fixed CUDA device. Environment count, physics timestep, and substep count are fixed at construction. Initial state and parameters are explicit device arrays; construction waits for validation and rejects the entire creation if any row is invalid. The old raw-buffer launcher is removed.
-
-- `step` borrows full-batch device actions and advances owned state in place with the selected midpoint method.
-- `apply_reset` accepts full-batch device mask/state/parameter arrays and writes per-environment statuses. Each selected pair commits together only if both records validate; invalid and unselected rows retain their previous state and parameters. Invalid state takes precedence over invalid parameters. Actual rotor speeds need not lie within command limits.
-- `export_state` copies requested typed fields or full records into caller-owned device arrays. Selection is all environments or an ordered device index array, including duplicates. Indexed exports require statuses; invalid IDs leave data outputs untouched. Even an empty batch reports invalid IDs for a nonempty indexed selection.
-
-One serialized host caller owns each batch's operation sequence. A batch-owned event orders every step, replacement, and export across supplied streams; an export therefore observes its position in that sequence, not later mutations. Callers must make borrowed inputs ready on the supplied stream, preserve their contents until consumed, and keep all borrowed allocations alive until queued use completes. Nonempty spans require storage on the configured CUDA device, not host or managed memory; declared allocation extents remain the caller's responsibility. Export outputs cannot overlap each other or their selector, and reset status cannot overlap reset inputs.
-
-Normal operations allocate no storage and do not synchronize the host. Creation, destruction, and CUDA-error cleanup may wait. This batch does not own curriculum, randomization profiles, reset generation, episode counters, RNG state, observations/rewards, or checkpoint semantics; higher layers supply concrete reset data, including data generated on the GPU. It adds no new physics or numerical-failure policy for stepping.
-
-Implementation evidence in JJ change `mkuzstvn`: CUDA-build and CPU-only correctness suites passed, as did two complete production benchmark runs and both motor-refinement levels. Compute Sanitizer reported zero errors for the batch tests and the benchmark at base count 257 (larger case 2,570). A throwaway instrumented smoke submitted 30 step/reset/export operations while a stream was deliberately blocked, checked resulting physical snapshots, and counted zero C++ allocations, CUDA allocation/free calls, and explicit host waits/synchronous copies during those operations. This checks the exercised steady-state path, not opaque driver-internal memory management.
-
-#### Production regression benchmark
-
-`sim_cuda_physics_benchmark` calls the public `PhysicsBatch::step` interface; it has no private stepping kernel or competing integrator. The default workload set times the four scenarios at 10,000 environments plus coupled attitude at 100,000 environments, all at 16 substeps per 10 ms control call. `--environments N` changes the base count; the larger case remains `10*N`. The double-precision RK4 oracle is checked by refinement, and accuracy uses indexed public exports of the first/middle/last environment after each control call, checking every export status. Additional motor-transient refinement at 32 and 64 substeps uses separate fixed-timing batches and is accuracy-only, with float32 error floors.
-
-```sh
-nu cuda/build.nu --release
-cuda/build/sim_cuda_physics_benchmark --label REVISION --output cuda/build/physics-baseline.tsv
-# After rebuilding the revision being compared, on the same machine:
-cuda/build/sim_cuda_physics_benchmark --label NEW_REVISION --baseline cuda/build/physics-baseline.tsv --output cuda/build/physics-current.tsv
-```
-
-Use actual revision identifiers for the labels. Saved reports include hardware/compiler/configuration metadata and fingerprints of the scenario parameters, initial states, and action schedules. Comparison requires matching metadata and complete workload/count/substep sets; incompatible, malformed, or incomplete reports are rejected. A workload that fails accuracy in either run is ineligible for a timing percentage. Correctness failures return nonzero, but timing changes are informational: report event/wall median deltas and min/max spread, then repeat suspicious measurements rather than applying an arbitrary CI slowdown threshold. Sample ranges are not confidence intervals, and clocks/system load remain uncontrolled.
-
-Both timers cover the public step sequence, including host span checks, stream-ordering events, and launch overhead; wall time additionally includes waiting for completion. Creation, checked masked state/parameter reset, allocation, preuploaded action schedules, exports/readback, and logging are outside the timed interval. The batch is reused across scenarios and reset before each timed trial. Its owned in-place state and full per-environment parameters/actions make old raw-launcher and selection-experiment timings incompatible baselines; reports identify the suite as `production-physics-batch-v2`. Memory reporting gives a workspace device-payload lower bound including owned state/parameters, separately reports host payload and process RSS, and excludes CUDA resources rather than claiming whole-GPU peak memory.
-
----
-
-## 5. Logical State and Tensor Contracts
-
-The following is the logical schema. The backend may use structure-of-arrays, array-of-structures, fused workspaces, or opaque packed tensors internally. Public fields must not depend on magic column offsets.
-
-| Logical value | Shape | Type | Meaning |
-| :--- | :--- | :--- | :--- |
-| `position_w` | `[N, 3]` | `float32` | $\mathbf p_W$ in metres |
-| `attitude_wb` | `[N, 4]` | `float32` | Unit $\mathbf q_{WB}=[w,x,y,z]$ |
-| `linear_velocity_w` | `[N, 3]` | `float32` | $\mathbf v_W$ in m/s |
-| `angular_velocity_b` | `[N, 3]` | `float32` | $\boldsymbol\omega_B$ in rad/s |
-| `rotor_speed` | `[N, M]` | `float32` | Actual $\Omega_i$ in rad/s |
-| `actions` | `[N, M]` | `float32` | Normalized actuator commands in `[0,1]` |
-| `wind_velocity_w` | `[N, 3]` | `float32` | Local ambient wind in m/s |
-| `sensor_bias` | task-defined | `float32` | Persistent accelerometer/gyro bias state |
-| `rng_counter` | implementation-defined | integer | Counter-based stochastic state |
-| `elapsed_steps` | `[N]` | integer | Control steps in the current episode |
-| `episode_id` | `[N]` | integer | Monotonic episode identity per environment |
-| `observations` | `[N, ObsDim]` or dict | `float32` | Task-defined policy observation |
-| `rewards` | `[N]` | `float32` | Task reward for the transition |
-| `terminated` | `[N]` | `bool` | MDP terminal state, such as crash or task success |
-| `truncated` | `[N]` | `bool` | External cutoff, such as a time limit |
-| `termination_code` | `[N]` | integer enum | Stable cause for diagnostics |
-
-Vehicle parameters are a validated named bundle: mass, a positive-definite inertia tensor, rotor geometry, physical spin and reaction-torque signs, thrust/torque coefficients, actuator limits and time constants, and aerodynamic coefficients. Per-environment packing is private to the backend so the parameter set can evolve without changing every caller.
-
-### 5.1 Ownership and execution
-
-- State is owned by the simulation module; callers receive documented tensor views or results, not unrestricted mutable aliases.
-- Actions must be on the configured device with the declared shape and dtype. Invalid inputs fail before launching work where practical.
-- The PyTorch adapter must respect the current CUDA stream or establish explicit producer/consumer events. It must not rely accidentally on the legacy default stream.
-- Host synchronization is absent from the headless `step` critical path. Logging that requires scalar host values is rate-limited and explicit.
-- Temporary storage is allocated during creation or capacity growth, not during each steady-state step.
-
-### 5.2 Reset and episode semantics
-
-The engine distinguishes `terminated` from `truncated`; there is no ambiguous `done` tensor in the core interface.
-
-Autoreset is a configured semantic mode compatible with the Python adapter:
-
-- **Disabled:** terminal observation is returned and the environment remains ended until reset.
-- **Next-step:** terminal observation is returned; reset occurs before consuming that environment's next action.
-- **Same-step:** returned observation is the reset observation, while `final_observation`, final episode statistics, and masks preserve the transition that ended.
-
-A fused reward/termination/reset kernel is allowed only if it preserves those observable semantics. Timeout is truncation by default. A crash or arena failure is termination unless a task specification says otherwise.
-
-### 5.3 Reproducibility
-
-Randomization and sensor noise use a counter-based scheme derived from stable identities such as `(base_seed, environment_id, episode_id, stream_id, sample_index)`. Reset ordering or unrelated environments must not silently perturb another environment's random stream.
-
-Exact bitwise equality is required only on the same supported software/hardware path when declared by that backend. Cross-backend verification uses numerical tolerances and distributional tests because floating-point reduction and transcendental implementations may differ.
-
----
-
-## 6. Sensor Contracts
-
-### 6.1 IMU
-
-At a sensor located at the centre of mass, ideal gyroscope and accelerometer outputs are:
-
-$$
-\tilde{\boldsymbol\omega}_B
-= \boldsymbol\omega_B + \mathbf b_g + \mathbf n_g,
-$$
-
-$$
-\tilde{\mathbf f}_B
-= R_{BW}(\mathbf a_W-\mathbf g_W) + \mathbf b_a + \mathbf n_a.
-$$
-
-The accelerometer measures **specific force**, not world acceleration with gravity added. Sensor-axis misalignment, scale error, saturation, quantization, latency, and an offset lever arm may be introduced later as explicit model terms.
-
-Bias follows a documented stochastic process, such as a discrete random walk:
-
-$$
-\mathbf b_{k+1}=\mathbf b_k+\sigma_b\sqrt{\Delta t}\,\boldsymbol\xi_k.
-$$
-
-Noise parameters must state whether they are continuous-time densities or per-sample standard deviations so changing the sensor rate does not silently change the physical model.
-
-### 6.2 Range sensing
-
-The first range sensor intersects a configured ray with an analytic ground plane or height field and reports range along the ray. General mesh raycasting is a future geometry-query adapter with its own acceleration structure; it is not delegated implicitly to render meshes.
-
-### 6.3 Visual sensors
-
-Each visual sample records:
-
-- simulation timestamp and camera exposure interval;
-- image dimensions;
-- camera intrinsics and distortion model;
-- camera extrinsics;
-- near/far planes and depth convention;
-- scene, environment, episode, frame, and randomization identifiers; and
-- renderer and asset version metadata.
-
-Canonical outputs:
-
-| Output | Contract |
+| Area / reference | Relevance and limitation |
 | :--- | :--- |
-| Color | Exported RGB is explicitly tagged with its transfer function; default dataset output is sRGB RGB8, with optional linear/HDR output for sensor modeling. |
-| Depth | `float32` metres along optical $+z_C$ (camera z-depth, not Euclidean range). Background is represented by the far value and object ID `0`. |
-| Object ID | `uint32`; `0` is background and every nonzero ID maps through per-frame metadata to a stable instance and semantic class. |
+| [CAD2RL](https://fsadeghi.github.io/CAD2RL/) | Direct monocular RGB-to-velocity collision avoidance trained in randomized simulation and transferred to real flight. This is close prior art for the basic thesis; it does not establish our proposed dynamic-world and held-out-family claims. |
+| [Domain randomization](https://arxiv.org/abs/1703.06907) | Supports varying synthetic appearance rather than requiring photorealism. Coverage and randomization design still matter. |
+| [DrQ-v2](https://github.com/facebookresearch/drqv2) and [SVEA](https://arxiv.org/abs/2107.00644) | Strong visual-RL augmentation baselines. SVEA also motivates caution about destabilizing value learning with severe augmentation. |
+| [Deep Bisimulation for Control](https://arxiv.org/abs/2006.10742) | A close formal connection to discarding behaviorally irrelevant information without pixel reconstruction. Reward/transition equivalence is more meaningful than arbitrary latent similarity; partial observability complicates direct application. |
+| [Self-Predictive Representations](https://arxiv.org/abs/2007.05929) | A small action-conditioned latent predictor and target encoder are a practical starting point for temporal auxiliary learning. |
+| [Learning High-Speed Flight in the Wild](https://arxiv.org/abs/2110.05113) | A strong simulation-trained privileged-learning reference for fast flight. Its sensing/training setup is not proof of raw synthetic-RGB transfer. |
+| [SIGN](https://arxiv.org/abs/2508.12394) | Recent drone visual RL with image augmentation and future prediction. Its separate depth-based safety module is important when comparing real-world success claims. |
+| [Procgen](https://arxiv.org/abs/1912.01588) | Useful procedural generalization methodology. Seed generalization alone is weaker than family and renderer holdouts. |
+| [Prioritized Level Replay](https://arxiv.org/abs/2010.03934) and [ACCEL](https://accelagent.github.io/) | Start with replay of informative levels; consider mutation-based curricula after a fixed distribution works. |
+| [DINOv2](https://arxiv.org/abs/2304.07193) | A frozen pretrained visual-feature baseline and potential semantic source. Imported pretraining is a large external data prior and must be disclosed. |
+| [V-JEPA 2](https://arxiv.org/abs/2506.09985) | Relevant separation of action-free video learning and action-conditioned prediction. Its internet-scale pretraining is not a locally affordable training recipe. |
+| [Invariant representation limits under domain shift](https://arxiv.org/abs/1901.09453) | Matching sim/real feature marginals is not sufficient for correct target behavior and can be harmful under conditional shift. |
 
-“Pixel-perfect” means aligned with the simulator's rendered visibility and label ontology. It does not imply perfect real-world labels. RGB realism additionally depends on assets, materials, lighting, camera response, exposure, motion blur, rolling shutter, distortion, noise, and compression.
+Use these as methodological references, not as a claim that any cited method already solves Triage's complete task. Keep comparisons explicit about sensors, privileged information, external pretraining, safety intervention, and real-data access.
 
-### 6.4 Visual scaling rule
+## 4. Current implementation and reusable contracts
 
-Physics count and visual-sensor count are independent:
+Source inventory at the plan update:
 
-- $N_{physics}$ may be $10{,}000+$.
-- $N_{visual}\ll N_{physics}$ is selected explicitly.
-- Visual sensors run at their own rate and may use stale-but-timestamped snapshots.
-- Viewer and exporter backpressure drops or delays render work; it never blocks headless training by default.
+- `cuda/src/hover_env.cu` and `cuda/src/hover_env.h`: hover/tracking task around the multirotor physics batch. The current policy observation is 22 float32 state values; actions are four raw rotor commands, transformed around hover thrust.
+- `rl/environment.py`: ctypes bridge with borrowed native CUDA tensors, explicit ownership/lifetimes, and stream constraints. This is not an RGB bridge.
+- `rl/policy.py`: a feed-forward MLP with Gaussian action and scalar value heads; no active recurrent state.
+- `rl/train.py` and `rl/vendor/torch_pufferl.py`: PPO-style training with trajectory reuse/V-trace-related machinery, checkpoints, JSON output, and evaluation. Reuse deliberately rather than describing it as an unmodified textbook PPO implementation.
+- `crates/sim-graphics/`: a `wgpu` renderer with box, plane, cylinder, sphere, and custom-mesh support. GPU textures and host readback exist; direct renderer-to-CUDA image sharing is additional work.
+- `README.md`: seeded scene generation, realized-scene replay, RGB/depth/instance outputs, and sensor provenance are documented separately from state-policy training.
 
-Raw output bandwidth is unavoidable. At $256\times256$, a four-byte color attachment, `float32` depth, and `uint32` IDs require 12 bytes/pixel. Rendering all three for 10,000 cameras would produce roughly 7.3 GiB per sensor tick before internal attachments or encoding, so “render every environment simultaneously” is not a design target.
+The critical missing connection is **rendered camera observations consumed by a closed-loop navigation learner**. A GPU renderer and a GPU physics batch do not imply this connection already exists.
 
----
+Retain the existing SI/frame conventions, quaternion handling, fixed-step timing, action interpretation, final-observation/autoreset semantics, and versioned scene/sensor contracts. Read the relevant implementation and archived sections before changing them. Introduce a separately named visual-navigation task rather than silently changing hover/tracking observations or action meanings.
 
-## 7. Scenario Generation and Sim-to-Real Evaluation
+The physics conventions are SI units, ENU world, FLU body, and scalar-first Hamilton body-to-world quaternions. The existing inspection scenes use a Y-up convention, so implement and test an explicit scene-to-physics/camera transform. Raw linear RGBA8 captures and sRGB PNGs are different encodings: choose one versioned policy preprocessing path and apply the corresponding conversion to real images. These two integration seams belong in E000, not in later appearance tuning.
 
-### 7.1 Structured scenarios
+For the new task, define image layout, color space, camera frame/extrinsics, capture timestamp, observation age, control cadence, collision shape, and reset behavior as versioned contracts. End an episode on collision or task completion; distinguish a time-limit truncation and retain the final pre-reset image/history for bootstrapping.
 
-Scenarios are versioned, schema-validated data containing asset references, poses, trajectories, weather, lighting, sensor configuration, and randomization distributions. Every realized scenario has a seed and can be replayed without the generator.
+## 5. Concrete v0 architecture
 
-Generation proceeds in increasing complexity:
+### Task and control boundary
 
-1. deterministic fixtures;
-2. parameterized procedural generation;
-3. distribution sampling and mutation;
-4. optimization or adversarial search over valid parameters; and
-5. optional model- or prompt-assisted proposals that still pass schema and feasibility validation.
+Use a fixed-altitude, approximately fixed-heading vehicle navigating a short course. Its navigation action is desired body-frame forward/lateral velocity, with forward velocity allowed to reach zero. Start at a maximum forward speed around 0.5 m/s; choose final limits from measured platform response and visible obstacle size.
 
-An LLM is therefore a possible proposal mechanism, not the world model or source of truth.
+For the initial simulator task, use a bounded-acceleration velocity-response model, a finite vehicle footprint, and swept collision checks. Label this as a navigation abstraction, not validated full flight dynamics. Later evaluate with the existing multirotor model and an explicit tracking controller.
 
-### 7.2 Dataset protocol
+On hardware, use an established stabilized flight controller with a demonstrated planar velocity-command interface. Stabilization alone does not provide velocity tracking: declare the velocity/position estimator and its sensor or external-localization dependencies. Measure command lag, braking, tracking error, loss-of-command behavior, and operator intervention before navigation trials. The current privileged-state motor policy is not automatically a suitable real controller.
 
-- Define a versioned label ontology before export.
-- Split real data by flight, site, and collection session to prevent adjacent-frame leakage.
-- Keep a final real test split untouched by scene tuning, model selection, and threshold selection.
-- Record provenance and randomization parameters for every synthetic frame.
-- Store images/masks in suitable media files or shards and metadata in a versioned manifest. COCO, YOLO, Parquet, or another container may be provided by adapters; no single format must carry every payload.
-- Validate exported geometry with simple scenes whose projected boxes, depth, occlusion, and IDs are analytically known.
+The initial instruction is “advance through the course without contact before the deadline.” The actor receives RGB history, previous commands, frame timing, and the requested motion direction/speed. Optional real-available inertial inputs are an explicitly named variant. Simulator position, obstacle state, depth, and perfect velocity are not actor inputs. Any low-level stabilization/localization sensors must be disclosed even when they are not navigation inputs.
 
-### 7.3 Transfer evaluation
+### Model
 
-The evaluation harness measures downstream performance under explicit regimes:
-
-- pretrained model without simulator-specific training;
-- synthetic-only training;
-- real-only training with a declared label budget;
-- synthetic pretraining followed by real fine-tuning; and
-- mixed real/synthetic training.
-
-Primary evidence is performance on the untouched real test set using task-appropriate metrics such as class-wise mIoU, boundary F1, mask AP, calibration, and failure slices. A “sim-to-real gap” always names the two regimes and datasets being subtracted; it is not computed by comparing unpaired pixels.
-
-SAM, YOLO segmentation models, DINO-family encoders, or later models are versioned evaluation adapters, not architectural dependencies. Prompting and class mapping are part of each adapter's protocol. Representation distance may diagnose domain shift but is not a substitute for downstream real-data performance.
-
-Scene parameters may be tuned on training/tuning splits. The final test split is evaluated only at release gates. The project claims measured transfer and confidence intervals—not parity or guaranteed zero-shot behavior.
-
----
-
-## 8. Optional Learned Models
-
-### 8.1 Aerodynamic residual
-
-A learned residual may predict bounded body-frame force and torque corrections:
-
-$$
-(\Delta\mathbf F_B,\Delta\boldsymbol\tau_B)
-= f_\theta(\text{state},\text{action},\text{context}).
-$$
-
-It is admitted only after:
-
-- synchronized real or higher-fidelity force/trajectory data exists;
-- train/tuning/test trajectories are separated by flight regime;
-- it improves held-out one-step and closed-loop rollout error over the analytical model;
-- outputs are bounded or gated outside supported data; and
-- batch latency and launch overhead are measured inside the actual simulation loop.
-
-The inference implementation—generated CUDA, a fused framework operation, TorchScript, ONNX, or another path—is selected from measurements. A nominal sub-millisecond claim without batch size and synchronization scope is not an acceptance criterion.
-
-### 8.2 Latent predictive model
-
-A latent dynamics model is a separate research module, not the scenario generator. It is justified only if it improves sample efficiency, planning performance, or total training cost after accounting for model training and exploitation of model error. RSSM, transformer, state-space, or other architectures compete under the same held-out rollout and policy-evaluation protocol.
-
-Latent “steps/sec” must be reported together with batch size, horizon, model size, device, precision, and whether decoding or policy inference is included.
-
-### 8.3 Failure mining
-
-Failure mining searches a bounded, valid scenario parameter space against a frozen policy checkpoint and explicit failure objectives. Results retain seeds and full scenario records. Mined examples enter a curriculum only after deduplication and evaluation on a separate scenario set, preventing the curriculum from degenerating into memorized adversarial cases.
-
----
-
-## 9. Performance and Measurement Contract
-
-“Steps/sec” is not used without qualification. For $K$ batched control calls, $N$ environments, and elapsed wall time $T$ after warm-up:
-
-$$
-\text{vector steps/s}=\frac{K}{T},
-\qquad
-\text{environment transitions/s}=\frac{KN}{T}.
-$$
-
-With $S$ physics substeps per control step:
-
-$$
-\text{physics state updates/s}=S\frac{KN}{T}.
-$$
-
-At control frequency $f_c$, aggregate real-time factor is:
-
-$$
-\mathrm{RTF}=\frac{KN/T}{Nf_c}=\frac{K/T}{f_c}.
-$$
-
-Every benchmark records:
-
-- GPU, driver, power/clock policy, CPU, OS, and build profile;
-- environment count, timestep, substeps, observation/action dimensions, and enabled model terms;
-- precision and deterministic settings;
-- warm-up and sample duration;
-- CUDA-event device time and end-to-end wall time;
-- whether policy inference, reward, reset, randomization, sensors, rendering, readback, and logging are included; and
-- peak device and host memory.
-
-Required benchmark tiers:
-
-| Tier | Included |
+| Component | Proposed starting point |
 | :--- | :--- |
-| Physics microbenchmark | Dynamics and integration only |
-| Full environment | Physics, kinematic sensors, observations, rewards, termination, and configured reset semantics |
-| Training loop | Full environment plus policy forward/backward and optimizer |
-| Visual pipeline | Selected snapshots, rendering, requested outputs, and separately measured readback/export |
-
-Initial capacity floor: **10,000 state-only environments at a 100 Hz control rate in real time or faster on the RTX 2070 SUPER target**, equivalent to at least 1,000,000 environment transitions/s for the full-environment tier. This is a useful minimum, not a claimed maximum. Maximum throughput is established by Phase 1 measurements.
-
-Rendering throughput is reported in sensor megapixels/s by output set and resolution, not only cameras/s. Viewer cost is reported as frame-time percentiles and measured training-throughput change under a fixed workload. The viewer must not introduce a synchronous dependency into `step`; a universal `<0.5%` same-GPU overhead promise is not credible.
-
----
-
-## 10. Implementation Roadmap
-
-```mermaid
-flowchart TD
-    P0["Phase 0: Contracts and feasibility<br/>Reference model, benchmark definitions, interop spike"]
-    P1["Phase 1: State-only GPU simulation<br/>CUDA dynamics, sensors, reset semantics, PyTorch binding"]
-    P2["Phase 2: RL baseline<br/>Gymnasium adapter, tasks, randomization, reproducible training"]
-    P3["Phase 3: Rendering integration<br/>RenderSnapshot adapters, viewer, bounded visual batches, replay"]
-    P4["Phase 4: Synthetic data and transfer evaluation<br/>Scenes, calibrated sensors, exporter, held-out real protocol"]
-    P5["Phase 5: Evidence-gated research<br/>Failure mining, residual dynamics, latent models"]
-
-    P0 --> P1 --> P2 --> P3 --> P4 --> P5
-```
-
-### Phase 0: Contracts and feasibility
-
-**Goal:** Retire theoretical ambiguity and the highest-risk platform assumption before optimizing.
-
-- [ ] **Freeze the v1 physical contract**
-  - Encode frame, quaternion, unit, actuator, timing, and termination conventions in types/configuration.
-  - Define the valid parameter and action envelope.
-- [ ] **Build a reference multirotor model**
-  - Favor clarity and `float64` verification over throughput.
-  - Cover force/torque allocation, motor lag, rigid-body derivatives, and sensor truth.
-- [ ] **Create analytic and convergence fixtures**
-  - Free fall, stationary supported IMU, constant rotation, symmetric hover, zero-force drift, and drag decay.
-  - Compare integrators by error, stability, and cost before selecting one.
-- [ ] **Specify benchmark tooling**
-  - Emit the metadata and qualified rates from Section 9.
-  - Prevent accidental host synchronization from being hidden outside the measured interval.
-- [ ] **Prototype the render transfer seam**
-  - Implement or measure a minimal staged path against the current CPU-authored `Frame` interface.
-  - Test whether `wgpu` 30's unsafe Vulkan HAL route can safely wrap exportable memory and synchronize with CUDA on the target machine.
-  - Record a go/no-go decision for native interop; retain staging as the supported fallback.
+| Camera | 64x64 RGB, approximately 20 Hz; test 96x96 or 128x128 only if observability or measured performance warrants it |
+| Spatial encoder | Four small stride-2 convolutions, channels 32/64/64/128; flatten the spatial map and project to 256 features |
+| Temporal state | GRU with 256 hidden units, consuming visual features, previous action, timing, and declared onboard inputs |
+| Actor / critic | Small MLP heads; Gaussian bounded velocity policy and visual-history value estimate |
+| Prediction head | Training-only action-conditioned MLP or small recurrent predictor over the learned state |
+| Consistency head | Training-only projection/prediction heads and a stop-gradient target encoder |
+| Size target | Roughly 1-2 million trainable parameters for the physical policy, verified from the implemented network |
+| Inference target | Measure batch-one p50/p95/p99 latency; initially aim for p95 below 10 ms on the declared target device, not just the training GPU |
 
-**Exit gate:** Reference trajectories and conventions are executable; benchmark terms are unambiguous; rendering has a proven fallback; native interop is classified as supported, experimental, or rejected.
+Keep spatial location in the encoder output. Immediate global average pooling can discard the left/right information needed for avoidance. Start without a transformer or an image-generating world model.
 
-### Phase 1: State-only GPU simulation
+### Where temporal modeling belongs
 
-**Goal:** Implement the full environment tier without rendering or policy inference.
+- The CNN handles spatial evidence from the current frame.
+- The recurrent policy state integrates observations and actions into a compact, approximate belief state. It should retain recently occluded obstacles and motion evidence.
+- The auxiliary predictor encourages that state to encode action consequences. Do not run multi-step latent planning in v0.
+- A future semantic module can use a longer, slower video window, independently of the physical control update rate.
 
-- [ ] **Implement batched dynamics and selected integration**
-  - Couple actuator and rigid-body state correctly.
-  - Normalize attitude and detect non-finite or out-of-envelope state.
-- [ ] **Implement deterministic reset and randomization**
-  - Support masked reset, stable episode IDs, and counter-based random streams.
-  - Randomize only named, physically valid parameters.
-- [ ] **Implement kinematic sensor state**
-  - IMU truth, discrete noise/bias processes, and analytic ground range.
-- [ ] **Implement task transition kernels**
-  - Observations, rewards, `terminated`, `truncated`, termination codes, and final episode data.
-  - Fuse kernels only when profiling shows a benefit and semantics remain unchanged.
-- [ ] **Implement the PyTorch adapter**
-  - Validate device/dtype/shape, respect CUDA stream ordering, and avoid steady-state allocation and host synchronization.
-- [ ] **Verify CPU/GPU equivalence and measure throughput**
-  - Compare derivatives and finite trajectories over the declared envelope.
-  - Demonstrate the initial 10,000-environment capacity floor or document the measured bottleneck before changing scope.
+Use ordered sequences, episode masks, sequence-start state, and burn-in in training. A proposed starting point is 32 learning steps plus 8 burn-in steps. Recompute features during optimization; do not train an evolving encoder from permanently cached latent features. Check that memory actually helps using a frame-stack baseline and ambiguous-motion cases.
 
-**Exit gate:** Correctness fixtures pass on reference and CUDA implementations; reset semantics are observable and reproducible; full-environment throughput is reported under the fixed protocol.
+For the first recurrent learner, use within-rollout PPO epochs and disable cross-update trajectory reuse until recurrent off-policy correction is explicitly tested. Before E001 main runs, verify ordered minibatches, hidden-state resets, final-history truncation bootstrapping, and stored behavior log-probabilities on a small recurrent fixture. Document any stale sequence-start state and finite-burn-in approximation; eight burn-in frames do not guarantee reconstruction of the full history.
 
-### Phase 2: Vectorized RL baseline
+### 8 GB memory and throughput discipline
 
-**Goal:** Demonstrate that the simulator trains and evaluates a policy correctly.
+Start E000 at 16 environments. Try 64, 128, and 256 only after collecting a full-loop profile. Thousands of state-only environments are not evidence that thousands of camera environments fit or improve time-to-solution.
 
-- [ ] **Implement `DroneVectorEnv`**
-  - Expose Gymnasium-compatible `reset()` and five-value `step()` results: observations, rewards, terminations, truncations, and infos.
-  - Declare autoreset mode and preserve final observations and episode statistics.
-  - Keep a typed tensor-native interface beneath the Python compatibility adapter.
-- [ ] **Implement state-based tasks**
-  - Begin with hover and target tracking.
-  - Add waypoint and state-based gate navigation only after simpler tasks establish correctness.
-- [ ] **Implement domain randomization**
-  - Sample validated distributions for mass/inertia, rotor coefficients, actuator response, wind, initial state, and sensor characteristics.
-  - Version every distribution used in an experiment.
-- [ ] **Train a reproducible baseline**
-  - Start with a small on-policy baseline; select the library from integration simplicity and profiler evidence.
-  - Report success, sample count, wall time, and distribution across multiple seeds.
+At 256 environments, 64 rollout steps, and 64x64 RGB uint8, one stored image rollout is **192 MiB**. A complete second appearance view doubles that image storage; materializing it all as float32 multiplies each copy's image storage by four. Store uint8 observations and normalize only minibatches. Generate paired views for a subset of sequences if necessary.
 
-Initial hover acceptance profile, to be versioned with the task: at least 90% of randomized evaluation episodes remain within the declared position/attitude envelope for a 20-second episode. “Converges in under two minutes” is a stretch measurement on named hardware, not a correctness gate.
+Use mixed precision where validated, bounded sequence minibatches, and a rollout buffer rather than a huge GPU image replay buffer for the first on-policy implementation. Target measured total device use below 7 GiB to leave operating headroom; account for `wgpu`/CUDA allocations and context overhead as well as learner allocations.
 
-**Exit gate:** A saved policy reproducibly meets the versioned hover criterion on held-out randomized seeds, and the end-to-end training profile identifies simulation versus learner cost.
+Profile physics, rendering, host/device transfers, encoding, policy inference, optimization, and artifact writing separately. Report aggregate GPU-hours including failed runs and tuning. Optimize the dominant cost only after the E000 trace exists.
 
-#### Current GPU hover / PufferLib integration
+## 6. Procedural geometry and appearance
 
-JJ change `mxmnyztp` adds a concrete GPU hover environment and a PufferLib-derived Torch learner. The chosen integration is a narrowly vendored, explicitly adapted learner from [PufferLib 4.0 revision `42f70d6932c30ac977736f861006809c50168ba9`](https://github.com/PufferAI/PufferLib/tree/42f70d6932c30ac977736f861006809c50168ba9), not the full PufferLib installation or its CPU-environment vectorizer. Attribution, the MIT license, and the exact adaptation rationale are retained in `rl/vendor/`. The learner retains Muon, prioritized trajectory-segment replay, clipped policy/value objectives, and V-trace corrections. It uses a two-hidden-layer float32 MLP Gaussian policy; native BF16 learning, recurrent policies, distributed execution, Protein, and dashboards are not included.
+### Generate encounters, not just shapes
 
-`cuda/src/hover_env.h` exposes the task through a C interface; `rl/environment.py` borrows its CUDA buffers through ctypes and the CUDA array interface. Physics remains in `PhysicsBatch`. The task owns GPU observations, rewards, episode clocks/counters, failure/timeout decisions, deterministic reset generation, final observations, and same-step autoreset. Python consumers and native operations use one declared CUDA stream. Policy actions map to `clamp(hover_command + 0.15*tanh(raw_action), 0, 1)` per rotor; the policy learns the offsets, with no scripted stabilizing controller. The 22 observation values are target-relative world position, world velocity, a row-major body-to-world rotation matrix, body angular velocity, and normalized actual rotor speeds.
+Represent a world as independently versioned factors: geometry family, layout/topology, scale, surface appearance, camera/sensor model, dynamics family, task, and random streams.
 
-Task version 1 holds a fixed reference Quad-X at target `(0,0,1)` using a 100 Hz control rate and 16 midpoint substeps. Initial position varies by ±0.15 m per axis, roll/pitch by ±0.05 rad, yaw across a full turn, velocity by ±0.05 m/s, and body rate by ±0.02 rad/s. Motor state starts at equilibrium. Ground crossing, distance beyond 2 m, tilt beyond 0.8 rad, and nonfinite state/actions terminate; the 2,000-control limit truncates instead. Final observations are preserved before reset on every step. The learner bootstraps timeouts from final observations, suppresses bootstrap on failure, stops advantage recurrence at either episode boundary, and retains the final rollout transition.
+Sample control-relevant quantities explicitly:
 
-The target Nix shell includes Python 3.12, uv, and runtime/driver library discovery. `rl/uv.lock` pins Torch 2.7.1+cu128, NumPy 2.2.6, and transitive dependencies. From the repository root:
+- Clearance relative to vehicle radius and uncertainty margin.
+- Opening width, corridor curvature, obstacle thickness, and surface orientation.
+- Occlusion duration, sight distance, and visibility before a decision.
+- Relative closing speed, time to contact, required braking, and lateral escape space.
+- Clutter density and connectivity of reachable free space.
+- Apparent feature size in pixels at the intended speed and distance.
 
-```sh
-nix develop
-nu rl/setup.nu
-cuda/build/rl-venv/bin/python -m unittest rl.test_advantage
-cuda/build/rl-venv/bin/python rl/train.py train --seed 1 --log-every 25 --checkpoint cuda/build/hover-final-seed1.pt
-cuda/build/rl-venv/bin/python rl/train.py train --seed 2 --log-every 25 --checkpoint cuda/build/hover-final-seed2.pt
-cuda/build/rl-venv/bin/python rl/train.py eval --checkpoint cuda/build/hover-final-seed1.pt --eval-envs 1024 --eval-seed 900000001
-cuda/build/rl-venv/bin/python rl/train.py eval --checkpoint cuda/build/hover-final-seed2.pt --eval-envs 1024 --eval-seed 900000002
-cuda/build/rl-venv/bin/python rl/profile_rollout.py
-```
+Normalize geometry against vehicle size and dynamics. A geometric path through a gap is insufficient if the vehicle cannot brake or turn into it. An initial braking estimate is `v * total_delay + v^2 / (2 * braking_acceleration)`, plus footprint and uncertainty margins; dynamic encounters need relative-motion reasoning as well.
 
-The default training run uses 1,024 environments, a 64-control rollout horizon, minibatches of 8,192 transitions, replay ratio 2, and 20 million requested transitions (20,054,016 after completing the last rollout). Both independently trained checkpoints loaded successfully with `weights_only=True` and passed fresh held-out evaluation:
+### Implementation sequence
 
-| Training seed | Fresh evaluation seed | Successful 20-second episodes | Fixed hover-thrust baseline | Mean episode maximum distance / tilt |
-| :--- | :--- | :--- | :--- | :--- |
-| 1 | 900000001 | 1,024 / 1,024 | 0 / 1,024 | 0.278 m / 0.088 rad |
-| 2 | 900000002 | 1,024 / 1,024 | 0 / 1,024 | 0.309 m / 0.126 rad |
+1. Start with existing boxes, cylinders, planes, and simple openings, using the same transforms and geometric parameters for rendering and collision.
+2. Add independent composition families: surface warps, branching graphs, convex/concave assemblies, and varied layouts.
+3. Add curved/custom meshes, cellular/Voronoi structures, porous structures, height fields, and bounded CSG/SDF families only when they expand measured encounter coverage.
+4. Keep renderer choice separate from generator family. Generate or mesh expensive implicit geometry at reset rather than assuming arbitrary SDF ray marching is cheap for every pixel and environment.
 
-Success requires remaining within 1 m of the target and 0.7 rad tilt for the entire 20 seconds, without failure. Evaluation counts only the first episode per environment, not subsequent autoresets. Checkpoints retain task/learner configuration, seeds, optimizer and RNG state, and evaluation metadata; they support saved-policy evaluation, not exact mid-episode simulator restoration.
+The first renderer is the existing staged `wgpu` path. If profiling identifies it as prohibitive, compare batched rasterization with a bounded CUDA primitive raycaster. A custom general-purpose renderer or external-memory bridge is not a prerequisite for the first transfer experiment.
 
-All five native CTests passed, including hover timeout/failure separation, final observations, seed replay, and cross-stream stepping. Compute Sanitizer reported zero errors for the hover test. Both advantage regression tests passed on CPU and CUDA. A warmed 1,024-environment, 64-control rollout trace recorded 3,338 GPU kernels and 513 device-to-device copies, with no host-copy activities, scalar readbacks, CUDA allocation/free calls, or host synchronization inside the collection interval. `rl/profile_rollout.py` repeats this check and saves its trace and summary under `cuda/build/`; profiler setup/teardown, learner updates, and logging are explicitly outside that interval. Torch's tensor-standard-deviation Gaussian sampling originally introduced per-step readbacks; equivalent `loc + scale*randn_like(loc)` arithmetic removed them. Device copies and multiple kernel launches remain; no CUDA-graph or maximum-throughput claim is made.
+### Avoid learning the generator
 
-This establishes the first state-based training milestone on the RTX 2070 SUPER, not the complete Phase 1/2 roadmap or a sim-to-real result. Vehicle parameters are fixed; broad domain randomization, wind/drag, noisy sensors, other tasks, a general Gymnasium adapter, and rendering integration remain separate work.
+- Give geometry, appearance, dynamics, and camera parameters independent random streams and cross their combinations.
+- Use both recognizable simple geometry and irregular composites. Do not equate novelty with utility.
+- Hold out whole construction mechanisms, parameter ranges, and combinations, not merely family names that share the same implementation.
+- Include a second rendering configuration or backend in evaluation when practical. A new geometry family rendered by the same shader still shares renderer artifacts.
+- Maintain a sealed final family suite and a separate development family suite. Once a held-out family guides tuning, it is development data; add a new final holdout.
+- Audit accidental shortcuts such as object color predicting motion, fixed texture scale revealing distance, or goal location correlating with a generator seed.
 
-#### Randomized target tracking contract
+### Appearance interventions
 
-JJ change `zmowkoop` adds a separately named `tracking` task; `hover` remains the default and retains its task/checkpoint contract. Both share the existing `PhysicsBatch`, direct four-motor action mapping, reward coefficients, initial-state distribution, and 22-value ground-truth observation layout. For tracking, the first three observations are world position relative to the **current** commanded target. Neither future commands nor countdowns enter the policy observation. Vehicle parameters remain fixed; this slice adds no wind, obstacles, noisy sensors, yaw commands, or rendering.
+Randomize material hue, texture frequency/orientation, contrast, background, illumination, and sensor effects within declared ranges. Preserve texture attachment and temporal coherence within a history. Include low-texture and low-contrast episodes, but record their observability rather than demanding identical representations under every degradation.
 
-Each episode lasts 2,000 controls at 100 Hz, with 16 midpoint physics substeps per control (`dt = 0.000625 s`). Commands are generated from seed, environment, episode, and command identities, independently of the vehicle trajectory. Candidates are uniform in `x,y ∈ [-1,1] m`, `z ∈ [0.75,1.75] m`, rejected until displacement from the previous commanded target is within `[0.5,1.5] m`; the first previous target is `(0,0,1)`. Each mixed-schedule command independently chooses a 75% long interval, uniform integer `[200,500]` controls, or a 25% short interval, uniform integer `[20,100]`. Consecutive short commands are allowed. A new command replaces the previous one without resetting physical state.
+The same physical state is not enough to validate an invariance pair. The task rules, relevant signals, action history, and visibility conditions must also be compatible. Keep task-signaling colors and gestures out of nuisance randomization unless their meaning is transformed consistently.
 
-Transition ordering is physics, reward/outcomes/metrics against the preceding target, then command publication for the next observation or episode autoreset. Final observations and `final_targets` describe the preceding transition. Tracking terminates on nonfinite state/actions, tilt beyond 0.8 rad, `x,y` outside ±3 m, or `z` outside `[0.05,3] m—not on target distance. Timeout truncates. Reward remains `exp(-2*distance² - 0.1*speed² - 0.05*body_rate² - 0.5*tilt²) - 0.005*mean(tanh(raw_action)²)`, with failure reward −1.
+## 7. Dynamic actors without semantic assets
 
-Acceptance uses two suites, with 1,024 fresh 20-second episodes per suite and policy:
+Generate bodies from primitives and motion controllers independently. Useful physical actor families include:
 
-- **Settling:** four fixed-500-control commands per episode. A command settles only when its final 50 consecutive controls have distance ≤0.2 m and speed ≤0.2 m/s. At least 90% of all commanded targets must settle, with at least 95% episode survival. Failed episode tails do not remove targets from the denominator.
-- **Mixed/interruption:** the randomized schedule above, at least 95% survival, and mean episode RMS position error ≤75% of a frozen trained hover policy's mean episode RMS. That baseline continues holding `(0,0,1)`; it is not supplied moving-target errors. Each paired evaluation receives an identical pre-generated command plan.
+- Rigid bodies following bounded-acceleration trajectories, with speed changes and pauses.
+- Crossing and intercepting trajectories with sampled arrival times.
+- Bodies entering from behind occluders, with controlled warning time.
+- Pendulums, hinged surfaces, and chains of capsules with constrained joint motion.
+- Falling and bouncing bodies under gravity with simple contact models.
+- Reactive agents with goals, reaction delays, limited sensing, and varied avoidance/aggressiveness parameters.
 
-Every episode contributes its full 2,000-control error horizon. Failure and remaining tail controls receive squared error `37.0625 m²`, the worst arena-to-target bound (`4² + 4² + 2.25²`). Reports distinguish mean episode RMS (the gate), pooled RMS, short-/long-interval pooled RMS, maximum error including failure padding, and action saturation. Saturation is the fraction of executed rotor controls with `abs(tanh(raw_action)) >= 0.99`; nonexistent failure-tail controls do not enter that denominator.
+Use latent intent variables and correlated stochastic accelerations, not independently sampled positions. A kinematically animated body with bounded velocity is not automatically a physically simulated articulated body; record which model produced it. Validate speed, acceleration, joint limits, and contact behavior appropriate to each family.
 
-`rl/train.py --task tracking` trains the mixed schedule; `--schedule settling|mixed` filters evaluation only. Tracking checkpoints bind the exact 2,000-control task configuration. `--init-checkpoint` loads weights with a fresh optimizer and records their provenance. Checkpoints and evaluation JSON are retained under ignored `cuda/build/`, not embedded in source control.
+Start with one crossing opaque body, then an occluded crossing body. The same current image can require different actions depending on preceding motion: use this as a temporal diagnostic. Later hold out motion mechanisms, such as reactive movement after training on scripted trajectories.
 
-#### Tracking training and measured acceptance
+Completely unpredictable or permanently hidden hazards can make an encounter unsolvable. Record unavoidable-collision cases separately and reject them from the learnable curriculum unless the intended behavior is earlier slowing or information gathering. Simulator state may verify feasibility; it must not leak into the actor.
 
-Tracking seeds 11 and 22 independently initialized from the previously trained hover seeds 1 and 2, respectively, using fresh optimizers. Each trained for 80,019,456 tracking transitions (80 million requested, rounded to the final complete rollout), with learning rate 0.0025 and the existing 1,024-environment / 64-control rollout / 8,192-transition minibatch / replay-ratio-2 configuration. These are hover-initialized tracking policies, not tracking runs from scratch. Development evaluation used 128 episodes on seeds 5000011 and 5000022. Initial 40-million-transition runs at learning rate 0.0005 failed; increasing learning updates and training duration—not changing the task, reward, or gates—produced the accepted policies.
+## 8. Objectives and training sequence
 
-Both saved policies loaded with `weights_only=True` and passed both suites on previously unused evaluation seeds. The paired frozen baseline was `hover-final-seed1.pt`, holding `(0,0,1)`; it survived all baseline episodes.
+Optimize a small set of objectives incrementally. The conceptual total is `L_control + lambda_pair * L_pair + lambda_pred * L_pred + lambda_aux * L_aux`; real-video adaptation is a separately reported stage. Log each loss, its gradient contribution, and its coefficient schedule.
 
-| Training seed | Fresh evaluation seed | Settled targets | Settling survival | Mixed survival | Mixed mean episode RMS / baseline | Baseline RMS ratio |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 11 | 910000011 | 4,096 / 4,096 (100%) | 1,024 / 1,024 | 997 / 1,024 (97.36%) | 0.5772 / 0.8384 m | 68.84% |
-| 22 | 910000022 | 4,033 / 4,096 (98.46%) | 1,021 / 1,024 (99.71%) | 1,011 / 1,024 (98.73%) | 0.5395 / 0.8432 m | 63.99% |
+### A. Control objective: always present
 
-| Policy / suite | Mean episode RMS | Pooled RMS | Short / long interval RMS | Maximum error | Action saturation |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| 11 / settling | 0.3702 m | 0.3745 m | — / 0.3745 m | 1.5924 m | 0% |
-| 22 / settling | 0.3842 m | 0.4192 m | — / 0.4192 m | 6.0879 m | 0% |
-| 11 / mixed | 0.5772 m | 0.8084 m | 1.0909 / 0.7885 m | 6.0879 m | 0.000481% |
-| 22 / mixed | 0.5395 m | 0.6448 m | 0.9768 / 0.6188 m | 6.0879 m | 0% |
+Begin with the existing PPO-style infrastructure after adapting the observation/action interface. Use task completion, forward progress, collision cost, a deadline, and modest control smoothness penalties. Specify all coefficients and time units in the versioned task configuration. Check rewards against stop-forever, wall-following, and simulator-exploit policies.
 
-The 6.0879 m maxima include the explicit failure padding; failures were not discarded. All five native CTests and four Python regression tests passed. The new tests cover command bounds/timing and replay, uninterrupted physical state, old-target reward ordering, failure-tail error accounting, missed settling targets, and original-plan short/long classification after autoreset. An independent recorded-state check recomputed the final-50-control settling windows and matched every native finish/settlement flag across 128 × 2,000 controls (486 settled commands on the development policy). Compute Sanitizer reported zero errors. Both original hover checkpoints still achieved 1,024 / 1,024 hover successes on their regression seeds.
+The primary endpoint is success without collision or intervention before the deadline, not training return. Rewards can use simulator state without making it a policy input.
 
-Warmed hover and tracking rollout traces each recorded 3,338 kernels and 513 device-to-device copies for 1,024 environments × 64 controls, with no recorded host-copy activities, scalar readbacks, CUDA allocation/free calls, or host synchronization in the collection interval. This checks rollout residency, not learner-update residency or a controlled throughput comparison. The Nix shell also supplies zlib, required for NumPy to import independently of Torch.
+### B. Paired appearance consistency: first research addition
 
-After creating the hover checkpoints with the commands above, reproduce the training and acceptance runs inside `nix develop`:
+Re-render an identical physical history and identical action history under two independently sampled, task-valid appearance settings. Align projected recurrent representations with a stop-gradient target and add policy-distribution consistency on these valid pairs.
 
-```sh
-cuda/build/rl-venv/bin/python rl/train.py train --task tracking --seed 11 --init-checkpoint cuda/build/hover-final-seed1.pt --steps 80000000 --learning-rate 0.0025 --log-every 200 --eval-envs 128 --eval-seed 5000011 --checkpoint cuda/build/tracking-final-seed11.pt --output cuda/build/tracking-final-development-seed11.json
-cuda/build/rl-venv/bin/python rl/train.py train --task tracking --seed 22 --init-checkpoint cuda/build/hover-final-seed2.pt --steps 80000000 --learning-rate 0.0025 --log-every 200 --eval-envs 128 --eval-seed 5000022 --checkpoint cuda/build/tracking-final-seed22.pt --output cuda/build/tracking-final-development-seed22.json
-cuda/build/rl-venv/bin/python rl/train.py eval --task tracking --checkpoint cuda/build/tracking-final-seed11.pt --baseline-checkpoint cuda/build/hover-final-seed1.pt --eval-envs 1024 --eval-seed 910000011 --output cuda/build/tracking-acceptance-seed11.json
-cuda/build/rl-venv/bin/python rl/train.py eval --task tracking --checkpoint cuda/build/tracking-final-seed22.pt --baseline-checkpoint cuda/build/hover-final-seed1.pt --eval-envs 1024 --eval-seed 910000022 --output cuda/build/tracking-acceptance-seed22.json
-cuda/build/rl-venv/bin/python -m unittest rl.test_advantage rl.test_tracking
-cuda/build/rl-venv/bin/python rl/profile_rollout.py --task tracking
-```
+Re-render both histories and reconstruct their recurrent state; comparing one changed frame against an unrelated hidden state is not the intended intervention. Preserve terminal state, camera timing, and actor trajectories. With reactive actors, replay the recorded physical history for appearance pairs rather than regenerating a different interaction.
 
-This completes the agreed fixed-vehicle target-tracking slice, not the remaining Phase 1/2 roadmap, general Gymnasium compatibility, or sim-to-real validation.
+Use episode-start paired sequences first, initializing each appearance branch's recurrent state independently to zero. For a later mid-episode paired segment, re-encode that appearance's prefix from the last reset, separately for online and target networks, or explicitly specify and test a bounded-history approximation. Do not initialize the alternate appearance with a hidden state computed from the original appearance.
 
-### Phase 3: Rendering integration and replay
+Do not force the entire latent to be a single canonical simulator state. Keep task-sensitive information available to the actor. Use RL plus target-encoder/predictor design and, if needed, variance/covariance regularization to discourage collapse. Measure feature variance and action discrimination; low consistency loss alone proves nothing.
 
-**Goal:** Add visualization and bounded visual sensing without coupling renderer cadence to training cadence.
+Add explicit counterexamples: recolor an irrelevant wall and expect similar behavior; change a task signal and expect different behavior. For v0, a tiny synthetic stop/go task can diagnose this distinction without claiming real traffic-light competence.
 
-- [x] **Define and implement `RenderSnapshot`**
-  - Select environment IDs and include timestamped poses, object identities, cameras, and scene version.
-  - Apply the documented ENU/FLU-to-renderer transform once.
-- [x] **Ship the staged-copy adapter first**
-  - Use bounded double/triple buffering and explicit backpressure.
-  - Measure gather, transfer, `queue.write_buffer`, and render costs separately.
-- [ ] **Resolve the native interop experiment**
-  - If Phase 0 proves safety and value, isolate unsafe Vulkan/CUDA ownership and semaphore logic behind a native-only adapter.
-  - Otherwise close the path without burdening the portable renderer.
-- [ ] **Extend `sim-graphics` for calibrated sensor batches**
-  - Budget camera count, resolution, and output set explicitly.
-  - Verify color transfer, optical z-depth, object-ID stability, occlusion, and background semantics.
-- [x] **Build the decoupled viewer**
-  - Free/orbit and vehicle-mounted views at a display-rate target such as 60 FPS.
-  - Drop stale snapshots rather than delaying simulation.
-- [x] **Add versioned trajectory recording and replay**
-  - Record conventions, schema version, timestamps, scenario identity, and enough state for reproducible, timestamp-aligned visual replay; bit-exact pixels are required only where a renderer/backend explicitly guarantees them.
-  - Support native and web replay through the same logical recording schema.
+### C. Action-conditioned prediction: second addition
 
-**Exit gate:** A trained trajectory can be viewed live and replayed; the headless step path remains render-independent; visual correctness fixtures pass; throughput impact is measured rather than assumed.
+Predict future target-encoder features from recurrent state and recorded actions at short horizons, initially 1, 2, and 4 control steps. Add longer horizons only if they improve closed-loop outcomes. This is a training auxiliary, not an image reconstruction task.
 
-#### Current trained-policy trajectory bridge
+A deterministic one-step predictor can learn persistence or average incompatible futures. Stochastic actors and occlusion require uncertainty or multiple hypotheses if prediction is expanded. Compare against action-free prediction and action-shuffled controls to test whether action consequences were learned.
 
-JJ change `rtywlmus` connects saved hover/tracking policies to selected-state staging, a native live viewer, and native/WebGPU recording playback. `rl/view_policy.py` uses the existing checkpoint loader and deterministic policy means; it does not change the learner, task, or ordinary headless training path. This completes the fixed-scene trajectory-viewing slice, not batched camera sensing or the entire Phase 3 exit gate. Visual inspection of the new viewer/playback controls is explicitly left to the user.
+### D. Privileged auxiliary supervision and diagnostics
 
-The optional native snapshot ring exports actual selected `PhysicsBatch` positions and Hamilton quaternions, then packs current targets and episode IDs on the producing stream. A separate nonblocking stream copies only these immutable compact slots to pinned host memory. Completion events gate polling and slot reuse; later physics never waits for the D2H transfer. Selection is 1–64 unique environments; 2–16 slots are allocated once, with four by default. Full rings drop submissions. Python copies ready rows into a bounded worker queue; JSON encoding, recording and localhost TCP writes belong to the worker, not the control call. A slow network client retains at most one partial line and the latest pending snapshot in application storage; it cannot hold a CUDA slot or block stepping. Teardown may drain/wait, but never waits for a viewer. Recording files must not already exist.
+First fit frozen-representation probes for collision risk, relative motion, traversability, and short-horizon action-conditioned outcomes using simulator labels. Probe results diagnose missing information, but do not establish real transfer.
 
-`sim-trajectory` owns the version-1 NDJSON schema, validation, timestamp sampling, coordinate conversion, fixed drone/target/ground geometry and cameras for both native and WASM consumers:
+If an auxiliary head materially improves control, train it jointly as a named ablation. Simulator depth/flow labels are cheap and acceptable; their accuracy is secondary to control. A privileged critic is another separate ablation. Do not impose privileged actor imitation as the default representation-learning pipeline.
 
-- The first line records schema/scene versions, ENU/FLU and scalar-first quaternion conventions, task, seed, checkpoint path, 10 ms control interval, requested sampling cadence, ordered environment selection and camera FOV/near/far calibration. Scene version 1 is illustrative quadrotor geometry and target markers above a ground plane, not a physical collision asset.
-- Each subsequent complete line records global control step/time and selected vehicles' environment IDs, episode IDs, world positions, body-to-world quaternions and active targets. These are **current post-autoreset** poses, not terminal-transition poses. Absolute simulation time never resets.
-- Replay sample-holds at the recorded timestamps, including dropped samples; it never interpolates across an episode reset. Recordings preserve realized poses rather than promising simulator restoration or bit-identical pixels across devices.
-- ENU `(x,y,z)` becomes renderer `(x,z,-y)` through one proper basis rotation. The mounted camera is 0.5 m forward and 0.12 m up in FLU, looking forward with body up; orbit uses world up. These mounts and geometry are part of scene version 1.
-- Background ID is `0`, ground is `4,294,967,295`, and vehicle/target IDs are `2*environment_id+1` / `2*environment_id+2`. Shared identity definitions drive both rendered labels and browser metadata.
+For counterfactual diagnostics, branch selected simulator states over a small action set and estimate short-horizon risk/return under a declared continuation policy. These are measured continuation values, not oracle optimal Q-values. Test whether useful action rankings survive appearance changes.
 
-Inside `nix develop`, after building the CUDA library and creating the existing policy checkpoints:
+### E. Small real-video adaptation: only after zero-shot evaluation
 
-```sh
-# Record 40 simulated seconds, independent of wall-clock playback speed.
-cuda/build/rl-venv/bin/python rl/view_policy.py --task tracking --checkpoint cuda/build/tracking-final-seed11.pt --environment-ids 0,7,31 --steps 4000 --record cuda/build/tracking-view.ndjson
-cargo run -p window-demo -- --trajectory cuda/build/tracking-view.ndjson
+Use the deployment camera and representative motion for real clips. Compare zero adaptation with 15 minutes, 1 hour, and 4 hours of unique real footage; extend to 8 hours only if the curve justifies it. Use nested subsets and separate sites/sessions for development and final evaluation.
 
-# Live: start the producer, then the viewer in another terminal.
-cuda/build/rl-venv/bin/python rl/view_policy.py --task tracking --checkpoint cuda/build/tracking-final-seed11.pt --environment-ids 0,7,31 --steps 6000 --listen 127.0.0.1:9876 --realtime
-cargo run -p window-demo -- --live 127.0.0.1:9876
+Start with conservative temporal/masked feature prediction or frozen-feature distillation. Replay synthetic RL/consistency data during adaptation and constrain policy drift on a fixed simulation anchor set. Update only a small adapter or selected encoder layers initially. Re-evaluate closed-loop behavior after every adaptation stage.
 
-# Native headless geometry/label/depth smoke and diagnostic captures.
-cargo run -p render-smoke -- --trajectory cuda/build/tracking-view.ndjson --output target/tracking-view
+Action-free video losses cannot substitute for action-conditioned supervision. If real commands and timing are available, use them in a separately named interaction-data condition. Do not invent action labels from an inverse model and count them as ground truth.
 
-# Browser: select the same NDJSON file in the supplied page.
-trunk serve --config apps/web-demo/Trunk.toml
-```
+### F. Domain invariance: deferred experiment
 
-Native controls: Space pauses, R restarts recorded playback, C switches orbit/mounted cameras, N selects the mounted vehicle, arrows orbit and wheel zooms. The live viewer consumes the latest complete snapshot without waiting for network IO and preserves its last pose on disconnect. Start a new viewer to reconnect. Browser loading starts paused; GPU buttons control play/pause and camera mode. Space toggles playback, Home restarts, `[`/`]` seek one second, C switches cameras, N selects the vehicle, and S returns to the showcase. Embedders can call `load_trajectory(ndjson)`, `play()`, `pause()`, `restart()`, `seek(absolute_seconds)` and `set_camera_mode("orbit"|"mounted")`; invalid loads preserve the existing recording. RGB/depth/ID/comparison modes remain available. Browser replay needs no CUDA or Python.
+Do not begin with an adversarial sim-versus-real classifier. Marginal feature alignment can merge states requiring different actions. If attempted, align conditional on comparable task/motion contexts and test action discrimination and real control explicitly. Chance-level domain classification is not a success metric.
 
-Verification on the RTX 2070 SUPER: all five native CTests, six Rust tests and four Python regressions passed; the release WASM bundle built. The native regression covers blocked-stream nonblocking submission/polling, full-ring drops, cross-stream ordering, selected pose/attitude/target correspondence, post-reset episode identity and independence from later state mutations. Compute Sanitizer reported zero errors after warming its snapshot-kernel instrumentation before the blocked-stream check. Shared tests cover sample-hold through timestamp gaps/resets and physical yaw/mounted-camera basis conversion. A real 25-second tracking rollout recorded all 501 requested samples. A separate 64-environment live stream delivered 4,901 increasing complete snapshots, each matched exactly against the simultaneously recorded frame. A deliberately non-reading client still completed all 5,000 controls while replacing 4,981 network snapshots. The received recording then passed native parsing and six headless RGB/depth/ID renders (first/middle/last, orbit/mounted), including finite optical depth, far-valued background and identity-map checks. No visual sign-off is claimed.
+## 9. Real data and semantic edge cases
 
-Measured staging impact, **not learner-update or live-viewer frame-rate performance**: three sequential paired runs used tracking seed 10001, checkpoint seed 11, 1,024 environments, 100 warm-up controls followed by reset, 10,000 measured controls, selection `[0,7,31]`, and one sample per five controls. Policy inference, full environment and optional recording/worker activity are inside the wall interval; checkpoint loading, construction, warm-up/reset and final recording drain are outside. Unpaced baseline median was 2.240 s (range 2.188–2.338), versus 2.639 s (2.612–2.674) with staging/recording: about 4.57 versus 3.88 million environment transitions/s, or a 15.1% throughput reduction. All three recording runs retained 2,001 samples without ring/worker drops. Average GPU gather/packing was 5.11–5.21 microseconds per selected snapshot; D2H was 2.12–2.14 microseconds, timed separately with CUDA events. These are uncontrolled-clock Linux/i7-9700K/RTX-2070-SUPER measurements with driver 595.99.02, Release CUDA and float32 physics/policy; ranges are not confidence intervals.
+### What data is unavoidable?
 
-For a three-vehicle, 960×540 RGB/depth/ID headless scene, six debug-build samples measured CPU scene preparation at 11–20 microseconds, upload-plus-render CPU submission at 141–295 microseconds, and GPU-completed wall time at 309–673 microseconds. The latter includes submission/polling and is **not** a GPU timestamp measurement. Separate temporary instrumentation measured the two `queue.write_buffer` CPU calls together at 7.8–36.5 microseconds on the six GPU-only submissions; that measures CPU staging, not isolated GPU transfer time. Explicit render/readback took 65.6–72.6 ms and remains outside interactive rendering. The probe and transport/performance driver were removed after measurement; the CLI retains stage counters/timings and a `--disabled` paired-baseline mode. Concurrent learner-plus-viewer throughput, display latency, visual inspection and the optional native-interoperation decision remain unclaimed.
+There is no universal minimum number of real-video hours. Zero real training images can work for a bounded task, as CAD2RL illustrates; that does not imply zero real engineering knowledge or zero validation.
 
-#### Large-jump playback stress scenario
+At minimum, obtain task-specific evidence about camera observations, command response, timing, and closed-loop behavior. Semantic conventions require an information source: pretrained data, explicit task rules, demonstrations, or a small targeted annotation set. Geometry alone cannot determine an arbitrary gesture's intended meaning.
 
-`rl/view_policy.py --scenario long-flight-v1 --task tracking` loads the **same unchanged tracking checkpoint** but commands abrupt targets `(10,0,2)`, `(10,10,2)`, `(-10,10,2)`, `(-10,-10,2)`, `(10,-10,2)` and `(0,0,2)` in metres, held for 10 seconds each. The route contains 10 m and 20 m horizontal jumps; it is not a smoothed target trajectory or a scripted flight controller. The episode limit is 60 seconds and the arena is widened to horizontal ±20 m and altitude `[0.05,5]` m so the original ±3 m arena does not reject the requested destinations. Tilt, nonfinite-action/state and ground failure checks, motor mapping, physics and same-step autoreset are unchanged. A failure restarts the route at its first target.
+Keep separate accounting for:
 
-This is an out-of-training-distribution stress scenario, not a new training task or acceptance claim. Existing mixed/settling schedules and checkpoint contracts are unchanged. Recordings identify it as `tracking-long-flight-v1` rather than ordinary `tracking`, and native/web readers support that identity.
+1. Deployment-domain unlabeled video, measured as unique duration and coverage, not repeated training exposure.
+2. Robot interaction data with commands/telemetry, plus any labeled demonstrations.
+3. Manual setup/calibration effort and task-specific labels.
+4. External pretrained weights and their disclosed training-data provenance.
+5. Real development trials and final evaluation trials, including interventions and failures.
 
-```sh
-cuda/build/rl-venv/bin/python rl/view_policy.py --task tracking --scenario long-flight-v1 --checkpoint cuda/build/tracking-final-seed11.pt --batch 1 --environment-ids 0 --steps 6000 --record cuda/build/tracking-large-jumps.ndjson
-cargo run -p window-demo -- --trajectory cuda/build/tracking-large-jumps.ndjson
-```
+A small amount of basic camera work is worth doing: identify image orientation, approximate FOV, camera-to-body mounting, exposure/frame-rate behavior, and timestamp/command delay. Use a full calibration procedure only when measurements show those approximations are inadequate. Camera mismatch cannot be wished away by domain randomization.
 
-Observed with environment seed 10001 and policy seed 11: all 1,201 requested samples were recorded over 60 simulated seconds, with 240 episode resets. The policy failed on the first 10 m command before reaching later route points; the recording retains those failures rather than substituting a successful or smoothed flight. Five native tests, the two shared replay tests, four Python regressions and the release WASM build passed after adding the scenario.
+### Slower semantic conditioning
 
-#### Current sensor-inspection slice
+Do not add a semantic model to E000 or E001. Later, keep a separate access path to RGB or higher-resolution crops; a heavily compressed physical latent may already have discarded a sign's content.
 
-JJ change `uunkvlmu` starts the visual/data path independently of drone training. `sim-inspection` supplies a shared version-1 scene configuration: explicit axis-aligned boxes with stable nonzero uint32 IDs, names, positions, scales and linear colors, plus camera pose, vertical field of view, clipping planes and resolution. Both the native window inspector and headless renderer consume this configuration. Coordinates are explicitly right-handed **Y-up, in metres**, matching the renderer; this is not yet the ENU/FLU physics `RenderSnapshot` adapter.
+Run a frozen small pretrained image/video encoder at a lower rate, provisionally 1-5 Hz, and learn a small context adapter. Condition the fast policy through a compact context vector or FiLM-style modulation. Supply context age, confidence, and expiry. Train with missing, stale, and incorrect context.
 
-The inspector displays RGB, optical depth, instance colors, and a separate observer view with the sensor's true near/far frustum, world axes, and object identity callouts. Observer gizmos never enter sensor labels. Camera intrinsics use pixel centers `(column+0.5,row+0.5)` with the image origin at the upper-left edge. Exported extrinsics map world coordinates into optical X-right/Y-down/Z-forward coordinates and are stored column-major.
+Begin with one explicit convention, such as a demonstrated stop or directional gesture. Define its meaning and provide a small source of task-specific supervision or verified pretrained interpretation. A generic visual embedding does not automatically encode the correct instruction.
 
-Interactive presentation uses `GpuInspector` and the existing renderer's frame graph, mesh registry, and transient texture pool. Both scene views use `Renderer::execute_gpu`, which skips readback scheduling. Sensor outputs are copied into persistent sampled GPU textures before the observer graph can reuse transient attachments. Panel coloring, text and callouts are composed on the GPU and presented through a `wgpu` surface. Meshes, pipelines, font atlas and sampled textures persist; sensor textures resize only when sensor dimensions change. Camera input only updates the scene and requests redraw. Explicit export retains the synchronous CPU capture path.
+Keep fast collision avoidance responsive between semantic updates. Slow processing is suitable only when the event permits the delay; urgent signals require earlier visibility, a fast trigger, or lower operating speed. A confidence estimate is not a safety guarantee. Report semantic success and intervention separately from physical avoidance.
 
-The initial CPU-preview design was rejected after an instrumented debug-build run measured a 792.63 ms median camera-update path: roughly 39 ms sensor capture/readback, 2 ms observer capture, 220 ms CPU panel construction and 532 ms CPU preview resizing. The replacement's warmed, offscreen GPU-completed frame benchmark measured 0.544 ms median over 16 camera updates at 948×1064 output with 640×480 sensors on the RTX 2070 SUPER. Completion waits were benchmark-only; the interactive rendering method does not poll or wait for readback. These are pipeline timings, not desktop input-to-photon latency or a vsync/frame-rate guarantee. The GPU-composited image was inspected offscreen.
+## 10. Evaluation and strongest baselines
 
-Native controls: arrows orbit the camera; `+`/`-` dolly; PageUp/PageDown translate camera height; `[`/`]` change FOV; `S` saves the configuration; `L` reloads; `R` resets the unsaved scene; `E` explicitly exports a capture; Escape closes. A missing window scene file starts the default scene. Invalid reloads report an error and preserve the current valid scene. Repeated window exports use unique subdirectories under `target/inspection/`.
+### Evaluation matrix
 
-```sh
-nix develop
-cargo run -p window-demo -- --inspect
-# Or edit/reload a specific scene:
-cargo run -p window-demo -- --inspect target/my-scene.json
-cargo run -p render-smoke -- --inspect --output target/my-capture --verify
-cargo run -p render-smoke -- --inspect --scene target/my-capture/scene.json --output target/my-replay
-```
+Vary one axis at a time, then evaluate combinations:
 
-Capture destinations must be absent or empty. A complete bundle is published together rather than overwriting a previous capture with partially updated files:
-
-- `scene.json`: the exact versioned scene configuration.
-- `metadata.json`: dimensions, layout, intrinsics, extrinsics, object identities and output interpretation.
-- `color.rgba8`: top-to-bottom, tightly packed **linear RGBA8 UNORM**, not sRGB; lighting is clipped/quantized by the existing sensor attachment.
-- `depth.f32le`: float32 little-endian optical Z-depth in metres; background is the camera's far value.
-- `object_ids.u32le`: uint32 little-endian IDs, with background `0`; no palette or 8-bit truncation.
-- `preview.png`: diagnostic panels only, including sRGB display conversion, false-color depth, instance palette and observer annotations.
-
-The headless `--verify` command checks all 76,800 pixels of an asymmetric, analytically projected two-box scene: visible IDs, occlusion, optical depths 3.5/5.5 m and far-plane background. It also verifies exact RGB/depth/ID replay after saving and reloading the supplied scene on the current renderer. An independent export check reconstructed all 30,710 foreground pixels in the default 640×480 capture using its calibration; the maximum distance from the labelled box surface was 0.0000273 m, and IDs 11, 257 and 65539 survived export intact. This is same-backend replay evidence, not a promise of bit-identical rendering across devices.
-
-After the GPU presentation cutover, the headless geometry/replay checks still passed and all three raw sensor payloads were byte-identical to the preceding CPU-inspector capture. All four existing rendering/registry unit tests passed, and the unchanged headless demo still rendered its 401-instance scene. Unsupported scene versions are rejected without creating a capture bundle. The temporary latency probe and timing instrumentation were removed after measurement.
-
-This slice establishes inspectable sensor output and scene replay. Procedural scene distributions, large dataset batches, perception-model comparisons, physical camera motion and sim-to-real improvement remain separate milestones.
-
-#### Embeddable WASM canvas showcase
-
-`apps/web-demo` is a canvas-only WebGPU showcase with deterministic courtyard and calibration scenes. RGB, depth, uint32 instance IDs and comparison use the same sensor camera. Gates share an ID across their component meshes; both scenes include ID `4,000,000,001`. GPU-rendered buttons select outputs, switch scenes, reset the view, toggle orbit and zoom. Control state and hit testing live in WASM; the small `app.js` harness supplies DOM pointer/keyboard events and animation scheduling, not a surrounding website UI.
-
-Depth **display colors** auto-range between the nearest and farthest visible foreground samples each frame. A GPU workgroup reduction ignores background IDs and invalid depths; a constant-depth surface uses the palette midpoint. Nearest is red, farthest blue, and background black. The underlying optical-Z depth remains in metres. The overlay is added only after sensor rendering, so its buttons never enter sensor labels. Sensor textures use five bounded resolution tiers up to 960×720; neither normal presentation nor relative-depth reduction reads images back to the CPU.
-
-```sh
-nix develop --command trunk build --config apps/web-demo/Trunk.toml --release --locked
-nix develop --command trunk serve --config apps/web-demo/Trunk.toml
-```
-
-The release bundle is in `apps/web-demo/dist/`. A host imports `web-demo.js`, calls its default WASM initializer, then `create_renderer(canvas)`. Keep `web-demo_bg.wasm` beside the generated JS module; `web-demo.d.ts` supplies TypeScript declarations. `Engine.render(width, height, pixel_ratio, delta_seconds)` draws into the supplied canvas; dimensions are backing pixels, UI pointer coordinates use those same pixels, and camera drag deltas use CSS pixels. Reuse the bundled `app.js` as the minimal event/render-loop example. No global renderer variable or fixed canvas ID is required by the WASM module. Serve via HTTPS or localhost in a WebGPU-enabled browser; CUDA physics and trained policies are not part of this browser demo.
-
-Verification: real browser RGB/depth/ID/comparison output and GPU buttons were inspected. Output selection, scene switching, zoom, orbit start/stop, reset and cancelled GUI drag-out were exercised; selecting outputs or cancelling a GUI gesture did not move the camera. The user also verified the canvas and relative-depth presentation. The shared attachment-sampling change passed the four existing rendering tests and the 76,800-pixel native analytical depth/occlusion and exact scene-replay smoke check.
-
-### Phase 4: Synthetic data and transfer evaluation
-
-**Goal:** Produce auditable datasets and answer whether they improve performance on held-out real data.
-
-#### Seeded obstacle generation and static showcase (2026-09-10)
-
-The first Phase 4 slice is implemented in JJ change `rvsmtnov`. `sim-scene` is the shared, GPU-independent Rust scene/generator module used by native inspection and WASM. Scene schema **v2** replaces the earlier inspection v1 schema: each instance owns a unique nonzero uint32 ID, name, semantic class and one or more world-space axis-aligned box parts. Unsupported versions reject; there are no v1 compatibility aliases. Right-handed Y-up metres and optical X-right/Y-down/Z-forward calibration remain unchanged. A saved realized scene replays without calling the generator.
-
-Generator recipe v1 samples ground, two three-part gates and box obstacles. The complete recipe records seed, image dimensions, inclusive integer distributions for obstacle count/size and gate width/height, obstacle spread and camera jitter. Placement uses shuffled cells with bounded jitter, colors and camera FOV also vary, and each sample has its own seed/index-derived integer RNG. Sample order and batch boundaries do not affect scene data. Gates share one instance ID across all three parts; full-width IDs exercise values above signed int32. Ontology v1 defines background 0, ground 1, gate 2 and obstacle 3. These are bounded geometric scenes, not realistic materials or a general asset/weather generator.
-
-```sh
-cargo run -p render-smoke -- --generate --seed 42 --count 3 --output target/dataset
-cargo run -p render-smoke -- --generate --seed 42 --start-index 2 --scene-only
-cargo run -p render-smoke -- --inspect --scene target/dataset/sample-0000000000/scene.json --output target/replay --verify
-NO_COLOR=true trunk build --config apps/web-demo/Trunk.toml --release --locked
-```
-
-`--recipe FILE` excludes `--seed`, `--width` and `--height`; duplicate/unknown flags, zero count, invalid dimensions and sample-index overflow reject. Batch output must be absent. One inspector captures all samples into a temporary sibling directory; the dataset manifest and all samples publish together. Linux/Android use no-replace rename; other platforms check before standard rename (a concurrent empty-directory creation can be replaced on other Unix, never an existing populated dataset). This is a synchronous, small-batch exporter, not the planned asynchronous pipeline.
-
-Each sample includes exact `scene.json`, metadata v2 with provenance/calibration/ontology/instance mapping, optical-Z `depth.f32le`, uint32 `object_ids.u32le`, uint32 `semantic_classes.u32le`, raw linear `color.rgba8`, sRGB `color.png`, and diagnostic `preview.png`. PNG conversion uses the same clipped/quantized linear LDR source; it does not restore HDR information. Mask IDs are checked against the scene before publishing. The batch manifest names every sample and its scene/metadata paths.
-
-`apps/web-demo` now wraps the reusable WebGPU canvas in a static showcase, replacing its independent hardcoded scene builder with the shared generator. Seed/sample selection, output modes, calibrated camera reset, instance/class legend, calibration/provenance and realized JSON download are available. Scene downloads reflect the current interacted camera; recipe provenance remains the original generation recipe. Sensor resolution remains recipe-defined when the canvas resizes. Recorded trajectory playback remains supported. The GPU-free `generate_scene(seed, sample_index)` WASM export also works without WebGPU. `examples/seed-42-sample-0/` is a real native capture with downloadable payloads and a static fallback page; update it alongside future generator/sensor changes. No CUDA physics runs in the browser.
-
-Verification: Rust workspace **13 tests**, Python **4 tests**, CPU physics **2 CTests** and CUDA physics **5 CTests** passed; release WASM built. Three 640×480 samples passed independent per-pixel instance/class/depth checks (**921,600 pixels**); all four classes and uint32 IDs above int32 were visible. Native replay matched raw color/depth/IDs/classes and sRGB PNG exactly, and the existing **76,800-pixel** analytical projection/depth/occlusion check passed. Five native/WASM scene comparisons, including seed/index `u32::MAX`, were exactly equal as parsed scene data. Browser generation, comparison display, camera modification/reset, downloaded-scene native replay, trajectory seek/mounted-camera controls and a 390px-wide WebGPU-unavailable fallback were exercised; live WebGPU and fallback screenshots were inspected. Cross-GPU pixel equality and sim-to-real improvement are not claimed.
-
-Two-axis review found one CLI regression: the new help check converted a Unix filename through `std::env::args()`. It was corrected to fallible conversion from `args_os()`; an actual non-UTF-8 output filename changed from a panic to a successful 401-instance PNG render, and focused review cleared the correction. The checkout also lacked the already-declared embedded window skybox; its original Poly Haven CC0 asset was restored and checksum-verified. The ignored Python environment was rebuilt from its lock after its Nix-store interpreter disappeared.
-
-The remaining Phase 4 roadmap below still includes richer scene families, camera/image effects, asynchronous export, downstream dataset adapters and real-data evaluation. This slice does not satisfy the full Phase 4 exit gate.
-
-#### Remaining Phase 4 work
-
-- [ ] **Extend the versioned scene schema and procedural generator beyond the bounded box family**
-  - Add towers, terrain, richer clutter/obstacles, asset references, lights, materials and weather parameters.
-  - Retain generator version, seed and realized parameters across those additions.
-- [ ] **Implement camera and image-domain variation**
-  - Intrinsics/extrinsics, exposure, transfer function, distortion, noise, blur, rolling shutter, and compression as explicit, independently testable stages.
-- [ ] **Implement the asynchronous exporter**
-  - Export color, depth, instance IDs, categories, camera calibration, and optional 2D/3D boxes.
-  - Provide format adapters based on downstream consumers and validate round trips.
-- [ ] **Establish the real-data protocol**
-  - Label ontology, privacy/provenance rules, leakage-resistant splits, baselines, model versions, and confidence intervals.
-- [ ] **Implement evaluation adapters and reports**
-  - Downstream segmentation/detection metrics are primary.
-  - Representation metrics and synthetic-vs-real distribution diagnostics are secondary.
-- [ ] **Tune without test leakage**
-  - Tune generator distributions only on allowed splits; run the held-out real test at declared release gates.
-
-**Exit gate:** Dataset samples are traceable and geometrically validated; at least one complete training/evaluation matrix is reported on an untouched real test split. No fixed mIoU target is set before the dataset, ontology, and baseline exist.
-
-### Phase 5: Evidence-gated research
-
-**Goal:** Add complexity only where a measured baseline exposes a valuable gap.
-
-- [ ] **Adversarial scenario and failure search**
-  - Search valid structured parameters, preserve exact replays, and verify curriculum generalization.
-- [ ] **Learned force/torque residual**
-  - Proceed only with suitable data and improvement on held-out open- and closed-loop metrics.
-- [ ] **Latent predictive model**
-  - Proceed only with a defined planning or sample-efficiency use case and a non-learned baseline.
-- [ ] **Future vehicle-family assessment**
-  - Specify a separate state/contact interface and choose an established contact engine or solver strategy before adding ground vehicles.
-
-**Exit gate:** Each research module independently demonstrates net value under a predeclared evaluation and can be disabled without changing core simulator semantics.
-
----
-
-## 11. Verification Matrix
-
-| Area | Required evidence |
+| Axis | Development / final tests |
 | :--- | :--- |
-| Frame and quaternion conventions | Round-trip basis tests; known 90° rotations; body/world force direction fixtures |
-| Rigid-body dynamics | Analytic special cases, convergence trend, invariant checks, and comparison to a high-accuracy reference |
-| Rotor allocation | Per-rotor force/torque fixtures and symmetric hover equilibrium |
-| IMU | Stationary, free-fall, constant-rate rotation, bias, and sample-rate scaling fixtures |
-| Randomness | Same-seed repeatability; independence from reset order and unrelated environments; distribution checks |
-| Episode semantics | Separate termination/truncation cases; all autoreset modes; preserved final observations and statistics |
-| CUDA adapter | Shape/device failures, non-default stream ordering, absence of steady-state allocation, CPU/GPU numerical comparison |
-| Performance | All four benchmark tiers with full metadata and qualified rate units |
-| Render bridge | Backpressure behavior, dropped-frame accounting, timestamp freshness, staged-path fallback |
-| Visual outputs | Known color, z-depth, ID, occlusion, camera projection, and background fixtures |
-| Recorder | Schema-version rejection/migration behavior and native/web replay consistency |
-| Dataset export | Provenance completeness, format round trip, mask/category integrity, calibration consistency |
-| Sim-to-real claims | Leakage-resistant split, named regimes, per-class metrics, uncertainty, and untouched real test results |
-| Learned modules | Held-out improvement, closed-loop effect, bounded failure behavior, and total compute cost |
+| Geometry | Unseen seeds; unseen parameter ranges; held-out construction families; mixed-family layouts |
+| Appearance | Held-out palettes/textures/lighting; low contrast; sensor corruption; different rendering configuration |
+| Dynamics | Different speed/acceleration ranges; occluded crossing; held-out motion controllers; reactive actors |
+| Camera / actuation | Measured FOV/timing variation; frame drops; blur; command delay and braking variation |
+| Domain | Simulation; real development course; sealed real sites/layouts/sessions |
 
-Numerical tolerances belong to each versioned fixture and are derived from precision, timestep, horizon, and task sensitivity. A single global trajectory-error threshold is not meaningful.
+Match physical task difficulty where possible when comparing sim and real. A success difference across unrelated courses conflates visual transfer with geometry and dynamics shifts. Use simple measured course dimensions for a controlled subset; no scanned digital twin is required.
 
----
+### Primary measurements
 
-## 12. Risks and Decision Gates
+- Real task success without contact, deadline violation, or safety intervention, with numerator and denominator.
+- Collision and intervention rates, completion time, distance traveled, and progress at termination. Stopping indefinitely is a timeout, not success.
+- Sim-to-real success drop in percentage points on matched task strata, with per-stratum results.
+- Environment transitions and GPU-hours to a preregistered success threshold; include tuning and failed-run totals separately.
+- Unique real-video hours and number of interaction trajectories used at each stage.
+- Batch-one inference p50/p95/p99, full capture-to-command age, jitter, and missed control deadlines on the declared deployment setup.
+- Peak total device memory, learner-allocated/reserved memory, host RAM, and renderer/copy/learner timings.
+- Performance per held-out geometry, appearance, and dynamics family, not just a favorable aggregate.
 
-| Risk | Why it matters | Gate or fallback |
+Log simulated time, control steps, physics substeps, rendered images, and optimization steps separately. “Steps per second” must state which step is counted.
+
+### Evidence that the representation transfers
+
+Closed-loop real improvement at controlled data/compute is the main evidence. Support it with:
+
+- Appearance intervention tests on the same physical histories, measuring policy divergence and action-risk rankings.
+- Relevant-change tests where collision geometry, motion, or a task signal changes and the policy must respond differently.
+- Frozen-encoder comparisons with identical small readouts and equal adaptation data/budget, distinguishing representation quality from policy retraining.
+- Temporal ambiguity tests and removal/shuffling of history or action inputs.
+- A decomposition of visual, dynamics, and task-distribution gaps using the evaluation matrix.
+
+Latent similarity, a domain classifier, image reconstruction quality, FID/FVD, depth accuracy, and segmentation accuracy are diagnostics only unless an experiment shows they predict control outcomes. A policy that fails all difficult cases consistently is invariant but useless.
+
+### Baseline ladder
+
+| Baseline | Purpose / fairness requirement |
+| :--- | :--- |
+| Stop, straight-line, and simple reactive controller | Detect reward/evaluation loopholes and establish trivial behavior |
+| Same visual architecture with narrow randomization | Establish the gain from broad randomization |
+| Same visual architecture with broad randomization and ordinary augmentations | Main baseline for paired-render and prediction objectives |
+| Four-frame CNN versus CNN+GRU | Measure the value of memory at similar capacity and budget |
+| DrQ-v2 visual control | Strong off-policy/data-efficiency comparison; account for replay memory and give it an explicit tuning budget |
+| Frozen small DINOv2 features plus the same temporal/action head | Test whether existing real-world visual pretraining is a better use of local compute; disclose imported data and extra resolution/cost |
+| Simulator depth plus small policy; real measured/estimated depth counterpart | Separate control/dynamics difficulty from RGB transfer. Disclose additional sensors/models and measure their latency |
+| Privileged-state policy or critic; privileged teacher/student | Diagnostic upper/reference baselines, not guaranteed upper bounds for every training setup |
+
+The full ladder is not a demand to implement all baselines before the first experiment. Run the controlled same-architecture comparisons first, then the strongest affordable external-feature and off-policy alternatives. Match either transitions or GPU-hours and report both; one matching criterion cannot equalize every resource.
+
+### Statistical protocol
+
+Use at least three independent training seeds for claims beyond a smoke test. Evaluate the same immutable scenario manifest across methods. Randomize/counterbalance real trial order to reduce battery, lighting, and operator effects.
+
+Pilot real testing may use approximately 30 trials per candidate to expose gross failures, not to establish small gains. For finalists, plan approximately 100-200 trials per method across multiple layouts/sessions and training seeds, then choose sample counts from the precision required. Report per-seed results and uncertainty across layout/session clusters; repeated frames and correlated attempts are not independent samples.
+
+Freeze checkpoint selection on development evaluation. Count safety interventions as policy failures, while recording infrastructure failures separately under predeclared rules. An external shield's success must not be attributed to the RGB policy. Record the actual executed commands as well as requested commands.
+
+## 11. First slice: E000, reproducible RGB control loop
+
+**Status: selected, not implemented. Estimated scope: 3-5 engineering days, subject to current renderer throughput.**
+
+The deliverable is a small working experiment, not a new general simulator or a library of shapes.
+
+### Fixed scope
+
+- A separately named `visual_nav_v0` task with planar motion, velocity-response dynamics, finite footprint, and swept collision checks.
+- A short, straight course with randomized offset box/cylinder obstacles and openings, plus empty-course and unavoidable-collision fixtures for diagnostics.
+- 64x64 RGB at a declared camera rate, starting with 16 environments and the existing renderer/readback path.
+- Two continuous velocity commands. Version the speed/acceleration limits, task deadline, success predicate, collision margin, and reward in one resolved task configuration.
+- A four-frame CNN policy and visual critic for integration; no privileged obstacle/depth inputs. Implement a scripted controller for fixed-action replay and comparison.
+- One PPO-style collection/update cycle, checkpoint reload/evaluation, per-episode output, and end-to-end profile.
+- One mandatory paired-render fixture: render the same short fixed-action trajectory with two appearances and verify unchanged physics/outcomes. Large-scale paired rendering and extra representation losses are outside E000.
+
+Start with fixed geometry fixtures, then small seeded variations. The task geometry should be simple enough to inspect without a 3D asset pipeline. Use simulator truth for collision and progress measurements, not actor features.
+
+### Work order and code seams
+
+1. **Run protocol first.** Define resolved configuration, run manifest, named seed streams, terminal episode records, and immutable run-directory creation. Wrap the new task; reuse existing checkpoint/logging code where appropriate.
+2. **Navigation task.** Add a new native task/adapter under `cuda/src/` and `rl/`, without changing the hover/tracking ABI. Specify reset, truncation, final observation, and command timing.
+3. **RGB bridge.** Add a Rust renderer adapter around `crates/sim-graphics/`, with persistent render targets and bounded staging buffers. Document ownership, image conversion, and synchronization; do not assume a `wgpu` texture is a CUDA tensor.
+4. **Closed-loop learner.** Connect image batches, previous actions, and episode masks to a small visual policy. Render the required terminal frame before autoreset; do not bootstrap from a new episode's image.
+5. **Replay and measurement.** Save realized scenes, camera/task configuration, fixed action traces, selected frames, and episode outcomes. Produce a profile and a ledger entry from the resulting run.
+
+For control observations, backpressure or an explicitly simulated stale-frame policy is required when rendering is late. Dropping visualization frames is acceptable; silently dropping or relabeling control frames changes the task.
+
+### Acceptance evidence
+
+- Two fresh-process fixed-action runs with the same realized scenes and stream identities reproduce resets, actor motion, termination causes, and task metrics within declared tolerances.
+- Replaying a realized scene does not invoke the generator. Replaying a different appearance changes RGB without changing the physical trace or task outcome under fixed actions.
+- Multiple environments can reset independently without cross-contaminating images, history, RNG streams, or terminal observations.
+- A visual rollout completes, a learning update produces finite losses and nonzero encoder gradients, and a saved checkpoint can be reloaded for evaluation.
+- A short fixed-fixture learning diagnostic shows the RGB path affects behavior; include an image-shuffle or blank-image diagnostic where geometry varies. A gradient alone is not evidence that vision is used.
+- Inspect actual rendered images and a replay visually. Confirm obstacle/collider alignment and camera orientation on known fixtures.
+- Record measured peak VRAM, stage timings, copying costs, and total artifact size. The 16-environment harness fits the 8 GB device without assuming later scale.
+- Validate manifest/schema references and every required artifact checksum; preserve the failed-run manifest if any gate fails.
+
+Use a pilot compute cap of 2 GPU-hours for E000 smoke/profiling runs. If full-loop cost makes even a tiny learning diagnostic impractical, identify the bottleneck and make one focused rendering/batching change before E001. Do not spend weeks optimizing an unmeasured interoperability design.
+
+## 12. First falsification experiment: E001
+
+**Question:** Does the procedural RGB approach transfer on an easy, observable physical navigation task, and does paired appearance training improve over ordinary randomization?
+
+Keep static opaque obstacles, fixed altitude/heading, slow motion, and one declared camera/control setup. Use simple real box/panel/cylinder arrangements with measured coarse dimensions. A wheeled or camera-rig diagnostic may isolate visual errors, but is not real-flight evidence.
+
+Before hardware trials, demonstrate the velocity-tracking and failsafe checks in section 5 and select a feasible depth/reactive reference, with its sensors, implementation effort, and trial budget included in the E001 specification. Without a functioning reference and measured command response, a poor real RGB result is diagnostically inconclusive, not an isolated visual-transfer failure. Complete the recurrent-learner fixture checks from section 5 before comparing the three arms.
+
+### Arms
+
+- A: CNN+GRU control with narrow appearance randomization and a fixed ordinary-augmentation recipe.
+- B: the identical architecture, learner, and ordinary augmentations with broad appearance randomization.
+- C: B plus valid paired-history representation/policy consistency.
+
+The primary comparison is equal training GPU-hours, not simultaneously equal transitions. Hold geometry sampling, control interface, architecture capacity, ordinary augmentations, and checkpoint-selection protocol fixed. Three training seeds per arm. Choose loss weights only on development data, with an explicit small tuning budget. Count C's extra rendering and representation updates inside its budget.
+
+Start with a fixed 8 GPU-hour training budget per run: nine main runs, at most 72 GPU-hours before separately recorded evaluation and tuning. Do not stop a main run early just because it reaches the success threshold; report time-to-threshold as a secondary endpoint. Save predetermined transition milestones for a secondary equal-transition comparison over the range all arms reach. Record exact completed transitions, budget overshoot at the last update, and failed/censored runs. If a run reaches the cap without learning the simulation task, it is a training/budget failure, not evidence about sim-to-real transfer.
+
+Evaluate held-out simulated geometry and appearance, then zero-shot real development trials before any real-video adaptation. Use a separate sealed final real suite for the later claim. The first iteration should fit roughly within the first two weeks after E000 and hardware access; do not delay real evaluation until the grammar is elaborate.
+
+### Decision gates
+
+Suggested pilot criteria to freeze in the E001 specification before results are viewed:
+
+- Require at least 90% held-out simulation success on the easy course before diagnosing a real gap.
+- If all RGB variants achieve that simulation criterion but less than 50% real success, while an appropriate depth/reactive reference succeeds on at least 90% of comparable trials and timing/control checks pass, reject the current zero-shot visual recipe for this scope.
+- If broad randomization transfers well but paired consistency does not improve results at equal resources, keep the simpler method and reject the extra objective, not the generator concept.
+- If the best RGB variant achieves around 80% or better real pilot success with a modest matched sim-to-real gap, continue to a larger held-out evaluation and dynamic obstacles. This is a development gate, not a statistical proof or deployment threshold.
+- If simulator and reference policies both fail on hardware, fix task observability, control mismatch, or evaluation setup before drawing representation conclusions.
+
+No finite small experiment can falsify every possible procedural-learning method, especially given existing positive prior art. E001 can quickly falsify **this low-data, low-compute recipe on its declared easy task**. Failure there is a strong reason not to spend months on broader geometry and semantics yet.
+
+## 13. Curriculum after a fixed-distribution result
+
+Start E003 only after E001/E002 have stable evaluation. Use a simple mixture, provisionally 50% fresh uniform worlds, 30% replayed high-learning-potential worlds, and 20% local mutations. These weights are hyperparameters, not theory.
+
+Store full realized scenarios and failure traces. Prioritize learnable failures, estimated regret, or improvement on revisit rather than maximum failure alone. Normalize priorities across families and deduplicate nearly identical encounters. Keep a minimum sampling floor for every training family.
+
+Validate reachability, observability, and dynamic feasibility. Cap the contribution of unavoidable or numerically pathological scenarios. Use an independent development suite to decide whether mining helps; never mine the sealed final suite. Compare against uniform sampling at equal total simulation and learner compute, including the cost of searching for hard worlds.
+
+## 14. Result recording
+
+### Versioned specification before each experiment
+
+Assign an experiment ID (`E000`, `E001`, ...), specification version, owner, and date. Commit the question, baseline/variant matrix, task/sensor/action contracts, split manifests, primary endpoint, seed list, transition/GPU-hour caps, checkpoint selection rule, tuning allowance, confidence procedure, and stop/continue criteria before the main run.
+
+Use the selected E000 definition above as the initial specification; implement machine-readable validation in E000. A change after seeing outcomes is a new specification version, with the reason recorded. Keep pilot results distinct from confirmatory results.
+
+### Artifact layout
+
+Use an explicit artifact root, initially ignored `target/experiments/`, with a unique directory per run. Do not overwrite a run or use “latest” as its identity. A run ID should include experiment/spec version, seed, and a unique suffix; identity is not the same as reproducibility.
+
+Each run contains:
+
+| Artifact | Required contents |
+| :--- | :--- |
+| `manifest.json` | Schema version, run/experiment/spec IDs, source revision, start/end/status, hardware/software fingerprint, parent/pretraining references, split/config/checkpoint hashes, data provenance, and reproducibility tier |
+| `config.json` | Fully resolved configuration including defaults, time units, all loss/reward coefficients, schedules, precision settings, task/camera/geometry/dynamics versions, and control interface |
+| `seeds.json` | Root seed, named streams, RNG algorithm/version, stable identity derivation, and actual train/development/final manifest references |
+| `metrics.jsonl` | Append-only training/resource records with control transitions, simulated seconds, images rendered, learner updates, elapsed time, losses, and measured memory |
+| `episodes.jsonl` | One terminal record per evaluated episode: scenario/family/split IDs, success, collision, intervention, termination reason, duration, progress, requested/executed-command trace reference, and sensor mode |
+| `evaluation.json` | Aggregates derived from episode records, denominators, per-family/per-seed values, uncertainty method, checkpoint choice, and evaluation code revision |
+| `checkpoints/` | Policy and declared training state, format version, architecture/config references, and explicit restoration capability |
+| `scenarios/` and `traces/` | Realized selected/failing worlds, actor trajectories/state, actions, timestamps, selected RGB frames/video, and replay metadata |
+| `profile/` | Stage timings, warmup/sample protocol, device-memory samples, profiler traces where requested, and inference measurements |
+| `artifacts.sha256` | Relative paths and checksums of finalized artifacts; exclude this checksum file itself |
+| `report.md` | Short question/result/limitations/decision summary with references to the artifacts, not a replacement for raw records |
+
+For every claim-bearing real trial, retain the exact policy-input stream or losslessly reconstructible inputs, not just selected video clips. Include capture/delivery timestamps, preprocessing version, dropped/stale-frame decisions, recurrent reset markers, requested and executed commands, and intervention events. Link this audit trace from the episode record and durable ledger entry. Auditability does not imply numerically identical policy-in-the-loop replay. Selected clips are sufficient only for illustrative training diagnostics.
+
+During a run, mark status as running. On completion or failure, finalize metadata atomically and checksum the artifact set. If interrupted before finalization, retain the partial run and mark it interrupted during recovery. Do not silently treat missing episodes as successful or remove failed seeds.
+
+Capture only a whitelist of environment metadata. Avoid credentials, complete environment dumps, and unnecessary identifying information in real video. Record collection permissions and access restrictions for any human-containing footage.
+
+### Git and durable storage
+
+Commit experiment specifications, small aggregate reports, schema versions, and [ledger entries](experiments/RESULTS.md). Keep videos, checkpoints, profiles, and bulk episode data out of Git. Before a result is accepted, copy its finalized artifact directory to a configured durable location and record both location and manifest digest in the ledger. An ignored `target/` directory alone is not durable evidence.
+
+The ledger records status (`planned`, `running`, `completed`, `failed`, `inconclusive`, or `superseded`), source revision, run IDs, artifact digest/location, metrics with denominators, resource/data cost, and the next decision. Use `not measured` rather than zero for missing metrics. Include a separate decision history so a changed hypothesis is traceable.
+
+## 15. Reproducibility contract
+
+### Three distinct claims
+
+1. **Scenario reproducibility:** reconstruct the same realized scene, camera/task configuration, motion/controller parameters, and random samples from archived data. Pin serialization and generator versions.
+2. **Numerical replay:** under declared hardware/software and fixed actions, reproduce state/observation/outcome traces within specified tolerances. Exact pixels across GPUs or graphics backends are not promised.
+3. **Statistical reproducibility:** across independent training seeds, reproduce the reported performance distribution and resource costs within uncertainty. A single deterministic seed is not this claim.
+
+State which tier each run supports. Never equate a stored seed with a reproducible learning experiment.
+
+### Seeds, splits, and scenarios
+
+Derive independent streams for geometry, layout, appearance, camera noise, actor intent/motion, vehicle parameters, policy initialization, minibatches, and evaluation. Use a pinned algorithm and canonical identity encoding, with identities such as `(root_seed, split_id, scenario_id, episode_id, stream_id, sample_index)`. Do not use wall-clock scheduling or an implementation-dependent hash to determine samples.
+
+Environment reset order must not perturb another environment's stream. If the implementation promises batching-independent scenario replay, use stable scenario identity rather than batch slot alone and test that promise.
+
+Save realized scene data in addition to seeds, because generator code evolves. Save actor/controller state and random-stream position for dynamic replay; a seed and starting mesh are insufficient. Appearance-pair records must reference the same physical-history digest.
+
+Version immutable split manifests. Keep separate training, development, held-out family, and real final-test manifests. Separate real sites/sessions as well as frames; adjacent clips from the same traversal must not straddle adaptation and final evaluation. Record every use of test data for debugging and reclassify contaminated sets as development.
+
+### Environment and executable provenance
+
+Record the Git revision and dirty status; claim-bearing runs use a clean committed source tree. Exploratory dirty runs require a saved patch and hashes of relevant untracked inputs and are labeled accordingly. Do not capture secrets while recording source provenance.
+
+Record `flake.lock`, `Cargo.lock`, installed Python package versions/lock information, vendored learner commit, compiled native-library hashes, compiler/build flags, GPU model/VRAM, driver, CUDA, PyTorch, graphics backend/adapter, shader/config versions, and precision/determinism settings. Nix pins user-space dependencies, not the physical GPU or host driver.
+
+Store exact launch arguments and resolved paths or content-addressed references. Include imported checkpoint/model identifiers, hashes, licenses, preprocessing, and external data assumptions. On the same environment, request deterministic kernels where supported and document exceptions and their cost.
+
+### Checkpoints and replay
+
+The current training checkpoint includes policy/optimizer/RNG/configuration metadata but does not restore a complete mid-episode simulator trajectory. E000 promises saved-policy evaluation and fixed-action replay, not exact mid-training continuation.
+
+Exact training resume is a later, explicit capability requiring simulator state, episode counters, all RNG states/counters, actor state, recurrent state/history, observation timing/queues, rollout/replay contents, optimizer/scheduler/precision-scaler state, and curriculum state at a synchronized boundary. Test uninterrupted versus resumed execution before claiming it.
+
+For the first slice, restart training from the committed specification when necessary and evaluate saved weights from fresh named scenarios. For replay, distinguish fixed-action physical replay from policy-in-the-loop replay, which can diverge after small numerical observation differences.
+
+### Measurement and verification
+
+- Use simulation timestamps for the environment and monotonic host timestamps for elapsed time; state how real camera/controller clocks are related.
+- Warm up kernels, synchronize at measurement boundaries, and report batch size and capture/inference mode. Do not time asynchronous enqueue calls as completed GPU work.
+- Record PyTorch peak allocated/reserved memory and total device usage covering renderer and CUDA contexts. Measure on an otherwise idle GPU or disclose competing load.
+- Specify numeric tolerances and success margins before comparisons. Borderline collisions or threshold changes require inspection, not silently relaxed tolerances.
+- Test behavioral contracts: seed isolation, geometry/collision agreement, image orientation/timing, independent resets, final frames, checksum validation, and replay. Avoid tests that merely freeze prose or incidental formatting.
+- Run relevant checks from [contributing.md](contributing.md), plus a GPU visual smoke/replay inspection for rendered-observation changes. Publish commands, outcomes, and any unavailable checks in the experiment report.
+
+## 16. Evidence-gated 90-day schedule
+
+Assume access to a controllable camera-equipped platform and a safe test space early in the schedule. If that access is unavailable, label the result simulation-only and do not substitute a video benchmark for closed-loop transfer.
+
+| Days | Work | Required evidence / gate |
 | :--- | :--- | :--- |
-| CUDA/`wgpu` external-memory integration is unavailable or fragile | It is backend-specific and unsafe; WebGPU does not expose raw CUDA pointers | Stage selected snapshots through bounded buffers; keep native interop optional |
-| Rendering saturates memory bandwidth or VRAM | Pixel cost scales with resolution, outputs, and visual cameras—not physics count | Cap `N_visual`, decimate sensor rate, measure megapixels/s, and separate export workloads |
-| Simulator exploits unrealistic dynamics | High RL throughput can optimize model error faster | Validate regimes, randomize justified uncertainty, compare real logs, and retain safety margins |
-| Real-data leakage inflates transfer results | Adjacent video frames and repeated locations are strongly correlated | Split by flight/site/session and hold back a final test set |
-| Kernel fusion obscures correctness | Fused reset/reward/state code can erase terminal data or complicate tests | Preserve the typed `StepResult`; fuse only behind equivalence fixtures |
-| Nondeterminism breaks reproduction | Parallel execution and reset ordering can alter random streams | Counter-based RNG and explicit backend determinism guarantees |
-| Learned residual destabilizes control | Extrapolated force/torque can inject energy | Bound/gate outputs and test closed-loop behavior outside training regimes |
-| Scope expands into a general robotics engine | Contact-rich vehicles require fundamentally different solvers and state | Finish multirotor gates first; design a new adapter only when a second family is funded |
+| 1-5 | E000 harness, run records, scene/action replay, tiny visual learner, profile; identify real camera/controller | Reproducible RGB loop and measured bottlenecks; no claimed transfer |
+| 6-20 | E001 three-arm static experiment; recurrent baseline; held-out geometry/appearance; first real development trials | A measured zero-shot gap with control/observability references; stop or simplify on the E001 failure gate |
+| 21-35 | E002 frame-stack/recurrent comparison, action-conditioned prediction, one crossing and one occluded actor family | Dynamic closed-loop gain over the static/broad-randomization baseline, with memory/action ablations |
+| 36-50 | E003 uniform versus prioritized/mutated worlds; extra independent geometry and motion families | Gains on untouched development families at equal total compute, not just mined worlds |
+| 51-65 | E004 real-video dose curve and frozen-pretrained-feature baseline; selective encoder adaptation | Real success versus unique video hours; no catastrophic loss on synthetic anchor tasks |
+| 66-75 | E005 one semantic convention only if physical transfer works; otherwise spend this interval on diagnosed physical failures | Benefit from explicit semantic information with stale/missing-context tests and measured latency |
+| 76-90 | Freeze methods; strongest affordable baseline comparisons; sealed sim/real evaluation; artifact replay audit | Multi-seed results, failures, data/compute/latency table, and a continue/pivot decision |
 
-### Decisions intentionally left open
+Treat later rows as conditional, not commitments to add complexity regardless of evidence. Budget roughly 300-500 total local GPU-hours for the 90-day study, including failed runs and tuning, then revise after E000 measurements. Do not launch a full Cartesian product of losses, generators, seeds, and video amounts. Screen on development data, then replicate a small finalist set.
 
-These are engineering decisions, not missing theory:
+## 17. Expected first failures and responses
 
-- exact integrator and physics timestep;
-- kernel fusion and launch strategy;
-- internal tensor packing;
-- PyTorch extension mechanism and build system;
-- RL implementation/library;
-- staged-buffer sizing and render batch strategy;
-- whether native CUDA/Vulkan interop is worth maintaining;
-- recording and dataset container formats;
-- scene-search algorithm; and
-- learned model architecture and inference runtime.
+| Likely failure | Diagnostic and next action |
+| :--- | :--- |
+| Renderer/readback dominates | E000 full-loop profile; batch views/reuse targets before considering a bounded custom renderer or native interop |
+| Policy ignores RGB | Vary obstacle layout, shuffle/blank images, inspect encoder gradients and action changes; remove position/seed shortcuts |
+| High sim success, poor real control | Check camera/timing/action response, compare matched courses and a depth/reactive reference, then narrow appearance/sensor failures |
+| Thin/dark obstacles invisible at 64x64 | Measure apparent size/contrast and stopping distance; change resolution, speed, or task envelope |
+| Appearance loss erases useful information | Relevant-change counterexamples, action-risk discrimination, lower weighting or restrict valid intervention pairs |
+| Prediction learns persistence or averages danger | Compare action-free/shuffled-action baselines; use longer informative encounters or a small uncertainty-aware head |
+| Real-video adaptation hurts control | Freeze more of the encoder, replay synthetic anchors, reduce update budget, or keep the zero-shot policy |
+| Curriculum concentrates on impossible cases | Feasibility checks, family floors, deduplication, and a uniform-sampling control |
+| Semantic context arrives too late or is wrong | Shorter validity windows, context-drop training, lower speed, or a faster task-specific path; record intervention |
 
-Changing a fixed physical or observable contract requires a versioned migration. Changing an open engineering choice requires benchmark evidence and must not leak new complexity through the module interface.
-
----
-
-## 13. Design References
-
-- [ROS REP 103: coordinate conventions and SI units](https://www.ros.org/reps/rep-0103.html)
-- [Gymnasium vector environment interface and autoreset semantics](https://gymnasium.farama.org/api/vector/)
-- [DLPack specification](https://dmlc.github.io/dlpack/latest/)
-- [NVIDIA CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-programming-guide/)
-- [`wgpu` 30 `Device` native HAL escape hatches](https://docs.rs/wgpu/30.0.1/wgpu/struct.Device.html#method.as_hal)
+The immediate deliverable is E000 and its evidence bundle. A positive E001 result earns work on dynamics and broader generator families. A negative result should identify which assumption failed before Triage grows another subsystem.
