@@ -6,6 +6,7 @@ This is deliberate E000 instrumentation rather than a zero-copy contract.
 """
 
 import ctypes
+import time
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,8 @@ class RGBEnv:
         self.max_steps = max_steps
         self.width = width
         self.height = height
-        self.observation_shape = (height, width, 12)
+        self.history_frames = 4
+        self.observation_shape = (height, width, self.history_frames * 3)
         self.action_size = 2
         self.device = torch.device(
             "cuda", device
@@ -64,18 +66,21 @@ class RGBEnv:
         self.lib.triage_rgb_destroy.restype = ctypes.c_int
         self.lib.triage_rgb_error.argtypes = []
         self.lib.triage_rgb_error.restype = ctypes.c_char_p
+        self.lib.triage_rgb_timings.argtypes = [p, ctypes.POINTER(ctypes.c_double)]
+        self.lib.triage_rgb_timings.restype = ctypes.c_int
 
         self.handle = self.lib.triage_rgb_create(n, seed, max_steps, width, height)
         if not self.handle:
             self._raise()
+        self.last_step_timings = {}
         self._host_observations = self._view(
-            0, ctypes.c_uint8, (n, *self.observation_shape)
+            0, ctypes.c_uint8, (n, self.history_frames, height, width, 3)
         )
         self._host_rewards = self._view(1, ctypes.c_float, (n,))
         self._host_terminated = self._view(2, ctypes.c_float, (n,))
         self._host_truncated = self._view(3, ctypes.c_float, (n,))
         self._host_final_observations = self._view(
-            4, ctypes.c_uint8, (n, *self.observation_shape)
+            4, ctypes.c_uint8, (n, self.history_frames, height, width, 3)
         )
         self._host_completed_returns = self._view(5, ctypes.c_float, (n,))
         self._host_completed_lengths = self._view(6, ctypes.c_float, (n,))
@@ -111,10 +116,13 @@ class RGBEnv:
 
     def _copy(self, target, source):
         target.copy_(torch.from_numpy(source), non_blocking=False)
+    def _copy_history(self, target, source):
+        channels_last = source.transpose(0, 2, 3, 1, 4).reshape(target.shape)
+        target.copy_(torch.from_numpy(channels_last), non_blocking=False)
 
     def _refresh(self):
-        self._copy(self.observations, self._host_observations)
-        self._copy(self.final_observations, self._host_final_observations)
+        self._copy_history(self.observations, self._host_observations)
+        self._copy_history(self.final_observations, self._host_final_observations)
         self._copy(self.rewards, self._host_rewards)
         self._copy(self.terminated, self._host_terminated)
         self._copy(self.truncated, self._host_truncated)
@@ -130,15 +138,35 @@ class RGBEnv:
             self._raise()
         self.seed = seed
         self._refresh()
+        self.last_step_timings = {}
 
     def step(self, actions):
         if actions.shape != (self.n, self.action_size):
             raise ValueError(f"actions must have shape [{self.n},2]")
+        total_start = time.perf_counter_ns()
+        stage_start = time.perf_counter_ns()
         staged = actions.detach().to("cpu", dtype=torch.float32).contiguous().numpy()
+        action_stage_ms = (time.perf_counter_ns() - stage_start) / 1_000_000.0
         pointer = staged.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        native_start = time.perf_counter_ns()
         if self.lib.triage_rgb_step(self.handle, pointer) != 0:
             self._raise()
+        native_ms = (time.perf_counter_ns() - native_start) / 1_000_000.0
+        copy_start = time.perf_counter_ns()
         self._refresh()
+        observation_copy_ms = (time.perf_counter_ns() - copy_start) / 1_000_000.0
+        timings = (ctypes.c_double * 3)()
+        if self.lib.triage_rgb_timings(self.handle, timings) != 0:
+            self._raise()
+        self.last_step_timings = {
+            "action_stage_ms": action_stage_ms,
+            "native_step_ms": native_ms,
+            "dynamics_ms": timings[0],
+            "render_readback_ms": timings[1],
+            "history_ms": timings[2],
+            "observation_copy_ms": observation_copy_ms,
+            "total_ms": (time.perf_counter_ns() - total_start) / 1_000_000.0,
+        }
 
     def checksum(self):
         return int(self.lib.triage_rgb_checksum(self.handle))
