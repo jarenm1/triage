@@ -2,13 +2,13 @@
 
 Use [PLAN.md](../PLAN.md) for experiment definitions, acceptance gates, artifact schemas, and reproducibility contracts. This ledger records plans, evidence, and decisions; it does not replace per-run artifacts.
 
-Updated: 2026-09-12. No claim-bearing visual-transfer experiments have been run. E000 now has a native staged RGB/PufferLib integration smoke; full replay and provenance evidence remain unfinished.
+Updated: 2026-09-12. E000 implementation, fixed-action replay, artifact recording, visual inspection, and full-loop profiling are complete. Checkpoint reload and the visual-dependence diagnostic remain before E000 acceptance.
 
 ## Experiment register
 
 | ID / spec | Status | Question / scope | Runs and evidence | Decision |
 | :--- | :--- | :--- | :--- | :--- |
-| E000 / 2 | partial | Can we collect, learn from, and replay a small closed-loop RGB navigation task with complete provenance? | Renderer benchmark and a 256-environment staged RGB/PufferLib PPO smoke passed; full replay/provenance evidence not complete | Finish fixed-action replay, artifact records, and visual inspection before E001 |
+| E000 / 2 | partial | Can we collect, learn from, and replay a small closed-loop RGB navigation task with complete provenance? | Renderer benchmark, corrected 256-environment CNN smoke, paired fixed-action replay, artifact records, visual inspection, and VRAM profile complete | Finish checkpoint reload and image-shuffle/blank-image diagnostic before E001 |
 | E001 / draft | planned, conditional on E000 | Does broad procedural RGB randomization transfer, and does paired-history consistency improve it? | Not run; metrics not measured | Freeze exact task/splits/seeds/budgets after E000 profiling, before main runs |
 | E002 / draft | planned, conditional | Do recurrence and action-conditioned prediction improve dynamic/occluded-obstacle control? | Not run | Proceed after static transfer is diagnosed |
 | E003 / draft | planned, conditional | Does prioritized/mutated world sampling outperform uniform sampling at equal total compute? | Not run | Keep final generator families out of mining |
@@ -34,7 +34,7 @@ Updated: 2026-09-12. No claim-bearing visual-transfer experiments have been run.
 
 ## E000 / 2 observed benchmark result
 
-**Status: partial, renderer benchmark and RGB policy smoke complete; full E000 evidence not complete.**
+**Status: partial, integration and replay profile complete; checkpoint and visual-dependence evidence remain.**
 
 - Implementation revision: `2dbb72a6d3e2ba044b66e1c7937270bf91c0d7a9`.
 - Claim run: `target/experiments/e000-rgb-benchmark-256-claim/`; manifest SHA-256 `62e27f1caa2b594bfce1b46d2f9758b02158f8bf4b32807e9a2c1ee25c1c3630`; artifact-set checksum `424824499b926258c21c5ad1235609ede0540ce66de1715c3d62b64a5de74665`.
@@ -48,11 +48,20 @@ Updated: 2026-09-12. No claim-bearing visual-transfer experiments have been run.
 ## E000 / 2 RGB/PufferLib integration smoke
 
 - Native bridge: `apps/rgb-env` renders 256 64x64 views, stages actions host-side, converts RGBA readbacks to four-frame RGB histories, and exposes rewards, termination flags, terminal observations, and episode metrics through `rl/rgb_environment.py`.
-- Integration revision: `6c6634a`.
+- Integration revision: `594b00c`.
 - Smoke command: `nix develop --command cuda/build/rl-venv/bin/python rl/rgb_train.py --num-envs 256 --horizon 4 --steps 1024 --device 0 --library target/release/librgb_env.so`.
-- Result: one 1,024-transition rollout and PPO update completed with finite losses, checksum `6143592202583394605`, 456,901 policy parameters, and PyTorch peak allocated memory of 742,236,160 bytes.
-- Fresh-process seed-29 repeats produced the same checksum: `7993221089584785578` on both runs.
-- This smoke does not claim fixed-action replay, saved checkpoints, full-loop stage timings, total device memory, or visual dependence.
+- Result: corrected frame-major history conversion, one 1,024-transition rollout and PPO update, finite losses, checksum `6115641783539149663`, 456,901 policy parameters, and PyTorch peak allocated memory of 742,236,160 bytes.
+- The earlier `6c6634a` smoke is superseded because its Python view treated native frame-major history as interleaved channels. It is not used as evidence.
+- The corrected reset, terminal, and autoreset samples were visually inspected; env slots 0 and 1 show distinct appearance colors.
+
+## E000 / 2 fixed-action replay and full-loop profile
+
+- Clean source revision: `594b00c`; both fresh-process runs used seed 11, 256 environments, 64x64 RGB, 64 measured steps, two warmup steps, and `max_steps=64`.
+- Runs: `target/experiments/e000-rgb-replay-256-seed11-run3/` artifact set `9dcc821edbf74b400fbfd99479fd48a3f2653bc92dbaca972ffd1d9f745a39bd`; run4 artifact set `988b4e5e86e8fe42b98c70aa99d4c4b2f850479c0bca4feab1bb2f3905ca4e83`.
+- Both runs produced reset/final checksum `092121544e67af15`, trace SHA-256 `0e2b49e626379eb7e529295e2381658853881671581522428b7731be0a617d14`, and identical `actions.jsonl` and `episodes.jsonl` hashes. Each produced 256 truncated episodes at the declared deadline.
+- Mean full-loop step time was **127.08 ms** in run3 and **129.83 ms** in run4, for **2,014** and **1,972 environment-frames/s**. Mean staged components were action host staging **0.05-0.13 ms**, native dynamics **0.003 ms**, render/readback **47.68-48.64 ms**, native history handling **2.29-2.35 ms**, and host-to-learner observation copy/conversion **76.91-78.72 ms**.
+- Peak sampled total device memory was **1,131 MiB** and **1,125 MiB** against an 8,192 MiB device. The full staged harness fits the device budget.
+- Interpretation: fixed actions, terminal observations, autoreset, episode metrics, and RGB delivery are numerically reproducible across fresh processes. The current bottleneck is host observation conversion/copying, not simulation dynamics. The full loop is about 2,000 environment-frames/s versus 5,214 renderer-only frames/s, which identifies zero-copy or fused history conversion as the next performance seam without blocking E000 integration.
 
 ## Per-experiment result entry
 

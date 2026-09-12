@@ -359,7 +359,7 @@ Freeze checkpoint selection on development evaluation. Count safety intervention
 
 ## 11. First slice: E000, reproducible RGB control loop
 
-**Status: selected, not implemented. Estimated scope: 3-5 engineering days, subject to current renderer throughput.**
+**Status: implementation and profiling complete; acceptance evidence partial. The remaining E000 gates are checkpoint reload and the visual-dependence diagnostic.**
 
 The deliverable is a small working experiment, not a new general simulator or a library of shapes.
 
