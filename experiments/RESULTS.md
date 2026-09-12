@@ -48,6 +48,7 @@ Updated: 2026-09-12. No claim-bearing visual-transfer experiments have been run.
 ## E000 / 2 RGB/PufferLib integration smoke
 
 - Native bridge: `apps/rgb-env` renders 256 64x64 views, stages actions host-side, converts RGBA readbacks to four-frame RGB histories, and exposes rewards, termination flags, terminal observations, and episode metrics through `rl/rgb_environment.py`.
+- Integration revision: `6c6634a`.
 - Smoke command: `nix develop --command cuda/build/rl-venv/bin/python rl/rgb_train.py --num-envs 256 --horizon 4 --steps 1024 --device 0 --library target/release/librgb_env.so`.
 - Result: one 1,024-transition rollout and PPO update completed with finite losses, checksum `6143592202583394605`, 456,901 policy parameters, and PyTorch peak allocated memory of 742,236,160 bytes.
 - Fresh-process seed-29 repeats produced the same checksum: `7993221089584785578` on both runs.
