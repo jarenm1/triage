@@ -190,11 +190,14 @@ def task_config(args):
             "eye_offset": [0.0, 2.0, 4.5],
             "target_offset": [0.0, 1.0, -2.0],
         },
-        "obstacles": [
-            {"center": [-1.4, 0.8, -2.4], "scale": [0.9, 1.6, 0.8]},
-            {"center": [1.1, 1.1, -4.2], "scale": [1.5, 2.2, 0.9]},
-            {"center": [-0.1, 0.55, -6.1], "scale": [2.5, 1.1, 0.7]},
-        ],
+        "obstacles": {
+            "base_layout": [
+                {"center": [-1.4, 0.8, -2.4], "scale": [0.9, 1.6, 0.8]},
+                {"center": [1.1, 1.1, -4.2], "scale": [1.5, 2.2, 0.9]},
+                {"center": [-0.1, 0.55, -6.1], "scale": [2.5, 1.1, 0.7]},
+            ],
+            "jitter": "per-(env, episode) mix64 hash of (seed, env, episode, index): center.x +/-0.5 m, center.z +/-0.4 m, scale.x/z 0.85-1.15x, scale.y 0.9-1.1x, center.y = scale.y/2",
+        },
     }
 
 
