@@ -311,11 +311,12 @@ impl RgbEnv {
         );
         let rgba_base = env * self.rgba_frame_bytes;
         let rgb_base = history_base + self.history_bytes - self.frame_bytes;
-        for pixel in 0..self.frame_bytes / 3 {
+        let plane_pixels = self.frame_bytes / 3;
+        for pixel in 0..plane_pixels {
             let source = rgba_base + pixel * 4;
-            let target = rgb_base + pixel * 3;
-            self.observations[target..target + 3]
-                .copy_from_slice(&self.rgba_batch[source..source + 3]);
+            self.observations[rgb_base + pixel] = self.rgba_batch[source];
+            self.observations[rgb_base + plane_pixels + pixel] = self.rgba_batch[source + 1];
+            self.observations[rgb_base + 2 * plane_pixels + pixel] = self.rgba_batch[source + 2];
         }
     }
 

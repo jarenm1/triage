@@ -71,7 +71,7 @@ nix develop --command cuda/build/rl-venv/bin/python rl/rgb_train.py \
   --library target/release/librgb_env.so
 ```
 
-The smoke test exercises staged actions, corrected frame-major RGB histories, autoreset terminal observations, rollout storage, and one PPO update. It is integration evidence, not sim-to-real evidence.
+The smoke test exercises staged actions, channel-first uint8 RGB histories, pinned host staging with double-buffered nonblocking transfers, autoreset terminal observations, rollout storage, and one PPO update. It is integration evidence, not sim-to-real evidence.
 
 The fixed-action replay/profile harness produces immutable run directories with manifest, task configuration, seeds, JSONL metrics and episodes, selected RGB frames, `nvidia-smi` memory samples, and `artifacts.sha256`:
 

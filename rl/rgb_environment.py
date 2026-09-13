@@ -2,7 +2,7 @@
 
 The renderer and the Python learner do not share device memory yet. Actions are
 staged CUDA -> host, and RGB observations are staged host -> learner device.
-Native history storage is frame-major; this adapter converts it to learner NHWC.
+Native history and learner observations use PyTorch's channel-first layout.
 This is deliberate E000 instrumentation rather than a zero-copy contract.
 """
 
@@ -35,7 +35,7 @@ class RGBEnv:
         self.width = width
         self.height = height
         self.history_frames = 4
-        self.observation_shape = (height, width, self.history_frames * 3)
+        self.observation_shape = (self.history_frames * 3, height, width)
         self.action_size = 2
         self.device = torch.device(
             "cuda", device
@@ -75,13 +75,13 @@ class RGBEnv:
             self._raise()
         self.last_step_timings = {}
         self._host_observations = self._view(
-            0, ctypes.c_uint8, (n, self.history_frames, height, width, 3)
+            0, ctypes.c_uint8, (n, self.history_frames * 3, height, width)
         )
         self._host_rewards = self._view(1, ctypes.c_float, (n,))
         self._host_terminated = self._view(2, ctypes.c_float, (n,))
         self._host_truncated = self._view(3, ctypes.c_float, (n,))
         self._host_final_observations = self._view(
-            4, ctypes.c_uint8, (n, self.history_frames, height, width, 3)
+            4, ctypes.c_uint8, (n, self.history_frames * 3, height, width)
         )
         self._host_completed_returns = self._view(5, ctypes.c_float, (n,))
         self._host_completed_lengths = self._view(6, ctypes.c_float, (n,))
@@ -89,9 +89,33 @@ class RGBEnv:
         self._host_current_returns = self._view(8, ctypes.c_float, (n,))
         self._host_current_lengths = self._view(9, ctypes.c_float, (n,))
 
+        if self.device.type == "cuda":
+            self._staging = [
+                (
+                    torch.empty(
+                        (n, *self.observation_shape),
+                        dtype=torch.uint8,
+                        pin_memory=True,
+                    ),
+                    torch.empty(
+                        (n, *self.observation_shape),
+                        dtype=torch.uint8,
+                        pin_memory=True,
+                    ),
+                )
+                for _ in range(2)
+            ]
+            self._staging_events = [torch.cuda.Event() for _ in self._staging]
+            self._staging_recorded = [False] * len(self._staging)
+            self._staging_index = 0
+        else:
+            self._staging = None
+            self._staging_events = None
+            self._staging_recorded = None
+            self._staging_index = None
         self.observations = torch.empty(
-            self.observation_shape, dtype=torch.float32, device=self.device
-        ).expand(n, -1, -1, -1).clone()
+            (n, *self.observation_shape), dtype=torch.uint8, device=self.device
+        )
         self.final_observations = torch.empty_like(self.observations)
         self.rewards = torch.empty(n, dtype=torch.float32, device=self.device)
         self.terminated = torch.empty_like(self.rewards)
@@ -117,13 +141,27 @@ class RGBEnv:
 
     def _copy(self, target, source):
         target.copy_(torch.from_numpy(source), non_blocking=False)
-    def _copy_history(self, target, source):
-        channels_last = source.transpose(0, 2, 3, 1, 4).reshape(target.shape)
-        target.copy_(torch.from_numpy(channels_last), non_blocking=False)
+
+    def _copy_images(self):
+        if self.device.type != "cuda":
+            self.observations.copy_(torch.from_numpy(self._host_observations))
+            self.final_observations.copy_(torch.from_numpy(self._host_final_observations))
+            return
+
+        slot = self._staging_index
+        if self._staging_recorded[slot]:
+            self._staging_events[slot].synchronize()
+        observations, final_observations = self._staging[slot]
+        np.copyto(observations.numpy(), self._host_observations)
+        np.copyto(final_observations.numpy(), self._host_final_observations)
+        self.observations.copy_(observations, non_blocking=True)
+        self.final_observations.copy_(final_observations, non_blocking=True)
+        self._staging_events[slot].record(torch.cuda.current_stream(self.device))
+        self._staging_recorded[slot] = True
+        self._staging_index = (slot + 1) % len(self._staging)
 
     def _refresh(self):
-        self._copy_history(self.observations, self._host_observations)
-        self._copy_history(self.final_observations, self._host_final_observations)
+        self._copy_images()
         self._copy(self.rewards, self._host_rewards)
         self._copy(self.terminated, self._host_terminated)
         self._copy(self.truncated, self._host_truncated)
