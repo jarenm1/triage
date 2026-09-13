@@ -1719,6 +1719,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rgb-env"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam",
+ "pollster",
+ "sim-graphics",
+ "wgpu",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

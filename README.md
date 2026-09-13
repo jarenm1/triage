@@ -52,9 +52,9 @@ cuda/build/rl-venv/bin/python -m rl.train train --task hover
 
 The setup command installs Python dependencies and builds the simulator. Training saves a checkpoint to `cuda/build/hover.pt`.
 
-## Benchmark the RGB rendering path
+## Benchmark and smoke-test the RGB control loop
 
-E000 currently benchmarks the staged renderer path at 256 independent camera views. It writes a manifest, per-step JSONL metrics, a summary, and one sample image under the requested output directory:
+E000 benchmarks the staged renderer path at 256 independent camera views. It writes a manifest, per-step JSONL metrics, a summary, and one sample image under the requested output directory:
 
 ```sh
 cargo run -p rgb-benchmark --release -- \
@@ -62,7 +62,16 @@ cargo run -p rgb-benchmark --release -- \
   --output target/experiments/e000-rgb-benchmark-256
 ```
 
-This measures rendered RGB throughput and readback. It is not yet the RGB-to-PufferLib policy bridge; that is the next E000 implementation step.
+The native RGB environment and CNN/PufferLib smoke learner can be run inside `nix develop` after building the shared library:
+
+```sh
+cargo build -p rgb-env --release
+nix develop --command cuda/build/rl-venv/bin/python rl/rgb_train.py \
+  --num-envs 256 --horizon 4 --steps 1024 --device 0 \
+  --library target/release/librgb_env.so
+```
+
+The smoke test exercises staged actions, RGB histories, autoreset terminal observations, rollout storage, and one PPO update. It is integration evidence, not sim-to-real evidence.
 
 ## Code
 
