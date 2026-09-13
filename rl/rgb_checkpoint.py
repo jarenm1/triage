@@ -17,6 +17,7 @@ def save_checkpoint(path, *, policy, learner, env, seed):
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "schema": SCHEMA,
+        "recurrent": bool(getattr(policy, "recurrent", False)),
         "seed": int(seed),
         "observation_shape": tuple(env.observation_shape),
         "action_size": int(env.action_size),
@@ -55,6 +56,10 @@ def load_checkpoint(path, *, policy, learner=None, env=None, expected_config=Non
         for key, value in expected_config.items():
             if key != "total_timesteps" and saved_config.get(key) != value:
                 raise ValueError(f"checkpoint config mismatch for {key}")
+    if bool(checkpoint.get("recurrent", False)) != bool(
+        getattr(policy, "recurrent", False)
+    ):
+        raise ValueError("checkpoint policy kind does not match the given policy")
     policy.load_state_dict(checkpoint["policy"])
     if learner is not None:
         learner.optimizer.load_state_dict(checkpoint["optimizer"])
