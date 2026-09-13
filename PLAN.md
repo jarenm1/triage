@@ -1,4 +1,4 @@
-# Triage: procedural visual control and sim-to-real transfer
+# Triage: a procedural data/RL framework for visual control
 
 Updated: 2026-09-12. Status: research direction and implementation plan, not a report of demonstrated visual transfer.
 
@@ -6,11 +6,12 @@ Updated: 2026-09-12. Status: research direction and implementation plan, not a r
 
 Build Triage around a testable question:
 
-**Can a small recurrent RGB policy learn transferable collision avoidance from cheap, diverse procedural simulation, with little deployment-domain data and no manually labeled perception dataset?**
+**Can a reusable RL framework learn control from procedurally generated observations, without real-world training data or manual labels, and support transfer across embodied tasks?**
 
 The main training path is `synthetic RGB history -> learned representation -> RL policy -> control`; deployment substitutes real camera observations. Simulator state can support rewards, diagnostics, auxiliary targets, and a critic experiment. It does not define the canonical visual latent or an obligatory privileged teacher.
 
 Start with slow, local navigation through opaque obstacles, at fixed altitude and approximately fixed heading. Add dynamic obstacles after static transfer works. General navigation, open-world semantics, and aggressive six-degree-of-freedom flight are later claims requiring separate evidence.
+The framework is the primary goal. Drones are the first proving task because they expose visual control, temporal observation, latency, and sim-to-real issues in a concrete setting. Later tasks should reuse the data generation, task, sensor, action, learner, replay, and evaluation contracts rather than require a new research stack.
 
 ### Decisions
 
