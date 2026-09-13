@@ -2,13 +2,13 @@
 
 Use [PLAN.md](../PLAN.md) for experiment definitions, acceptance gates, artifact schemas, and reproducibility contracts. This ledger records plans, evidence, and decisions; it does not replace per-run artifacts.
 
-Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recording, visual inspection, full-loop profiling, checkpoint reload/resume, and the visual-dependence diagnostic are complete. The blank-image arm shows the policy responds to visual input; the shuffle arm is inconclusive because the current fixture's scenes are near-identical across environments.
+Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recording, visual inspection, full-loop profiling, checkpoint reload/resume, and the visual-dependence diagnostic are complete. Blank-image arm passes; the shuffle arm shows the policy is scene-invariant because all environments share identical geometry — per-env geometry variation is the next prerequisite.
 
 ## Experiment register
 
 | ID / spec | Status | Question / scope | Runs and evidence | Decision |
 | :--- | :--- | :--- | :--- | :--- |
-| E000 / 2 | partial | Can we collect, learn from, and replay a small closed-loop RGB navigation task with complete provenance? | Renderer benchmark, corrected 256-environment CNN smoke, paired fixed-action replay, artifact records, visual inspection, VRAM profile, checkpoint reload/resume, and visual-dependence diagnostic complete | Blank arm passes; rerun shuffle on a visually diverse fixture before E001 |
+| E000 / 2 | partial | Can we collect, learn from, and replay a small closed-loop RGB navigation task with complete provenance? | Renderer benchmark, corrected 256-environment CNN smoke, paired fixed-action replay, artifact records, visual inspection, VRAM profile, checkpoint reload/resume, and visual-dependence diagnostic complete | Blank arm passes; shuffle needs per-env geometry variation, which E001 requires anyway |
 | E001 / draft | planned, conditional on E000 | Does broad procedural RGB randomization transfer, and does paired-history consistency improve it? | Not run; metrics not measured | Freeze exact task/splits/seeds/budgets after E000 profiling, before main runs |
 | E002 / draft | planned, conditional | Do recurrence and action-conditioned prediction improve dynamic/occluded-obstacle control? | Not run | Proceed after static transfer is diagnosed |
 | E003 / draft | planned, conditional | Does prioritized/mutated world sampling outperform uniform sampling at equal total compute? | Not run | Keep final generator families out of mining |
@@ -34,7 +34,7 @@ Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recordin
 
 ## E000 / 2 observed benchmark result
 
-**Status: partial, integration, replay profile, checkpoint reload, and visual-dependence diagnostic complete; shuffle arm needs a diverse-scene fixture.**
+**Status: partial, integration, replay profile, checkpoint reload, and visual-dependence diagnostic complete; shuffle arm needs per-env geometry variation.**
 
 - Implementation revision: `2dbb72a6d3e2ba044b66e1c7937270bf91c0d7a9`.
 - Claim run: `target/experiments/e000-rgb-benchmark-256-claim/`; manifest SHA-256 `62e27f1caa2b594bfce1b46d2f9758b02158f8bf4b32807e9a2c1ee25c1c3630`; artifact-set checksum `424824499b926258c21c5ad1235609ede0540ce66de1715c3d62b64a5de74665`.
@@ -66,11 +66,11 @@ Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recordin
 
 - Verification revision: `c575479a` (`rl/rgb_diagnostic.py`); policy checkpoint at 16,384 transitions, seed 11, 256 environments, 256 deterministic (`distribution.mean`) steps per mode.
 - Artifacts: `target/experiments/e000/diagnostic.json` (2,048-step policy) and `target/experiments/e000/diagnostic-16k.json` (16,384-step policy).
-- Result at 16k: normal reward/step **+0.001287**, mean action **[0.0552, -0.0162]**; blank reward/step **-0.000683**, mean action **[0.0221, -0.0046]** — a ~2.5x action shift and reward sign flip. The CNN policy measurably responds to visual input; the RGB path is behaviorally live.
-- Shuffle arm inconclusive: normal vs shuffle differ only ~5e-6 in mean action. Measured cause: environments' images differ by only ~4/255 mean absolute pixel intensity (per-env mean std 0.89), so swapping images across the batch is nearly a null intervention on this fixture. The arm cannot detect per-env scene dependence until fixtures render visibly distinct scenes per environment.
-- At 2k steps all three modes were near-identical near-zero actions, consistent with an undertrained actor head (init scale 0.01); the blank divergence emerged only after training.
+- Shuffle arm inconclusive at 16k: normal vs shuffle differed only ~5e-6 in mean action. First suspected cause — near-identical scenes (~4/255 mean pixel difference) — was fixed by seeded per-env appearance variation (floor + obstacle colors, `mix64`-hashed from seed and env index; ~27-62/255 pairwise difference, per-env mean std 17.9).
+- Shuffle remains flat at 32k on the varied-appearance fixture (normal vs shuffle mean action delta ~5e-5; blank still diverges ~3x). Measured cause: all environments share one fixed obstacle layout, so a scene-invariant policy is correct on this fixture — the task never requires per-scene discrimination. The diagnostic is functioning; it has measured that geometry variation, not appearance, is the missing ingredient.
+- Artifact: `target/experiments/e000/diagnostic-32k-varied.json`. Appearance variation is seeded per env and episode-persistent; geometry and physics contract unchanged.
+- Interpretation: E000's "RGB path affects behavior" gate is met at the coarse level (blank vs rendered). Per-scene dependence requires per-env geometry variation, which E001's held-out-geometry design requires anyway; defer the conclusive shuffle result to that fixture.
 - No episodes completed in any mode within 256 steps (max-steps 2000); termination-based endpoints were not exercised.
-- Interpretation: E000's "RGB path affects behavior" gate is met at the coarse level (blank vs rendered). Fine-grained per-scene dependence remains unproven and is deferred to a diverse-appearance fixture, which E001's randomization arms will require anyway.
 
 ## E000 / 2 fixed-action replay and full-loop profile
 
