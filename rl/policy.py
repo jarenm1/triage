@@ -45,13 +45,13 @@ class HoverPolicy(nn.Module):
 class RGBPolicy(nn.Module):
     """Small feed-forward RGB policy for E000's staged visual loop."""
 
-    def __init__(self, observation_shape=(64, 64, 12), hidden_size=128):
+    def __init__(self, observation_shape=(12, 64, 64), hidden_size=128):
         super().__init__()
         if len(observation_shape) != 3:
-            raise ValueError("observation_shape must be height, width, channels")
+            raise ValueError("observation_shape must be channels, height, width")
         self.observation_shape = tuple(observation_shape)
         self.action_size = 2
-        channels = self.observation_shape[-1]
+        channels = self.observation_shape[0]
         self.encoder = nn.Sequential(
             nn.Conv2d(channels, 32, 5, stride=2, padding=2),
             nn.ReLU(),
@@ -80,8 +80,8 @@ class RGBPolicy(nn.Module):
 
     def forward(self, observations):
         observations = observations.reshape(-1, *self.observation_shape)
-        channels_last = observations.float() / 255.0
-        features = self.encoder(channels_last.permute(0, 3, 1, 2).contiguous())
+        channels_first = observations.float() / 255.0
+        features = self.encoder(channels_first)
         mean = self.actor(features)
         distribution = torch.distributions.Normal(
             mean,

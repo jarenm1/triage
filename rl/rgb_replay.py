@@ -21,7 +21,7 @@ import torch
 from rl.rgb_environment import RGBEnv
 
 
-SCHEMA = "E000/2-rgb-replay-v1"
+SCHEMA = "E000/2-rgb-replay-v2"
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -81,7 +81,13 @@ def write_png(path, rgb):
 
 
 def latest_rgb(observations, environment=0):
-    array = observations[environment, :, :, -3:].detach().to("cpu").numpy()
+    array = (
+        observations[environment, -3:]
+        .detach()
+        .to("cpu")
+        .permute(1, 2, 0)
+        .numpy()
+    )
     return np.clip(array, 0, 255).astype(np.uint8)
 
 
@@ -153,8 +159,8 @@ def task_config(args):
         "resolution": [args.height, args.width],
         "max_steps": args.max_steps,
         "observation": {
-            "layout": "NHWC",
-            "shape_per_environment": [args.height, args.width, 12],
+            "layout": "NCHW",
+            "shape_per_environment": [12, args.height, args.width],
             "history_frames": 4,
             "channels": "RGB",
             "terminal_observation": "pre_autoreset_history",
