@@ -10,7 +10,7 @@ if __package__ in (None, ""):
 
 import torch
 
-from rl.policy import RGBPolicy
+from rl.policy import RGBPolicy, RecurrentRGBPolicy
 from rl.rgb_checkpoint import load_checkpoint
 from rl.rgb_environment import RGBEnv
 
@@ -43,7 +43,8 @@ def run_mode(args, mode):
         device=args.device,
         library=args.library,
     ) as env:
-        policy = RGBPolicy(env.observation_shape).to(env.device)
+        policy_cls = RecurrentRGBPolicy if args.recurrent else RGBPolicy
+        policy = policy_cls(env.observation_shape).to(env.device)
         load_checkpoint(args.checkpoint, policy=policy, env=env)
         reward_sum = torch.zeros((), device=env.device)
         action_sum = torch.zeros(env.action_size, device=env.device)
@@ -53,14 +54,22 @@ def run_mode(args, mode):
         completed = torch.zeros((), device=env.device)
         completed_return_sum = torch.zeros((), device=env.device)
         completed_length_sum = torch.zeros((), device=env.device)
+        state = policy.initial_state(args.num_envs, env.device)
+        prev_action = torch.zeros(args.num_envs, env.action_size, device=env.device)
         for _ in range(args.steps):
             observations = transformed_observations(env.observations, mode)
-            distribution, _, _ = policy.forward_eval(observations)
+            distribution, _, state = policy.forward_eval(
+                observations, state, prev_action
+            )
             actions = distribution.mean
             action_sum += actions.sum(dim=0)
             action_abs_sum += actions.abs().sum(dim=0)
             env.step(actions)
             done = (env.terminated + env.truncated) > 0
+            if getattr(policy, "recurrent", False):
+                reset = done.unsqueeze(-1).float()
+                state = state * (1.0 - reset)
+                prev_action = actions * (1.0 - reset)
             reward_sum += env.rewards.sum()
             terminated += env.terminated.sum()
             truncated += env.truncated.sum()
@@ -100,6 +109,7 @@ def main():
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--library")
+    parser.add_argument("--recurrent", action="store_true")
     args = parser.parse_args()
     if args.num_envs <= 0 or args.steps <= 0 or args.max_steps <= 0:
         parser.error("num-envs, steps and max-steps must be positive")

@@ -171,15 +171,18 @@ impl RgbEnv {
             let collision = collides(self.seed, env, state.episode, state.x, state.z);
             let success = state.z <= -7.0;
             let timeout = state.length >= self.max_steps;
-            let reward = -0.002 + (-state.vz).max(0.0) * 0.08;
-            self.rewards[env] = reward
-                + if collision {
-                    -1.0
-                } else if success {
-                    1.0
-                } else {
-                    0.0
-                };
+            // Progress reward only counts on survival, and the collision
+            // penalty exceeds what a blind charge can accumulate (~+8 over
+            // the ~150 steps to the wall): blindness must score worse than
+            // standing still, or the task does not require reading the scene.
+            let reward = if collision {
+                -10.0
+            } else if success {
+                1.0
+            } else {
+                -0.002 + (-state.vz).max(0.0) * 0.08
+            };
+            self.rewards[env] = reward;
             state.return_ += self.rewards[env];
             self.terminated[env] = f32::from(collision || success);
             self.truncated[env] = f32::from(timeout && !collision && !success);
@@ -367,27 +370,53 @@ impl RgbEnv {
     }
 }
 
-fn obstacles(seed: u64, env: usize, episode: u64) -> [(Vec3, Vec3); 3] {
-    // Same base course everywhere; per-(env, episode) jitter varies the layout
-    // while keeping the corridor traversable and the physics contract fixed.
+fn obstacles(seed: u64, env: usize, episode: u64) -> [(Vec3, Vec3); 5] {
+    // Per-(env, episode) seeded layout. The wall's gap position is drawn from
+    // the same stream, so a blind forward policy always collides: the course
+    // cannot be solved without reading the scene.
+    let stream = mix64(
+        seed ^ mix64((env as u64).wrapping_mul(0x9e3779b97f4a7c15))
+            ^ mix64(episode.wrapping_mul(0x85ebca6b)),
+    );
+    let jitter = |index: u64, shift: u32| {
+        let value = mix64(stream.wrapping_add(index.wrapping_mul(0xc2b2ae35)));
+        ((value >> shift) & 1023) as f32 / 1023.0
+    };
     let mut layout = [
         (Vec3::new(-1.4, 0.8, -2.4), Vec3::new(0.9, 1.6, 0.8)),
         (Vec3::new(1.1, 1.1, -4.2), Vec3::new(1.5, 2.2, 0.9)),
         (Vec3::new(-0.1, 0.55, -6.1), Vec3::new(2.5, 1.1, 0.7)),
+        (Vec3::ZERO, Vec3::ZERO),
+        (Vec3::ZERO, Vec3::ZERO),
     ];
-    for (index, (position, scale)) in layout.iter_mut().enumerate() {
-        let value = mix64(
-            seed ^ mix64((env as u64).wrapping_mul(0x9e3779b97f4a7c15))
-                ^ mix64(episode.wrapping_mul(0x85ebca6b))
-                    .wrapping_add((index as u64 + 1).wrapping_mul(0xc2b2ae35)),
-        );
-        position.x += ((value & 1023) as f32 / 1023.0 - 0.5) * 1.0;
-        position.z += (((value >> 10) & 1023) as f32 / 1023.0 - 0.5) * 0.8;
-        scale.x *= 0.85 + ((value >> 20) & 1023) as f32 / 1023.0 * 0.3;
-        scale.z *= 0.85 + ((value >> 30) & 1023) as f32 / 1023.0 * 0.3;
-        scale.y *= 0.9 + ((value >> 40) & 1023) as f32 / 1023.0 * 0.2;
-        position.y = scale.y * 0.5;
+    for (index, (position, scale)) in layout[..3].iter_mut().enumerate() {
+        let index = index as u64 + 1;
+        position.x += (jitter(index, 0) - 0.5) * 1.0;
+        position.z += (jitter(index, 10) - 0.5) * 0.8;
+        scale.x *= 0.85 + jitter(index, 20) * 0.3;
+        scale.z *= 0.85 + jitter(index, 30) * 0.3;
     }
+    // Wall across the corridor at z = -5.2 with a gap of half-width 1.5
+    // centered at gap_x in [-2.6, 2.6]. Two boxes fill the sides. The z slot
+    // sits between the second and third jittered obstacles' ranges. The gap
+    // is wide enough to learn within the E001 budget but still requires
+    // steering toward the observed position.
+    let gap_x = (jitter(4, 0) - 0.5) * 5.2;
+    let gap_half = 1.5f32;
+    let wall_z = -5.2f32;
+    let wall_half_z = 0.15f32;
+    let wall_y = 1.2f32;
+    let corridor_half = 4.5f32;
+    let left_width = (gap_x - gap_half) - (-corridor_half);
+    let right_width = corridor_half - (gap_x + gap_half);
+    layout[3] = (
+        Vec3::new(-corridor_half + left_width * 0.5, wall_y * 0.5, wall_z),
+        Vec3::new(left_width.max(0.01), wall_y, wall_half_z * 2.0),
+    );
+    layout[4] = (
+        Vec3::new(gap_x + gap_half + right_width * 0.5, wall_y * 0.5, wall_z),
+        Vec3::new(right_width.max(0.01), wall_y, wall_half_z * 2.0),
+    );
     layout
 }
 
