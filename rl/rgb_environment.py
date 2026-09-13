@@ -88,6 +88,7 @@ class RGBEnv:
         self._host_episode_counts = self._view(7, ctypes.c_uint64, (n,))
         self._host_current_returns = self._view(8, ctypes.c_float, (n,))
         self._host_current_lengths = self._view(9, ctypes.c_float, (n,))
+        self._host_successes = self._view(10, ctypes.c_float, (n,))
 
         if self.device.type == "cuda":
             self._staging = [
@@ -125,6 +126,7 @@ class RGBEnv:
         self.episode_counts = torch.empty(n, dtype=torch.uint64, device=self.device)
         self.current_returns = torch.empty_like(self.rewards)
         self.current_lengths = torch.empty_like(self.rewards)
+        self.successes = torch.empty_like(self.rewards)
         self._refresh()
 
     def _view(self, field, ctype, shape):
@@ -170,6 +172,7 @@ class RGBEnv:
         self._copy(self.episode_counts, self._host_episode_counts)
         self._copy(self.current_returns, self._host_current_returns)
         self._copy(self.current_lengths, self._host_current_lengths)
+        self._copy(self.successes, self._host_successes)
 
     def reset(self, seed=None):
         seed = self.seed if seed is None else seed

@@ -51,6 +51,7 @@ pub struct RgbEnv {
     rewards: Vec<f32>,
     terminated: Vec<f32>,
     truncated: Vec<f32>,
+    successes: Vec<f32>,
     completed_returns: Vec<f32>,
     completed_lengths: Vec<f32>,
     episode_counts: Vec<u64>,
@@ -102,6 +103,7 @@ impl RgbEnv {
             rewards: vec![0.0; n],
             terminated: vec![0.0; n],
             truncated: vec![0.0; n],
+            successes: vec![0.0; n],
             completed_returns: vec![0.0; n],
             completed_lengths: vec![0.0; n],
             episode_counts: vec![0; n],
@@ -124,6 +126,7 @@ impl RgbEnv {
         self.rewards.fill(0.0);
         self.terminated.fill(0.0);
         self.truncated.fill(0.0);
+        self.successes.fill(0.0);
         self.completed_returns.fill(0.0);
         self.completed_lengths.fill(0.0);
         self.episode_counts.fill(0);
@@ -151,6 +154,7 @@ impl RgbEnv {
         self.rewards.fill(0.0);
         self.terminated.fill(0.0);
         self.truncated.fill(0.0);
+        self.successes.fill(0.0);
         self.completed_returns.fill(0.0);
         self.completed_lengths.fill(0.0);
 
@@ -184,8 +188,9 @@ impl RgbEnv {
             };
             self.rewards[env] = reward;
             state.return_ += self.rewards[env];
-            self.terminated[env] = f32::from(collision || success);
             self.truncated[env] = f32::from(timeout && !collision && !success);
+            self.successes[env] = f32::from(success);
+            self.terminated[env] = f32::from(collision || success);
             done[env] = collision || success || timeout;
         }
 
@@ -349,6 +354,7 @@ impl RgbEnv {
             7 => self.episode_counts.as_mut_ptr().cast(),
             8 => self.current_returns.as_mut_ptr().cast(),
             9 => self.current_lengths.as_mut_ptr().cast(),
+            10 => self.successes.as_mut_ptr().cast(),
             _ => std::ptr::null_mut(),
         }
     }

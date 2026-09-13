@@ -94,6 +94,12 @@ Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recordin
 - Diagnostic on the wall course (`diagnostic-gru-wall3.json`): normal vs shuffle remain near-identical and blank diverges ~3x. The shuffle arm is now gated on policy competence on a vision-required course, not on fixture diversity or reward structure. A conclusive result is expected once an E001 arm trains to competence at the 25M-transition budget.
 - Interpretation: the course now satisfies the "correct action depends on the observed scene" requirement. The remaining shuffle question is whether a *competent* policy uses per-scene information, which requires the full E001 training budget to answer.
 
+## E001 / 1 held-out evaluation harness
+
+- `rl/rgb_evaluate.py` loads a checkpoint (feed-forward or `--recurrent`), rolls deterministic mean actions on a chosen seed/split, and writes `episodes.jsonl`, `evaluation.json`, `config.json`, `seeds.json`, `manifest.json`, and `artifacts.sha256` into a fresh run directory.
+- The native env now exposes a per-env `successes` buffer (field 10) so episode records distinguish success from collision; a dropped `state.return_` accumulation was restored after eval showed zeroed returns.
+- Smoke run: `target/experiments/e001-eval-dev-seed101/` — the 131k-step GRU checkpoint on development seed 101 produced 929 episodes, all collisions, mean return -7.45, matching the diagnostic's -7.59. The harness is validated; the policy is not yet competent.
+
 ## E000 / 2 fixed-action replay and full-loop profile
 
 - Clean source revision: `594b00c`; both fresh-process runs used seed 11, 256 environments, 64x64 RGB, 64 measured steps, two warmup steps, and `max_steps=64`.
