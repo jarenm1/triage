@@ -2,13 +2,13 @@
 
 Use [PLAN.md](../PLAN.md) for experiment definitions, acceptance gates, artifact schemas, and reproducibility contracts. This ledger records plans, evidence, and decisions; it does not replace per-run artifacts.
 
-Updated: 2026-09-12. E000 implementation, fixed-action replay, artifact recording, visual inspection, and full-loop profiling are complete. Checkpoint reload and the visual-dependence diagnostic remain before E000 acceptance.
+Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recording, visual inspection, full-loop profiling, and checkpoint reload/resume are complete. The visual-dependence diagnostic remains before E000 acceptance.
 
 ## Experiment register
 
 | ID / spec | Status | Question / scope | Runs and evidence | Decision |
 | :--- | :--- | :--- | :--- | :--- |
-| E000 / 2 | partial | Can we collect, learn from, and replay a small closed-loop RGB navigation task with complete provenance? | Renderer benchmark, corrected 256-environment CNN smoke, paired fixed-action replay, artifact records, visual inspection, and VRAM profile complete | Finish checkpoint reload and image-shuffle/blank-image diagnostic before E001 |
+| E000 / 2 | partial | Can we collect, learn from, and replay a small closed-loop RGB navigation task with complete provenance? | Renderer benchmark, corrected 256-environment CNN smoke, paired fixed-action replay, artifact records, visual inspection, VRAM profile, and checkpoint reload/resume complete | Finish image-shuffle/blank-image diagnostic before E001 |
 | E001 / draft | planned, conditional on E000 | Does broad procedural RGB randomization transfer, and does paired-history consistency improve it? | Not run; metrics not measured | Freeze exact task/splits/seeds/budgets after E000 profiling, before main runs |
 | E002 / draft | planned, conditional | Do recurrence and action-conditioned prediction improve dynamic/occluded-obstacle control? | Not run | Proceed after static transfer is diagnosed |
 | E003 / draft | planned, conditional | Does prioritized/mutated world sampling outperform uniform sampling at equal total compute? | Not run | Keep final generator families out of mining |
@@ -34,7 +34,7 @@ Updated: 2026-09-12. E000 implementation, fixed-action replay, artifact recordin
 
 ## E000 / 2 observed benchmark result
 
-**Status: partial, integration and replay profile complete; checkpoint and visual-dependence evidence remain.**
+**Status: partial, integration, replay profile, and checkpoint reload complete; visual-dependence evidence remains.**
 
 - Implementation revision: `2dbb72a6d3e2ba044b66e1c7937270bf91c0d7a9`.
 - Claim run: `target/experiments/e000-rgb-benchmark-256-claim/`; manifest SHA-256 `62e27f1caa2b594bfce1b46d2f9758b02158f8bf4b32807e9a2c1ee25c1c3630`; artifact-set checksum `424824499b926258c21c5ad1235609ede0540ce66de1715c3d62b64a5de74665`.
@@ -53,6 +53,14 @@ Updated: 2026-09-12. E000 implementation, fixed-action replay, artifact recordin
 - Result: corrected frame-major history conversion, one 1,024-transition rollout and PPO update, finite losses, checksum `6115641783539149663`, 456,901 policy parameters, and PyTorch peak allocated memory of 742,236,160 bytes.
 - The earlier `6c6634a` smoke is superseded because its Python view treated native frame-major history as interleaved channels. It is not used as evidence.
 - The corrected reset, terminal, and autoreset samples were visually inspected; env slots 0 and 1 show distinct appearance colors.
+
+## E000 / 2 checkpoint reload and training resume
+
+- Verification revision: `c575479a` (`rl/rgb_checkpoint.py`, `rl/rgb_train.py --resume`).
+- Commands: `rl/rgb_train.py --num-envs 256 --horizon 4 --steps 1024 --checkpoint target/experiments/e000/checkpoint.pt`, then `--steps 2048 --resume target/experiments/e000/checkpoint.pt` (same seed 11, device 0, `librgb_env.so`).
+- Result: the resumed run restored policy, optimizer, `epoch`/`global_step` counters, and RNG state; it continued from step 1,024 to 2,048 with finite losses and re-saved the checkpoint. The saved checkpoint records `epoch=2`, `global_step=2048`, SHA-256 `b55ebc42120080e4b09de8dc607aebeac227ab35d2640972cc84b3711b3267c4` (3,671,989 bytes).
+- A separate eval-only load (`load_checkpoint` without a learner) restored the policy, passed observation/action-shape checks, and produced finite action distributions and values on fresh observations.
+- Limitation per PLAN.md section "Checkpoints and replay": resume restores learner state, not a mid-episode simulator trajectory; the environment restarts from its seed. Exact mid-training continuation remains a later capability.
 
 ## E000 / 2 fixed-action replay and full-loop profile
 
