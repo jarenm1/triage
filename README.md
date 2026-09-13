@@ -52,6 +52,18 @@ cuda/build/rl-venv/bin/python -m rl.train train --task hover
 
 The setup command installs Python dependencies and builds the simulator. Training saves a checkpoint to `cuda/build/hover.pt`.
 
+## Benchmark the RGB rendering path
+
+E000 currently benchmarks the staged renderer path at 256 independent camera views. It writes a manifest, per-step JSONL metrics, a summary, and one sample image under the requested output directory:
+
+```sh
+cargo run -p rgb-benchmark --release -- \
+  --envs 256 --steps 10 --warmup 2 --width 64 --height 64 \
+  --output target/experiments/e000-rgb-benchmark-256
+```
+
+This measures rendered RGB throughput and readback. It is not yet the RGB-to-PufferLib policy bridge; that is the next E000 implementation step.
+
 ## Code
 
 - `cuda/` — drone physics

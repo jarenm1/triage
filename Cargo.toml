@@ -6,6 +6,7 @@ members = [
   "crates/sim-scene",
   "crates/sim-trajectory",
   "apps/render-smoke",
+  "apps/rgb-benchmark",
   "apps/window-demo",
   "apps/web-demo",
 ]
