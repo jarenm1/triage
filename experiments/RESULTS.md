@@ -86,6 +86,14 @@ Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recordin
 - Interpretation: E000's "RGB path affects behavior" gate is met at the coarse level (blank vs rendered). Per-scene dependence requires a course where the correct action depends on the observed scene; freeze that requirement in the E001 specification rather than retrofitting E000's fixed course.
 - No episodes completed in any mode within 256 steps (max-steps 2000); termination-based endpoints were not exercised.
 
+## E001 / 1 vision-load-bearing course
+
+- Implementation: `apps/rgb-env` now draws a two-box wall across the corridor at z = -5.2 with a seeded gap (half-width 1.5, center in [-2.6, 2.6]) per (env, episode), plus the existing three jittered obstacles. Collision and render share `obstacles(seed, env, episode)`.
+- Reward fix: collision is a flat -10.0 and progress reward only accrues on survival. Previously a blind charge accumulated ~+8 in progress reward before the -1 collision penalty, making blindness profitable — the task did not require vision.
+- Verified: a blind full-forward policy now terminates every episode (283 terminations / 200 steps / 256 envs). A GRU policy trained 131k steps on the fixed course still collides (mean return -7.59 vs the -10 blind floor) — it has not learned to thread the gap within this budget.
+- Diagnostic on the wall course (`diagnostic-gru-wall3.json`): normal vs shuffle remain near-identical and blank diverges ~3x. The shuffle arm is now gated on policy competence on a vision-required course, not on fixture diversity or reward structure. A conclusive result is expected once an E001 arm trains to competence at the 25M-transition budget.
+- Interpretation: the course now satisfies the "correct action depends on the observed scene" requirement. The remaining shuffle question is whether a *competent* policy uses per-scene information, which requires the full E001 training budget to answer.
+
 ## E000 / 2 fixed-action replay and full-loop profile
 
 - Clean source revision: `594b00c`; both fresh-process runs used seed 11, 256 environments, 64x64 RGB, 64 measured steps, two warmup steps, and `max_steps=64`.
