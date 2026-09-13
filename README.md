@@ -73,6 +73,24 @@ nix develop --command cuda/build/rl-venv/bin/python rl/rgb_train.py \
 
 The smoke test exercises staged actions, channel-first uint8 RGB histories, pinned host staging with double-buffered nonblocking transfers, autoreset terminal observations, rollout storage, and one PPO update. It is integration evidence, not sim-to-real evidence.
 
+Checkpoints restore the policy, optimizer, learner counters and RNG state:
+
+```sh
+nix develop --command cuda/build/rl-venv/bin/python rl/rgb_train.py \
+  --num-envs 256 --horizon 4 --steps 1024 --device 0 \
+  --library target/release/librgb_env.so \
+  --checkpoint target/experiments/e000/checkpoint.pt
+```
+
+Resume with `--resume PATH` and a larger `--steps` target. The visual-dependence diagnostic compares normal, batch-shuffled and blank observations:
+
+```sh
+nix develop --command cuda/build/rl-venv/bin/python rl/rgb_diagnostic.py \
+  --checkpoint target/experiments/e000/checkpoint.pt \
+  --num-envs 256 --steps 256 --device 0 \
+  --library target/release/librgb_env.so
+```
+
 The fixed-action replay/profile harness produces immutable run directories with manifest, task configuration, seeds, JSONL metrics and episodes, selected RGB frames, `nvidia-smi` memory samples, and `artifacts.sha256`:
 
 ```sh
