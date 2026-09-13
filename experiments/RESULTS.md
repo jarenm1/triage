@@ -66,6 +66,7 @@ Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recordin
 
 - Verification revision: `c575479a` (`rl/rgb_diagnostic.py`); policy checkpoint at 16,384 transitions, seed 11, 256 environments, 256 deterministic (`distribution.mean`) steps per mode.
 - Artifacts: `target/experiments/e000/diagnostic.json` (2,048-step policy) and `target/experiments/e000/diagnostic-16k.json` (16,384-step policy).
+- Provenance gap: the 16,384-transition checkpoint was produced by extending the recorded 2,048-step run in place at `target/experiments/e000/checkpoint.pt`; later training overwrote that file, so its SHA-256 is unrecoverable. `diagnostic-16k.json` is the preserved evidence for the 16k result.
 - Result at 16k: normal reward/step **+0.001287**, mean action **[0.0552, -0.0162]**; blank reward/step **-0.000683**, mean action **[0.0221, -0.0046]** — a ~2.5x action shift and reward sign flip. The CNN policy measurably responds to visual input; the RGB path is behaviorally live.
 - Shuffle arm inconclusive: normal vs shuffle differ only ~5e-6 in mean action. Measured cause: environments' images differ by only ~4/255 mean absolute pixel intensity (per-env mean std 0.89), so swapping images across the batch is nearly a null intervention on this fixture. The arm cannot detect per-env scene dependence until fixtures render visibly distinct scenes per environment.
 - At 2k steps all three modes were near-identical near-zero actions, consistent with an undertrained actor head (init scale 0.01); the blank divergence emerged only after training.
