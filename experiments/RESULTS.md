@@ -34,9 +34,9 @@ Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recordin
 
 ## E001 / 1 preregistration
 
-- Specification date: 2026-09-13. Source revision at freeze: `3994ef4f`. Changes after viewing outcomes require a new spec version with the reason recorded.
+- Specification date: 2026-09-13. Source revision at freeze: `4ae851e`. Changes after viewing outcomes require a new spec version with the reason recorded.
 - Task: `visual_nav_v0` on `apps/rgb-env` — planar velocity control through a three-obstacle course, 64x64 RGB four-frame history plus previous action as the only actor inputs. No privileged obstacle/depth/position features.
-- Geometry: per-(env, episode) seeded jitter of the base three-obstacle layout (position ±0.5/±0.4 m, scale 0.85-1.15x). Training uses root seeds 11, 29, 47. Held-out geometry evaluation uses seed 101 (development) and seed 202 (final, sealed until arms are compared).
+- Geometry: per-(env, episode) seeded jitter of the base three-obstacle layout (position ±0.5/±0.4 m, scale 0.85-1.15x on x/z and 0.9-1.1x on y). Training uses root seeds 11, 29, 47. Held-out geometry evaluation uses seed 101 (development) and seed 202 (final, sealed until arms are compared).
 - Appearance: seeded per-env floor and obstacle colors (current `mix64` scheme). Arm A (narrow) fixes appearance to the seed-11 distribution; arm B (broad) samples the full seeded range; arm C is B plus paired-history consistency (same trajectory rendered under two appearances).
 - Architecture: `RecurrentRGBPolicy` (CNN+GRU, 556,741 parameters), identical across arms. Ordinary augmentations fixed to none beyond the seeded variation; the learner is the vendored PuffeRL PPO configuration in `rl/rgb_train.py`.
 - Budget: 25M transitions per run (~3.5 GPU-hours at the measured ~2,000 env-frames/s), 3 arms x 3 seeds = 9 runs, ~32 GPU-hours total training cap. Evaluation and the small tuning allowance (one sweep over the arm-C consistency weight on development seed 101 only) are recorded separately.
