@@ -11,6 +11,7 @@ Build Triage around a testable question:
 The main training path is `synthetic RGB history -> learned representation -> RL policy -> control`; deployment substitutes real camera observations. Simulator state can support rewards, diagnostics, auxiliary targets, and a critic experiment. It does not define the canonical visual latent or an obligatory privileged teacher.
 
 Start with slow, local navigation through opaque obstacles, at fixed altitude and approximately fixed heading. Add dynamic obstacles after static transfer works. General navigation, open-world semantics, and aggressive six-degree-of-freedom flight are later claims requiring separate evidence.
+
 The framework is the primary goal. Drones are the first proving task because they expose visual control, temporal observation, latency, and sim-to-real issues in a concrete setting. Later tasks should reuse the data generation, task, sensor, action, learner, replay, and evaluation contracts rather than require a new research stack.
 
 ### Decisions
