@@ -9,7 +9,7 @@ Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recordin
 | ID / spec | Status | Question / scope | Runs and evidence | Decision |
 | :--- | :--- | :--- | :--- | :--- |
 | E000 / 2 | partial | Can we collect, learn from, and replay a small closed-loop RGB navigation task with complete provenance? | Renderer benchmark, corrected 256-environment CNN smoke, paired fixed-action replay, artifact records, visual inspection, VRAM profile, checkpoint reload/resume, and visual-dependence diagnostic complete | Blank arm passes; shuffle needs a course where correct action depends on the scene — freeze in E001 spec |
-| E001 / draft | planned, conditional on E000 | Does broad procedural RGB randomization transfer, and does paired-history consistency improve it? | Not run; metrics not measured | Freeze exact task/splits/seeds/budgets after E000 profiling, before main runs |
+| E001 / 1 | specified, not run | Does broad procedural RGB randomization transfer, and does paired-history consistency improve it? | Spec frozen below; metrics not measured | Run three arms at equal GPU-hours; evaluate held-out geometry/appearance before real trials |
 | E002 / draft | planned, conditional | Do recurrence and action-conditioned prediction improve dynamic/occluded-obstacle control? | Not run | Proceed after static transfer is diagnosed |
 | E003 / draft | planned, conditional | Does prioritized/mutated world sampling outperform uniform sampling at equal total compute? | Not run | Keep final generator families out of mining |
 | E004 / draft | planned, conditional | How does real-video adaptation compare with zero-shot and frozen pretrained features? | Not run | Account separately for unique footage and imported pretraining |
@@ -31,6 +31,20 @@ Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recordin
 - Configuration freeze: commit numeric dynamics, camera, reward, success, and tolerance definitions before recorded acceptance runs. During integration these may change, but bump the specification when its declared behavior changes.
 - Acceptance: satisfy the section 11 evidence checklist, report stage timings and peak total device memory, and inspect rendered frames/replay.
 - Interpretation: passing E000 establishes integration and measurement capability, not sim-to-real transfer.
+
+## E001 / 1 preregistration
+
+- Specification date: 2026-09-13. Source revision at freeze: `4ae851e`. Changes after viewing outcomes require a new spec version with the reason recorded.
+- Task: `visual_nav_v0` on `apps/rgb-env` — planar velocity control through a three-obstacle course, 64x64 RGB four-frame history plus previous action as the only actor inputs. No privileged obstacle/depth/position features.
+- Geometry: per-(env, episode) seeded jitter of the base three-obstacle layout (position ±0.5/±0.4 m, scale 0.85-1.15x on x/z and 0.9-1.1x on y). Training uses root seeds 11, 29, 47. Held-out geometry evaluation uses seed 101 (development) and seed 202 (final, sealed until arms are compared).
+- Appearance: seeded per-env floor and obstacle colors (current `mix64` scheme). Arm A (narrow) fixes appearance to the seed-11 distribution; arm B (broad) samples the full seeded range; arm C is B plus paired-history consistency (same trajectory rendered under two appearances).
+- Architecture: `RecurrentRGBPolicy` (CNN+GRU, 556,741 parameters), identical across arms. Ordinary augmentations fixed to none beyond the seeded variation; the learner is the vendored PuffeRL PPO configuration in `rl/rgb_train.py`.
+- Budget: 25M transitions per run (~3.5 GPU-hours at the measured ~2,000 env-frames/s), 3 arms x 3 seeds = 9 runs, ~32 GPU-hours total training cap. Evaluation and the small tuning allowance (one sweep over the arm-C consistency weight on development seed 101 only) are recorded separately.
+- Checkpoint selection: final checkpoint at budget end; milestone saves at 25/50/75% of transitions for the secondary equal-transition comparison. No early stopping at the success threshold.
+- Primary endpoint: held-out-geometry success rate (development seed 101) per arm at equal GPU-hours. Secondary: time-to-threshold, equal-transition comparison, collision rate.
+- Reference: a privileged-state reactive controller (steers toward the corridor gap using simulator obstacle truth) as the simulation reference; a depth-camera reactive baseline is the designated real-trial reference, implementation deferred to hardware bring-up. A poor RGB result without a working reference is diagnostically inconclusive per PLAN.md section 12.
+- Decision gates (from PLAN.md section 12, frozen): high held-out sim success required before diagnosing a real gap; if all arms pass sim but fail real while the reference succeeds, reject the zero-shot recipe; if B transfers and C does not improve at equal resources, keep B and reject the extra objective; strong real pilot success with a modest matched gap continues to larger held-out evaluation and dynamic obstacles.
+- Known open item carried from E000: the shuffle diagnostic needs a course where the correct action depends on the observed scene. The E001 held-out-geometry evaluation provides this; the conclusive shuffle result is expected on the E001 fixture, not retrofitted to E000.
 
 ## E000 / 2 observed benchmark result
 
