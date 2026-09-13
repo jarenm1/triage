@@ -58,6 +58,16 @@ class PuffeRL:
         self.advantages = buffer(n, horizon)
         self.ratio = torch.ones(n, horizon, device=self.device)
         self.episode_stats = buffer(3)
+        self.recurrent = bool(getattr(policy, "recurrent", False))
+        if self.recurrent:
+            self.hidden_size = int(policy.hidden_size)
+            self.segment_states = buffer(n, self.hidden_size)
+            self.prev_actions = buffer(horizon, n, self.action_size)
+            self._state = policy.initial_state(n, self.device)
+            self._prev_action = torch.zeros(n, self.action_size, device=self.device)
+        else:
+            self._state = ()
+            self._prev_action = None
         self.optimizer = Muon(
             policy.parameters(),
             lr=config["learning_rate"],
@@ -72,7 +82,13 @@ class PuffeRL:
         self.episode_stats.zero_()
         for t in range(self.config["horizon"]):
             self.observations[t].copy_(env.observations)
-            logits, value, _ = self.policy.forward_eval(self.observations[t])
+            if self.recurrent:
+                if t == 0:
+                    self.segment_states.copy_(self._state)
+                self.prev_actions[t].copy_(self._prev_action)
+            logits, value, next_state = self.policy.forward_eval(
+                self.observations[t], self._state, self._prev_action
+            )
             action, logprob, _ = sample_logits(logits)
             self.actions[t].copy_(action)
             self.logprobs[t].copy_(logprob)
@@ -84,14 +100,22 @@ class PuffeRL:
             # Every final state is evaluated without a host-side done check.
             # A failed nonfinite state must not poison the critic through NaN*0.
             _, final_value, _ = self.policy.forward_eval(
-                torch.nan_to_num(env.final_observations)
+                torch.nan_to_num(env.final_observations),
+                next_state if self.recurrent else (),
+                action if self.recurrent else None,
             )
             self.final_values[t].copy_(final_value.flatten())
             done = (env.terminated + env.truncated).clamp(max=1)
+            if self.recurrent:
+                reset = done.unsqueeze(-1)
+                self._state = next_state * (1.0 - reset)
+                self._prev_action.copy_(action * (1.0 - reset))
             self.episode_stats[0].add_(done.sum())
             self.episode_stats[1].add_((env.completed_returns * done).sum())
             self.episode_stats[2].add_((env.completed_lengths * done).sum())
-        _, value, _ = self.policy.forward_eval(env.observations)
+        _, value, _ = self.policy.forward_eval(
+            env.observations, self._state, self._prev_action
+        )
         self.bootstrap_value.copy_(value.flatten())
         self.global_step += self.batch_size
 
@@ -161,7 +185,14 @@ class PuffeRL:
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
 
-            logits, newvalue = self.policy(mb_obs)
+            if self.recurrent:
+                logits, newvalue = self.policy.forward_sequence(
+                    mb_obs,
+                    self.segment_states[idx],
+                    self.prev_actions.transpose(0, 1)[idx],
+                )
+            else:
+                logits, newvalue = self.policy(mb_obs)
             actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
 
             newlogprob = newlogprob.reshape(mb_logprobs.shape)

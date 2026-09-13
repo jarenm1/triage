@@ -10,7 +10,7 @@ if __package__ in (None, ""):
 
 import torch
 
-from rl.policy import RGBPolicy
+from rl.policy import RGBPolicy, RecurrentRGBPolicy
 from rl.rgb_checkpoint import load_checkpoint, restore_rng, save_checkpoint
 from rl.rgb_environment import RGBEnv
 from rl.vendor.torch_pufferl import PuffeRL
@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--library")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--recurrent", action="store_true")
     args = parser.parse_args()
     if args.num_envs <= 0 or args.horizon <= 0 or args.steps <= 0:
         parser.error("num-envs, horizon and steps must be positive")
@@ -44,7 +45,8 @@ def main():
         device=args.device,
         library=args.library,
     ) as env:
-        policy = RGBPolicy(env.observation_shape).to(env.device)
+        policy_cls = RecurrentRGBPolicy if args.recurrent else RGBPolicy
+        policy = policy_cls(env.observation_shape).to(env.device)
         config = {
             "horizon": args.horizon,
             "total_timesteps": args.steps,
