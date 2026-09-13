@@ -58,8 +58,9 @@ fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    let args = Args::parse()?;
-    prepare_output(&args.output)?;
+    let Some(args) = Args::parse()? else {
+        return Ok(());
+    };
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -69,6 +70,9 @@ async fn run() -> Result<()> {
         "{}; backend={:?}; device_type={:?}; driver={}",
         adapter_info.name, adapter_info.backend, adapter_info.device_type, adapter_info.driver
     );
+    // Create the output directory only after the renderer exists: a failed GPU
+    // init must not leave a directory that blocks rerunning with the same --output.
+    prepare_output(&args.output)?;
 
     let manifest = Manifest {
         experiment: SPEC,
@@ -215,7 +219,8 @@ impl Summary {
 }
 
 impl Args {
-    fn parse() -> Result<Self> {
+    /// Returns `None` when the run should exit successfully without benchmarking (--help).
+    fn parse() -> Result<Option<Self>> {
         let mut envs = 256usize;
         let mut steps = 10usize;
         let mut warmup = 2usize;
@@ -239,7 +244,7 @@ impl Args {
                     println!(
                         "rgb-benchmark [--envs N] [--steps N] [--warmup N] [--width N] [--height N] [--output DIR]"
                     );
-                    return Err(anyhow::anyhow!("help requested"));
+                    return Ok(None);
                 }
                 _ => bail!("unknown argument {flag}"),
             }
@@ -255,14 +260,14 @@ impl Args {
                 unique_stamp()
             ))
         });
-        Ok(Self {
+        Ok(Some(Self {
             envs,
             steps,
             warmup,
             width,
             height,
             output,
-        })
+        }))
     }
 }
 
