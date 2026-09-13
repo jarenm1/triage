@@ -262,7 +262,7 @@ impl RgbEnv {
                     Quat::IDENTITY,
                     origin + Vec3::new(0.0, -0.05, -2.5),
                 ),
-                color: [0.16, 0.19, 0.22, 1.0],
+                color: floor_color(self.seed, env),
                 object_id: env as u32 * 10 + 1,
             });
             for (index, (position, scale)) in obstacles().into_iter().enumerate() {
@@ -273,7 +273,7 @@ impl RgbEnv {
                         Quat::IDENTITY,
                         origin + position,
                     ),
-                    color: obstacle_color(env, index),
+                    color: obstacle_color(self.seed, env, index),
                     object_id: env as u32 * 10 + 2 + index as u32,
                 });
             }
@@ -380,16 +380,33 @@ fn collides(x: f32, z: f32) -> bool {
     })
 }
 
-fn obstacle_color(env: usize, index: usize) -> [f32; 4] {
-    let mut value = (env as u32)
-        .wrapping_mul(747796405)
-        .wrapping_add((index as u32 + 1).wrapping_mul(2891336453));
-    value ^= value >> 16;
-    value = value.wrapping_mul(2246822519);
+fn mix64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d049bb133111eb);
+    value ^ value >> 31
+}
+
+fn floor_color(seed: u64, env: usize) -> [f32; 4] {
+    let value = mix64(seed ^ mix64(env as u64).wrapping_add(0x9e3779b97f4a7c15));
     [
-        0.25 + (value & 255) as f32 / 510.0,
-        0.25 + ((value >> 8) & 255) as f32 / 510.0,
-        0.25 + ((value >> 16) & 255) as f32 / 510.0,
+        0.06 + (value & 1023) as f32 / 1023.0 * 0.55,
+        0.06 + ((value >> 10) & 1023) as f32 / 1023.0 * 0.55,
+        0.06 + ((value >> 20) & 1023) as f32 / 1023.0 * 0.55,
+        1.0,
+    ]
+}
+
+fn obstacle_color(seed: u64, env: usize, index: usize) -> [f32; 4] {
+    let value = mix64(
+        seed ^ mix64((env as u64).wrapping_mul(747796405))
+            .wrapping_add((index as u64 + 1).wrapping_mul(2891336453)),
+    );
+    [
+        0.08 + (value & 1023) as f32 / 1023.0 * 0.80,
+        0.08 + ((value >> 10) & 1023) as f32 / 1023.0 * 0.80,
+        0.08 + ((value >> 20) & 1023) as f32 / 1023.0 * 0.80,
         1.0,
     ]
 }
