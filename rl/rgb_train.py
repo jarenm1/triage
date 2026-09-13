@@ -11,6 +11,7 @@ if __package__ in (None, ""):
 import torch
 
 from rl.policy import RGBPolicy
+from rl.rgb_checkpoint import load_checkpoint, restore_rng, save_checkpoint
 from rl.rgb_environment import RGBEnv
 from rl.vendor.torch_pufferl import PuffeRL
 
@@ -23,6 +24,8 @@ def main():
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--library")
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
     if args.num_envs <= 0 or args.horizon <= 0 or args.steps <= 0:
         parser.error("num-envs, horizon and steps must be positive")
@@ -33,6 +36,8 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.set_device(args.device)
         torch.cuda.manual_seed_all(args.seed)
+    checkpoint_path = args.checkpoint or args.resume
+    resumed_from = None
     with RGBEnv(
         n=args.num_envs,
         seed=args.seed,
@@ -63,6 +68,16 @@ def main():
             "max_grad_norm": 1.0,
         }
         learner = PuffeRL(config, env, policy)
+        if args.resume:
+            checkpoint = load_checkpoint(
+                args.resume,
+                policy=policy,
+                learner=learner,
+                env=env,
+                expected_config=config,
+            )
+            restore_rng(checkpoint)
+            resumed_from = str(args.resume)
         while learner.global_step < args.steps:
             learner.rollouts()
             learner.train()
@@ -79,6 +94,14 @@ def main():
             )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        if checkpoint_path:
+            save_checkpoint(
+                checkpoint_path,
+                policy=policy,
+                learner=learner,
+                env=env,
+                seed=args.seed,
+            )
         print(
             json.dumps(
                 {
@@ -89,6 +112,8 @@ def main():
                     "peak_allocated_bytes": torch.cuda.max_memory_allocated(env.device)
                     if torch.cuda.is_available()
                     else None,
+                    "checkpoint": str(checkpoint_path) if checkpoint_path else None,
+                    "resumed_from": resumed_from,
                 }
             ),
             flush=True,
