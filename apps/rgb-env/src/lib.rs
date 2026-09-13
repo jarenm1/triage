@@ -168,7 +168,7 @@ impl RgbEnv {
             state.z += state.vz * CONTROL_DT;
             state.length += 1;
 
-            let collision = collides(state.x, state.z);
+            let collision = collides(self.seed, env, state.episode, state.x, state.z);
             let success = state.z <= -7.0;
             let timeout = state.length >= self.max_steps;
             let reward = -0.002 + (-state.vz).max(0.0) * 0.08;
@@ -265,7 +265,10 @@ impl RgbEnv {
                 color: floor_color(self.seed, env),
                 object_id: env as u32 * 10 + 1,
             });
-            for (index, (position, scale)) in obstacles().into_iter().enumerate() {
+            for (index, (position, scale)) in obstacles(self.seed, env, state.episode)
+                .into_iter()
+                .enumerate()
+            {
                 self.frame.draw(RenderPrimitive {
                     mesh: self.cube,
                     transform: Mat4::from_scale_rotation_translation(
@@ -364,20 +367,38 @@ impl RgbEnv {
     }
 }
 
-fn obstacles() -> [(Vec3, Vec3); 3] {
-    [
+fn obstacles(seed: u64, env: usize, episode: u64) -> [(Vec3, Vec3); 3] {
+    // Same base course everywhere; per-(env, episode) jitter varies the layout
+    // while keeping the corridor traversable and the physics contract fixed.
+    let mut layout = [
         (Vec3::new(-1.4, 0.8, -2.4), Vec3::new(0.9, 1.6, 0.8)),
         (Vec3::new(1.1, 1.1, -4.2), Vec3::new(1.5, 2.2, 0.9)),
         (Vec3::new(-0.1, 0.55, -6.1), Vec3::new(2.5, 1.1, 0.7)),
-    ]
+    ];
+    for (index, (position, scale)) in layout.iter_mut().enumerate() {
+        let value = mix64(
+            seed ^ mix64((env as u64).wrapping_mul(0x9e3779b97f4a7c15))
+                ^ mix64(episode.wrapping_mul(0x85ebca6b))
+                    .wrapping_add((index as u64 + 1).wrapping_mul(0xc2b2ae35)),
+        );
+        position.x += ((value & 1023) as f32 / 1023.0 - 0.5) * 1.0;
+        position.z += (((value >> 10) & 1023) as f32 / 1023.0 - 0.5) * 0.8;
+        scale.x *= 0.85 + ((value >> 20) & 1023) as f32 / 1023.0 * 0.3;
+        scale.z *= 0.85 + ((value >> 30) & 1023) as f32 / 1023.0 * 0.3;
+        scale.y *= 0.9 + ((value >> 40) & 1023) as f32 / 1023.0 * 0.2;
+        position.y = scale.y * 0.5;
+    }
+    layout
 }
 
-fn collides(x: f32, z: f32) -> bool {
-    obstacles().into_iter().any(|(center, scale)| {
-        let half_x = scale.x * 0.5 + VEHICLE_RADIUS;
-        let half_z = scale.z * 0.5 + VEHICLE_RADIUS;
-        (x - center.x).abs() <= half_x && (z - center.z).abs() <= half_z
-    })
+fn collides(seed: u64, env: usize, episode: u64, x: f32, z: f32) -> bool {
+    obstacles(seed, env, episode)
+        .into_iter()
+        .any(|(center, scale)| {
+            let half_x = scale.x * 0.5 + VEHICLE_RADIUS;
+            let half_z = scale.z * 0.5 + VEHICLE_RADIUS;
+            (x - center.x).abs() <= half_x && (z - center.z).abs() <= half_z
+        })
 }
 
 fn mix64(mut value: u64) -> u64 {
