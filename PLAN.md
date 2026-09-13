@@ -1,6 +1,6 @@
 # Triage: a procedural data/RL framework for visual control
 
-Updated: 2026-09-12. Status: research direction and implementation plan, not a report of demonstrated visual transfer.
+Updated: 2026-09-13. Status: research direction and implementation plan, not a report of demonstrated visual transfer.
 
 ## 1. Direction and immediate decision
 
@@ -18,13 +18,13 @@ The framework is the primary goal. Drones are the first proving task because the
 
 - **First engineering slice: E000, a reproducible RGB closed-loop experiment harness.** Connect observations to actions, collisions, resets, saved runs, and replay before expanding the procedural grammar.
 - **First research experiment: E001, procedural visual transfer.** Compare narrow appearance randomization, broad randomization, and broad randomization plus paired-render consistency under the same control architecture and budget.
-- Use the existing Rust rendering and CUDA/Python infrastructure first. Benchmark 256 rendered environments with staged copies. Increase parallelism based on the measured full-loop profile.
+- Use the existing Rust rendering and CUDA/Python infrastructure first. Increase parallelism based on the measured full-loop profile.
 - Use high-level planar velocity commands for the new navigation task. Do not simultaneously solve visual transfer and raw-motor control.
 - Use a small CNN and recurrent policy for the research baseline; a four-frame CNN is sufficient for the E000 integration smoke test.
 - Spend the first real-world effort on camera/latency checks and a small closed-loop course, not on collecting a large passive video dataset.
 - Record every experiment, including failed runs, in [the results ledger](experiments/RESULTS.md). Commit specifications and compact reports; retain large artifacts outside Git with checksums and a backup.
 
-All resource budgets, model sizes, performance targets, and data-hour schedules below are proposed starting points. Measure them on the actual GPU and deployment platform.
+Where concrete budgets, model sizes, or schedules appear below, they are placeholders to be measured on the actual hardware and frozen per experiment, not commitments.
 
 ### Existing work and document authority
 
@@ -52,7 +52,7 @@ The previous plan is preserved in [the engineering archive](docs/archive/plan-20
 
 **RGB cannot reveal unobservable quantities.** A single monocular frame generally cannot establish metric distance or velocity without additional assumptions. Motion, known ego-action effects, and optional onboard inertial measurements help, but do not remove every ambiguity. Completely hidden actors require risk-aware behavior, not clairvoyance.
 
-**Low resolution creates physical limits.** For a 64-pixel-wide, 90-degree horizontal-FOV camera, focal length is approximately 32 pixels. A 2 cm obstacle at 3 m spans about 0.21 pixels. No representation objective can reliably recover an obstacle absent from the sampled image. Increase resolution, reduce speed, change optics, or narrow the task envelope when necessary.
+**Low resolution creates physical limits.** An obstacle's apparent size in pixels falls with focal length and distance; a small obstacle at long range can occupy a fraction of a pixel. No representation objective can reliably recover an obstacle absent from the sampled image. Increase resolution, reduce speed, change optics, or narrow the task envelope when necessary.
 
 **Aggressive randomization can destroy useful cues.** Redrawing textures independently every frame corrupts motion evidence. Erasing all texture can remove parallax cues. Randomize persistent surface appearance over episodes; vary exposure and illumination with plausible temporal continuity. Treat sensor noise separately.
 
@@ -70,7 +70,7 @@ A useful result would include:
 
 - Generalization across held-out geometry families, render styles, and motion families, followed by real closed-loop evaluation.
 - An ablation showing whether paired interventions or temporal learning improve over ordinary domain randomization.
-- A measured data/compute/latency frontier on an 8 GB GPU.
+- A measured data/compute/latency frontier on a modest single-GPU budget.
 - A reproducible benchmark and failure corpus showing where the approach stops working.
 
 A benchmark-only or negative result is credible if the controls isolate the failure. “A broad generator plus several known losses” is not, by itself, a novel method claim.
@@ -98,18 +98,19 @@ Use these as methodological references, not as a claim that any cited method alr
 
 Source inventory at the plan update:
 
-- `cuda/src/hover_env.cu` and `cuda/src/hover_env.h`: hover/tracking task around the multirotor physics batch. The current policy observation is 22 float32 state values; actions are four raw rotor commands, transformed around hover thrust.
+- `cuda/src/hover_env.cu` and `cuda/src/hover_env.h`: hover/tracking task around the multirotor physics batch. The current policy observation is a small float32 state vector; actions are four raw rotor commands, transformed around hover thrust.
 - `rl/environment.py`: ctypes bridge with borrowed native CUDA tensors, explicit ownership/lifetimes, and stream constraints. This is not an RGB bridge.
 - `rl/policy.py`: a feed-forward MLP with Gaussian action and scalar value heads; no active recurrent state.
 - `rl/train.py` and `rl/vendor/torch_pufferl.py`: PPO-style training with trajectory reuse/V-trace-related machinery, checkpoints, JSON output, and evaluation. Reuse deliberately rather than describing it as an unmodified textbook PPO implementation.
 - `crates/sim-graphics/`: a `wgpu` renderer with box, plane, cylinder, sphere, and custom-mesh support. GPU textures and host readback exist; direct renderer-to-CUDA image sharing is additional work.
+- `apps/rgb-env` plus `rl/rgb_environment.py` and related `rl/rgb_*` modules: a first staged version of the RGB closed-loop bridge, built for E000.
 - `README.md`: seeded scene generation, realized-scene replay, RGB/depth/instance outputs, and sensor provenance are documented separately from state-policy training.
 
-The critical missing connection is **rendered camera observations consumed by a closed-loop navigation learner**. A GPU renderer and a GPU physics batch do not imply this connection already exists.
+The critical connection — rendered camera observations consumed by a closed-loop navigation learner — now exists in staged form. A GPU renderer and a GPU physics batch did not imply this connection; it was built deliberately and its remaining E000 gate is rerunning the shuffle arm on a visually diverse fixture (checkpoint reload and the visual-dependence diagnostic are complete).
 
 Retain the existing SI/frame conventions, quaternion handling, fixed-step timing, action interpretation, final-observation/autoreset semantics, and versioned scene/sensor contracts. Read the relevant implementation and archived sections before changing them. Introduce a separately named visual-navigation task rather than silently changing hover/tracking observations or action meanings.
 
-The physics conventions are SI units, ENU world, FLU body, and scalar-first Hamilton body-to-world quaternions. The existing inspection scenes use a Y-up convention, so implement and test an explicit scene-to-physics/camera transform. Raw linear RGBA8 captures and sRGB PNGs are different encodings: choose one versioned policy preprocessing path and apply the corresponding conversion to real images. These two integration seams belong in E000, not in later appearance tuning.
+The physics conventions are SI units, ENU world, FLU body, and scalar-first Hamilton body-to-world quaternions. The existing inspection scenes use a Y-up convention, so implement and test an explicit scene-to-physics/camera transform. Raw linear RGBA8 captures and sRGB PNGs are different encodings: choose one versioned policy preprocessing path and apply the corresponding conversion to real images. These integration seams belong in E000, not in later appearance tuning.
 
 For the new task, define image layout, color space, camera frame/extrinsics, capture timestamp, observation age, control cadence, collision shape, and reset behavior as versioned contracts. End an episode on collision or task completion; distinguish a time-limit truncation and retain the final pre-reset image/history for bootstrapping.
 
@@ -117,7 +118,7 @@ For the new task, define image layout, color space, camera frame/extrinsics, cap
 
 ### Task and control boundary
 
-Use a fixed-altitude, approximately fixed-heading vehicle navigating a short course. Its navigation action is desired body-frame forward/lateral velocity, with forward velocity allowed to reach zero. Start at a maximum forward speed around 0.5 m/s; choose final limits from measured platform response and visible obstacle size.
+Use a fixed-altitude, approximately fixed-heading vehicle navigating a short course. Its navigation action is desired body-frame forward/lateral velocity, with forward velocity allowed to reach zero. Keep speeds low enough that the declared camera resolution and response latency leave obstacles observable; choose final limits from measured platform response and visible obstacle size.
 
 For the initial simulator task, use a bounded-acceleration velocity-response model, a finite vehicle footprint, and swept collision checks. Label this as a navigation abstraction, not validated full flight dynamics. Later evaluate with the existing multirotor model and an explicit tracking controller.
 
@@ -129,14 +130,14 @@ The initial instruction is “advance through the course without contact before 
 
 | Component | Proposed starting point |
 | :--- | :--- |
-| Camera | 64x64 RGB, approximately 20 Hz; test 96x96 or 128x128 only if observability or measured performance warrants it |
-| Spatial encoder | Four small stride-2 convolutions, channels 32/64/64/128; flatten the spatial map and project to 256 features |
-| Temporal state | GRU with 256 hidden units, consuming visual features, previous action, timing, and declared onboard inputs |
+| Camera | A small RGB frame (starting at low resolution) at a declared control rate; increase resolution only if observability or measured performance warrants it |
+| Spatial encoder | A small strided CNN that preserves spatial layout; flatten the spatial map and project to a compact feature |
+| Temporal state | A small recurrent state (GRU-class) consuming visual features, previous action, timing, and declared onboard inputs |
 | Actor / critic | Small MLP heads; Gaussian bounded velocity policy and visual-history value estimate |
-| Prediction head | Training-only action-conditioned MLP or small recurrent predictor over the learned state |
+| Prediction head | Training-only action-conditioned predictor over the learned state |
 | Consistency head | Training-only projection/prediction heads and a stop-gradient target encoder |
-| Size target | Roughly 1-2 million trainable parameters for the physical policy, verified from the implemented network |
-| Inference target | Measure batch-one p50/p95/p99 latency; initially aim for p95 below 10 ms on the declared target device, not just the training GPU |
+| Size target | A small trainable-parameter budget for the physical policy, verified from the implemented network |
+| Inference target | Measure batch-one p50/p95/p99 latency on the declared target device, not just the training GPU |
 
 Keep spatial location in the encoder output. Immediate global average pooling can discard the left/right information needed for avoidance. Start without a transformer or an image-generating world model.
 
@@ -147,17 +148,17 @@ Keep spatial location in the encoder output. Immediate global average pooling ca
 - The auxiliary predictor encourages that state to encode action consequences. Do not run multi-step latent planning in v0.
 - A future semantic module can use a longer, slower video window, independently of the physical control update rate.
 
-Use ordered sequences, episode masks, sequence-start state, and burn-in in training. A proposed starting point is 32 learning steps plus 8 burn-in steps. Recompute features during optimization; do not train an evolving encoder from permanently cached latent features. Check that memory actually helps using a frame-stack baseline and ambiguous-motion cases.
+Use ordered sequences, episode masks, sequence-start state, and burn-in in training. Recompute features during optimization; do not train an evolving encoder from permanently cached latent features. Check that memory actually helps using a frame-stack baseline and ambiguous-motion cases.
 
-For the first recurrent learner, use within-rollout PPO epochs and disable cross-update trajectory reuse until recurrent off-policy correction is explicitly tested. Before E001 main runs, verify ordered minibatches, hidden-state resets, final-history truncation bootstrapping, and stored behavior log-probabilities on a small recurrent fixture. Document any stale sequence-start state and finite-burn-in approximation; eight burn-in frames do not guarantee reconstruction of the full history.
+For the first recurrent learner, use within-rollout PPO epochs and disable cross-update trajectory reuse until recurrent off-policy correction is explicitly tested. Before E001 main runs, verify ordered minibatches, hidden-state resets, final-history truncation bootstrapping, and stored behavior log-probabilities on a small recurrent fixture. Document any stale sequence-start state and finite-burn-in approximation; a short burn-in does not guarantee reconstruction of the full history.
 
-### 8 GB memory and throughput discipline
+### Memory and throughput discipline
 
-Start E000's full-loop benchmark at 256 environments. Keep the batch size configurable and use the profile to decide whether to test 512, 1,024, or larger batches. Measure rendering, transfers, collection, and learner updates together rather than extrapolating from state-only environment throughput.
+Start E000's full-loop benchmark at a moderate environment count, keep the batch size configurable, and use the profile to decide whether larger batches are warranted. Measure rendering, transfers, collection, and learner updates together rather than extrapolating from state-only environment throughput.
 
-At 256 environments, 64 rollout steps, and 64x64 RGB uint8, one stored image rollout is **192 MiB**. A complete second appearance view doubles that image storage; materializing it all as float32 multiplies each copy's image storage by four. Store uint8 observations and normalize only minibatches. Generate paired views for a subset of sequences if necessary.
+Full image rollouts are expensive: storing a paired second appearance doubles image storage, and materializing observations as float32 multiplies it again. Store uint8 observations and normalize only minibatches. Generate paired views for a subset of sequences if necessary.
 
-Use mixed precision where validated, bounded sequence minibatches, and a rollout buffer rather than a huge GPU image replay buffer for the first on-policy implementation. Target measured total device use below 7 GiB to leave operating headroom; account for `wgpu`/CUDA allocations and context overhead as well as learner allocations.
+Use mixed precision where validated, bounded sequence minibatches, and a rollout buffer rather than a huge GPU image replay buffer for the first on-policy implementation. Keep measured total device use comfortably below the device limit; account for `wgpu`/CUDA allocations and context overhead as well as learner allocations.
 
 Profile physics, rendering, host/device transfers, encoding, policy inference, optimization, and artifact writing separately. Report aggregate GPU-hours including failed runs and tuning. Optimize the dominant cost only after the E000 trace exists.
 
@@ -176,7 +177,7 @@ Sample control-relevant quantities explicitly:
 - Clutter density and connectivity of reachable free space.
 - Apparent feature size in pixels at the intended speed and distance.
 
-Normalize geometry against vehicle size and dynamics. A geometric path through a gap is insufficient if the vehicle cannot brake or turn into it. An initial braking estimate is `v * total_delay + v^2 / (2 * braking_acceleration)`, plus footprint and uncertainty margins; dynamic encounters need relative-motion reasoning as well.
+Normalize geometry against vehicle size and dynamics. A geometric path through a gap is insufficient if the vehicle cannot brake or turn into it. Estimate braking distance from speed, delay, and deceleration capability, plus footprint and uncertainty margins; dynamic encounters need relative-motion reasoning as well.
 
 ### Implementation sequence
 
@@ -243,7 +244,7 @@ Add explicit counterexamples: recolor an irrelevant wall and expect similar beha
 
 ### C. Action-conditioned prediction: second addition
 
-Predict future target-encoder features from recurrent state and recorded actions at short horizons, initially 1, 2, and 4 control steps. Add longer horizons only if they improve closed-loop outcomes. This is a training auxiliary, not an image reconstruction task.
+Predict future target-encoder features from recurrent state and recorded actions at short horizons. Add longer horizons only if they improve closed-loop outcomes. This is a training auxiliary, not an image reconstruction task.
 
 A deterministic one-step predictor can learn persistence or average incompatible futures. Stochastic actors and occlusion require uncertainty or multiple hypotheses if prediction is expanded. Compare against action-free prediction and action-shuffled controls to test whether action consequences were learned.
 
@@ -257,7 +258,7 @@ For counterfactual diagnostics, branch selected simulator states over a small ac
 
 ### E. Small real-video adaptation: only after zero-shot evaluation
 
-Use the deployment camera and representative motion for real clips. Compare zero adaptation with 15 minutes, 1 hour, and 4 hours of unique real footage; extend to 8 hours only if the curve justifies it. Use nested subsets and separate sites/sessions for development and final evaluation.
+Use the deployment camera and representative motion for real clips. Compare zero adaptation against increasing doses of unique real footage; extend the dose range only if the measured curve justifies it. Use nested subsets and separate sites/sessions for development and final evaluation.
 
 Start with conservative temporal/masked feature prediction or frozen-feature distillation. Replay synthetic RL/consistency data during adaptation and constrain policy drift on a fixed simulation anchor set. Update only a small adapter or selected encoder layers initially. Re-evaluate closed-loop behavior after every adaptation stage.
 
@@ -271,7 +272,7 @@ Do not begin with an adversarial sim-versus-real classifier. Marginal feature al
 
 ### What data is unavoidable?
 
-There is no universal minimum number of real-video hours. Zero real training images can work for a bounded task, as CAD2RL illustrates; that does not imply zero real engineering knowledge or zero validation.
+There is no universal minimum amount of real video. Zero real training images can work for a bounded task, as CAD2RL illustrates; that does not imply zero real engineering knowledge or zero validation.
 
 At minimum, obtain task-specific evidence about camera observations, command response, timing, and closed-loop behavior. Semantic conventions require an information source: pretrained data, explicit task rules, demonstrations, or a small targeted annotation set. Geometry alone cannot determine an arbitrary gesture's intended meaning.
 
@@ -289,7 +290,7 @@ A small amount of basic camera work is worth doing: identify image orientation, 
 
 Do not add a semantic model to E000 or E001. Later, keep a separate access path to RGB or higher-resolution crops; a heavily compressed physical latent may already have discarded a sign's content.
 
-Run a frozen small pretrained image/video encoder at a lower rate, provisionally 1-5 Hz, and learn a small context adapter. Condition the fast policy through a compact context vector or FiLM-style modulation. Supply context age, confidence, and expiry. Train with missing, stale, and incorrect context.
+Run a frozen small pretrained image/video encoder at a lower rate than the control loop, and learn a small context adapter. Condition the fast policy through a compact context vector or FiLM-style modulation. Supply context age, confidence, and expiry. Train with missing, stale, and incorrect context.
 
 Begin with one explicit convention, such as a demonstrated stop or directional gesture. Define its meaning and provide a small source of task-specific supervision or verified pretrained interpretation. A generic visual embedding does not automatically encode the correct instruction.
 
@@ -355,13 +356,13 @@ The full ladder is not a demand to implement all baselines before the first expe
 
 Use at least three independent training seeds for claims beyond a smoke test. Evaluate the same immutable scenario manifest across methods. Randomize/counterbalance real trial order to reduce battery, lighting, and operator effects.
 
-Pilot real testing may use approximately 30 trials per candidate to expose gross failures, not to establish small gains. For finalists, plan approximately 100-200 trials per method across multiple layouts/sessions and training seeds, then choose sample counts from the precision required. Report per-seed results and uncertainty across layout/session clusters; repeated frames and correlated attempts are not independent samples.
+Pilot real testing should expose gross failures, not establish small gains. For finalists, choose trial counts from the precision required, across multiple layouts/sessions and training seeds. Report per-seed results and uncertainty across layout/session clusters; repeated frames and correlated attempts are not independent samples.
 
 Freeze checkpoint selection on development evaluation. Count safety interventions as policy failures, while recording infrastructure failures separately under predeclared rules. An external shield's success must not be attributed to the RGB policy. Record the actual executed commands as well as requested commands.
 
 ## 11. First slice: E000, reproducible RGB control loop
 
-**Status: implementation and profiling complete; acceptance evidence partial. The remaining E000 gates are checkpoint reload and the visual-dependence diagnostic.**
+**Status: implementation and profiling complete; acceptance evidence partial. Checkpoint reload and the visual-dependence diagnostic are complete; the remaining E000 gate is rerunning the shuffle arm on a visually diverse fixture.**
 
 The deliverable is a small working experiment, not a new general simulator or a library of shapes.
 
@@ -395,10 +396,10 @@ For control observations, backpressure or an explicitly simulated stale-frame po
 - A visual rollout completes, a learning update produces finite losses and nonzero encoder gradients, and a saved checkpoint can be reloaded for evaluation.
 - A short fixed-fixture learning diagnostic shows the RGB path affects behavior; include an image-shuffle or blank-image diagnostic where geometry varies. A gradient alone is not evidence that vision is used.
 - Inspect actual rendered images and a replay visually. Confirm obstacle/collider alignment and camera orientation on known fixtures.
-- Record measured peak VRAM, stage timings, copying costs, and total artifact size at 256 environments. Demonstrate that the full harness fits the 8 GB device budget; record an explicit failed gate if it does not.
+- Record measured peak VRAM, stage timings, copying costs, and total artifact size at the benchmark batch. Demonstrate that the full harness fits the device budget; record an explicit failed gate if it does not.
 - Validate manifest/schema references and every required artifact checksum; preserve the failed-run manifest if any gate fails.
 
-Use a pilot compute cap of 2 GPU-hours for E000 smoke/profiling runs. If full-loop cost makes even a tiny learning diagnostic impractical, identify the bottleneck and make one focused rendering/batching change before E001. Do not spend weeks optimizing an unmeasured interoperability design.
+Use a small pilot compute cap for E000 smoke/profiling runs. If full-loop cost makes even a tiny learning diagnostic impractical, identify the bottleneck and make one focused rendering/batching change before E001. Do not spend weeks optimizing an unmeasured interoperability design.
 
 ## 12. First falsification experiment: E001
 
@@ -414,27 +415,27 @@ Before hardware trials, demonstrate the velocity-tracking and failsafe checks in
 - B: the identical architecture, learner, and ordinary augmentations with broad appearance randomization.
 - C: B plus valid paired-history representation/policy consistency.
 
-The primary comparison is equal training GPU-hours, not simultaneously equal transitions. Hold geometry sampling, control interface, architecture capacity, ordinary augmentations, and checkpoint-selection protocol fixed. Three training seeds per arm. Choose loss weights only on development data, with an explicit small tuning budget. Count C's extra rendering and representation updates inside its budget.
+The primary comparison is equal training GPU-hours, not simultaneously equal transitions. Hold geometry sampling, control interface, architecture capacity, ordinary augmentations, and checkpoint-selection protocol fixed. Use a small number of training seeds per arm, at least three for claim-bearing main runs. Choose loss weights only on development data, with an explicit small tuning budget. Count C's extra rendering and representation updates inside its budget.
 
-Start with a fixed 8 GPU-hour training budget per run: nine main runs, at most 72 GPU-hours before separately recorded evaluation and tuning. Do not stop a main run early just because it reaches the success threshold; report time-to-threshold as a secondary endpoint. Save predetermined transition milestones for a secondary equal-transition comparison over the range all arms reach. Record exact completed transitions, budget overshoot at the last update, and failed/censored runs. If a run reaches the cap without learning the simulation task, it is a training/budget failure, not evidence about sim-to-real transfer.
+Fix a training budget per run derived from the measured E000 profile and the transition count each arm plausibly needs; report the total across arms before separately recorded evaluation and tuning. Do not stop a main run early just because it reaches the success threshold; report time-to-threshold as a secondary endpoint. Save predetermined transition milestones for a secondary equal-transition comparison over the range all arms reach. Record exact completed transitions, budget overshoot at the last update, and failed/censored runs. If a run reaches the cap without learning the simulation task, it is a training/budget failure, not evidence about sim-to-real transfer.
 
-Evaluate held-out simulated geometry and appearance, then zero-shot real development trials before any real-video adaptation. Use a separate sealed final real suite for the later claim. The first iteration should fit roughly within the first two weeks after E000 and hardware access; do not delay real evaluation until the grammar is elaborate.
+Evaluate held-out simulated geometry and appearance, then zero-shot real development trials before any real-video adaptation. Use a separate sealed final real suite for the later claim. Do not delay real evaluation until the grammar is elaborate.
 
 ### Decision gates
 
 Suggested pilot criteria to freeze in the E001 specification before results are viewed:
 
-- Require at least 90% held-out simulation success on the easy course before diagnosing a real gap.
-- If all RGB variants achieve that simulation criterion but less than 50% real success, while an appropriate depth/reactive reference succeeds on at least 90% of comparable trials and timing/control checks pass, reject the current zero-shot visual recipe for this scope.
+- Require high held-out simulation success on the easy course before diagnosing a real gap.
+- If all RGB variants achieve that simulation criterion but fail real trials while an appropriate depth/reactive reference succeeds on comparable trials and timing/control checks pass, reject the current zero-shot visual recipe for this scope.
 - If broad randomization transfers well but paired consistency does not improve results at equal resources, keep the simpler method and reject the extra objective, not the generator concept.
-- If the best RGB variant achieves around 80% or better real pilot success with a modest matched sim-to-real gap, continue to a larger held-out evaluation and dynamic obstacles. This is a development gate, not a statistical proof or deployment threshold.
+- If the best RGB variant achieves strong real pilot success with a modest matched sim-to-real gap, continue to a larger held-out evaluation and dynamic obstacles. This is a development gate, not a statistical proof or deployment threshold.
 - If simulator and reference policies both fail on hardware, fix task observability, control mismatch, or evaluation setup before drawing representation conclusions.
 
 No finite small experiment can falsify every possible procedural-learning method, especially given existing positive prior art. E001 can quickly falsify **this low-data, low-compute recipe on its declared easy task**. Failure there is a strong reason not to spend months on broader geometry and semantics yet.
 
 ## 13. Curriculum after a fixed-distribution result
 
-Start E003 only after E001/E002 have stable evaluation. Use a simple mixture, provisionally 50% fresh uniform worlds, 30% replayed high-learning-potential worlds, and 20% local mutations. These weights are hyperparameters, not theory.
+Start E003 only after E001/E002 have stable evaluation. Use a simple mixture of fresh uniform worlds, replayed high-learning-potential worlds, and local mutations, with weights treated as hyperparameters rather than theory.
 
 Store full realized scenarios and failure traces. Prioritize learnable failures, estimated regret, or improvement on revisit rather than maximum failure alone. Normalize priorities across families and deduplicate nearly identical encounters. Keep a minimum sampling floor for every training family.
 
@@ -492,7 +493,7 @@ State which tier each run supports. Never equate a stored seed with a reproducib
 
 ### Seeds, splits, and scenarios
 
-Derive independent streams for geometry, layout, appearance, camera noise, actor intent/motion, vehicle parameters, policy initialization, minibatches, and evaluation. Use a pinned algorithm and canonical identity encoding, with identities such as `(root_seed, split_id, scenario_id, episode_id, stream_id, sample_index)`. Do not use wall-clock scheduling or an implementation-dependent hash to determine samples.
+Derive independent streams for geometry, layout, appearance, camera noise, actor intent/motion, vehicle parameters, policy initialization, minibatches, and evaluation. Use a pinned algorithm and canonical identity encoding. Do not use wall-clock scheduling or an implementation-dependent hash to determine samples.
 
 Environment reset order must not perturb another environment's stream. If the implementation promises batching-independent scenario replay, use stable scenario identity rather than batch slot alone and test that promise.
 
@@ -504,7 +505,7 @@ Version immutable split manifests. Keep separate training, development, held-out
 
 Record the Git revision and dirty status; claim-bearing runs use a clean committed source tree. Exploratory dirty runs require a saved patch and hashes of relevant untracked inputs and are labeled accordingly. Do not capture secrets while recording source provenance.
 
-Record `flake.lock`, `Cargo.lock`, installed Python package versions/lock information, vendored learner commit, compiled native-library hashes, compiler/build flags, GPU model/VRAM, driver, CUDA, PyTorch, graphics backend/adapter, shader/config versions, and precision/determinism settings. Nix pins user-space dependencies, not the physical GPU or host driver.
+Record the pinned dependency set (lockfiles, installed Python packages, vendored learner commit), compiled native-library hashes, compiler/build flags, GPU model/VRAM, driver, CUDA, PyTorch, graphics backend/adapter, shader/config versions, and precision/determinism settings. Nix pins user-space dependencies, not the physical GPU or host driver.
 
 Store exact launch arguments and resolved paths or content-addressed references. Include imported checkpoint/model identifiers, hashes, licenses, preprocessing, and external data assumptions. On the same environment, request deterministic kernels where supported and document exceptions and their cost.
 
@@ -525,34 +526,16 @@ For the first slice, restart training from the committed specification when nece
 - Test behavioral contracts: seed isolation, geometry/collision agreement, image orientation/timing, independent resets, final frames, checksum validation, and replay. Avoid tests that merely freeze prose or incidental formatting.
 - Run relevant checks from [contributing.md](contributing.md), plus a GPU visual smoke/replay inspection for rendered-observation changes. Publish commands, outcomes, and any unavailable checks in the experiment report.
 
-## 16. Evidence-gated 90-day schedule
+## 16. Evidence-gated schedule
 
 Assume access to a controllable camera-equipped platform and a safe test space early in the schedule. If that access is unavailable, label the result simulation-only and do not substitute a video benchmark for closed-loop transfer.
 
-| Days | Work | Required evidence / gate |
+| Phase | Work | Required evidence / gate |
 | :--- | :--- | :--- |
-| 1-5 | E000 harness, run records, scene/action replay, tiny visual learner, profile; identify real camera/controller | Reproducible RGB loop and measured bottlenecks; no claimed transfer |
-| 6-20 | E001 three-arm static experiment; recurrent baseline; held-out geometry/appearance; first real development trials | A measured zero-shot gap with control/observability references; stop or simplify on the E001 failure gate |
-| 21-35 | E002 frame-stack/recurrent comparison, action-conditioned prediction, one crossing and one occluded actor family | Dynamic closed-loop gain over the static/broad-randomization baseline, with memory/action ablations |
-| 36-50 | E003 uniform versus prioritized/mutated worlds; extra independent geometry and motion families | Gains on untouched development families at equal total compute, not just mined worlds |
-| 51-65 | E004 real-video dose curve and frozen-pretrained-feature baseline; selective encoder adaptation | Real success versus unique video hours; no catastrophic loss on synthetic anchor tasks |
-| 66-75 | E005 one semantic convention only if physical transfer works; otherwise spend this interval on diagnosed physical failures | Benefit from explicit semantic information with stale/missing-context tests and measured latency |
-| 76-90 | Freeze methods; strongest affordable baseline comparisons; sealed sim/real evaluation; artifact replay audit | Multi-seed results, failures, data/compute/latency table, and a continue/pivot decision |
-
-Treat later rows as conditional, not commitments to add complexity regardless of evidence. Budget roughly 300-500 total local GPU-hours for the 90-day study, including failed runs and tuning, then revise after E000 measurements. Do not launch a full Cartesian product of losses, generators, seeds, and video amounts. Screen on development data, then replicate a small finalist set.
-
-## 17. Expected first failures and responses
-
-| Likely failure | Diagnostic and next action |
-| :--- | :--- |
-| Renderer/readback dominates | E000 full-loop profile; batch views/reuse targets before considering a bounded custom renderer or native interop |
-| Policy ignores RGB | Vary obstacle layout, shuffle/blank images, inspect encoder gradients and action changes; remove position/seed shortcuts |
-| High sim success, poor real control | Check camera/timing/action response, compare matched courses and a depth/reactive reference, then narrow appearance/sensor failures |
-| Thin/dark obstacles invisible at 64x64 | Measure apparent size/contrast and stopping distance; change resolution, speed, or task envelope |
-| Appearance loss erases useful information | Relevant-change counterexamples, action-risk discrimination, lower weighting or restrict valid intervention pairs |
-| Prediction learns persistence or averages danger | Compare action-free/shuffled-action baselines; use longer informative encounters or a small uncertainty-aware head |
-| Real-video adaptation hurts control | Freeze more of the encoder, replay synthetic anchors, reduce update budget, or keep the zero-shot policy |
-| Curriculum concentrates on impossible cases | Feasibility checks, family floors, deduplication, and a uniform-sampling control |
-| Semantic context arrives too late or is wrong | Shorter validity windows, context-drop training, lower speed, or a faster task-specific path; record intervention |
-
-The immediate deliverable is E000 and its evidence bundle. A positive E001 result earns work on dynamics and broader generator families. A negative result should identify which assumption failed before Triage grows another subsystem.
+| 1 | E000 harness, run records, scene/action replay, tiny visual learner, profile; identify real camera/controller and begin hardware bring-up in parallel | Reproducible RGB loop and measured bottlenecks; no claimed transfer |
+| 2 | E001 three-arm static experiment; recurrent baseline; held-out geometry/appearance; first real development trials | A measured zero-shot gap with control/observability references; stop or simplify on the E001 failure gate |
+| 3 | E002 frame-stack/recurrent comparison, action-conditioned prediction, one crossing and one occluded actor family | Dynamic closed-loop gain over the static/broad-randomization baseline, with memory/action ablations |
+| 4 | E003 uniform versus prioritized/mutated worlds; extra independent geometry and motion families | Gains on untouched development families at equal total compute, not just mined worlds |
+| 5 | E004 real-video dose curve and frozen-pretrained-feature baseline; selective encoder adaptation | Real success versus unique video hours; no catastrophic loss on synthetic anchor tasks |
+| 6 | E005 one semantic convention only if physical transfer works; otherwise spend this interval on diagnosed physical failures | Benefit from explicit semantic information with stale/missing-context tests and measured latency |
+| 7 | Freeze methods; strongest affordable baseline comparisons; sealed sim/real evaluation; artifact replay audit | Multi-seed results, failures, data/compute/latency table, and a continue/pivot decision |
