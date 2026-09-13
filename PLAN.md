@@ -106,7 +106,7 @@ Source inventory at the plan update:
 - `apps/rgb-env` plus `rl/rgb_environment.py` and related `rl/rgb_*` modules: a first staged version of the RGB closed-loop bridge, built for E000.
 - `README.md`: seeded scene generation, realized-scene replay, RGB/depth/instance outputs, and sensor provenance are documented separately from state-policy training.
 
-The critical connection — rendered camera observations consumed by a closed-loop navigation learner — now exists in staged form. A GPU renderer and a GPU physics batch did not imply this connection; it was built deliberately and its remaining E000 gates are checkpoint reload and the visual-dependence diagnostic.
+The critical connection — rendered camera observations consumed by a closed-loop navigation learner — now exists in staged form. A GPU renderer and a GPU physics batch did not imply this connection; it was built deliberately and its remaining E000 gate is rerunning the shuffle arm on a visually diverse fixture (checkpoint reload and the visual-dependence diagnostic are complete).
 
 Retain the existing SI/frame conventions, quaternion handling, fixed-step timing, action interpretation, final-observation/autoreset semantics, and versioned scene/sensor contracts. Read the relevant implementation and archived sections before changing them. Introduce a separately named visual-navigation task rather than silently changing hover/tracking observations or action meanings.
 
@@ -362,7 +362,7 @@ Freeze checkpoint selection on development evaluation. Count safety intervention
 
 ## 11. First slice: E000, reproducible RGB control loop
 
-**Status: implementation and profiling complete; acceptance evidence partial. The remaining E000 gates are checkpoint reload and the visual-dependence diagnostic.**
+**Status: implementation and profiling complete; acceptance evidence partial. Checkpoint reload and the visual-dependence diagnostic are complete; the remaining E000 gate is rerunning the shuffle arm on a visually diverse fixture.**
 
 The deliverable is a small working experiment, not a new general simulator or a library of shapes.
 
@@ -415,7 +415,7 @@ Before hardware trials, demonstrate the velocity-tracking and failsafe checks in
 - B: the identical architecture, learner, and ordinary augmentations with broad appearance randomization.
 - C: B plus valid paired-history representation/policy consistency.
 
-The primary comparison is equal training GPU-hours, not simultaneously equal transitions. Hold geometry sampling, control interface, architecture capacity, ordinary augmentations, and checkpoint-selection protocol fixed. Use a small number of training seeds per arm. Choose loss weights only on development data, with an explicit small tuning budget. Count C's extra rendering and representation updates inside its budget.
+The primary comparison is equal training GPU-hours, not simultaneously equal transitions. Hold geometry sampling, control interface, architecture capacity, ordinary augmentations, and checkpoint-selection protocol fixed. Use a small number of training seeds per arm, at least three for claim-bearing main runs. Choose loss weights only on development data, with an explicit small tuning budget. Count C's extra rendering and representation updates inside its budget.
 
 Fix a training budget per run derived from the measured E000 profile and the transition count each arm plausibly needs; report the total across arms before separately recorded evaluation and tuning. Do not stop a main run early just because it reaches the success threshold; report time-to-threshold as a secondary endpoint. Save predetermined transition milestones for a secondary equal-transition comparison over the range all arms reach. Record exact completed transitions, budget overshoot at the last update, and failed/censored runs. If a run reaches the cap without learning the simulation task, it is a training/budget failure, not evidence about sim-to-real transfer.
 
