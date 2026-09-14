@@ -58,6 +58,8 @@ pub struct RgbEnv {
     completed_lengths: Vec<f32>,
     episode_counts: Vec<u64>,
     current_returns: Vec<f32>,
+    gap_centers: Vec<f32>,
+    vehicle_xs: Vec<f32>,
     current_lengths: Vec<f32>,
     renderer: Renderer,
     cube: sim_graphics::MeshHandle,
@@ -124,6 +126,8 @@ impl RgbEnv {
             episode_counts: vec![0; n],
             current_returns: vec![0.0; n],
             current_lengths: vec![0.0; n],
+            gap_centers: vec![0.0; n],
+            vehicle_xs: vec![0.0; n],
             renderer,
             cube,
             plane,
@@ -163,6 +167,10 @@ impl RgbEnv {
             for env in 0..self.n {
                 self.fill_history_from_current(env, 1);
             }
+        }
+        for env in 0..self.n {
+            self.vehicle_xs[env] = self.states[env].x;
+            self.gap_centers[env] = gap_center(self.seed, env, self.states[env].episode);
         }
         self.current_returns.fill(0.0);
         self.current_lengths.fill(0.0);
@@ -278,6 +286,8 @@ impl RgbEnv {
         for env in 0..self.n {
             self.current_returns[env] = self.states[env].return_;
             self.current_lengths[env] = self.states[env].length as f32;
+            self.vehicle_xs[env] = self.states[env].x;
+            self.gap_centers[env] = gap_center(self.seed, env, self.states[env].episode);
         }
         Ok(())
     }
@@ -411,6 +421,8 @@ impl RgbEnv {
             9 => self.current_lengths.as_mut_ptr().cast(),
             10 => self.successes.as_mut_ptr().cast(),
             11 => self.paired_observations.as_mut_ptr().cast(),
+            12 => self.gap_centers.as_mut_ptr().cast(),
+            13 => self.vehicle_xs.as_mut_ptr().cast(),
             _ => std::ptr::null_mut(),
         }
     }
@@ -432,10 +444,9 @@ impl RgbEnv {
     }
 }
 
-fn obstacles(seed: u64, env: usize, episode: u64) -> [(Vec3, Vec3); 5] {
-    // Per-(env, episode) seeded layout. The wall's gap position is drawn from
-    // the same stream, so a blind forward policy always collides: the course
-    // cannot be solved without reading the scene.
+fn obstacles(seed: u64, env: usize, episode: u64) -> [(Vec3, Vec3); 2] {
+    // Per-(env, episode) seeded wall gap. A blind forward policy always
+    // collides: the course cannot be solved without reading the scene.
     let stream = mix64(
         seed ^ mix64((env as u64).wrapping_mul(0x9e3779b97f4a7c15))
             ^ mix64(episode.wrapping_mul(0x85ebca6b)),
@@ -444,23 +455,9 @@ fn obstacles(seed: u64, env: usize, episode: u64) -> [(Vec3, Vec3); 5] {
         let value = mix64(stream.wrapping_add(index.wrapping_mul(0xc2b2ae35)));
         ((value >> shift) & 1023) as f32 / 1023.0
     };
-    let mut layout = [
-        (Vec3::new(-1.4, 0.8, -2.4), Vec3::new(0.9, 1.6, 0.8)),
-        (Vec3::new(1.1, 1.1, -4.2), Vec3::new(1.5, 2.2, 0.9)),
-        (Vec3::new(-0.1, 0.55, -6.1), Vec3::new(2.5, 1.1, 0.7)),
-        (Vec3::ZERO, Vec3::ZERO),
-        (Vec3::ZERO, Vec3::ZERO),
-    ];
-    for (index, (position, scale)) in layout[..3].iter_mut().enumerate() {
-        let index = index as u64 + 1;
-        position.x += (jitter(index, 0) - 0.5) * 1.0;
-        position.z += (jitter(index, 10) - 0.5) * 0.8;
-        scale.x *= 0.85 + jitter(index, 20) * 0.3;
-        scale.z *= 0.85 + jitter(index, 30) * 0.3;
-    }
+    let mut layout = [(Vec3::ZERO, Vec3::ZERO); 2];
     // Wall across the corridor at z = -5.2 with a gap of half-width 1.5
-    // centered at gap_x in [-2.6, 2.6]. Two boxes fill the sides. The z slot
-    // sits between the second and third jittered obstacles' ranges. The gap
+    // centered at gap_x in [-2.6, 2.6]. Two boxes fill the sides. The gap
     // is wide enough to learn within the E001 budget but still requires
     // steering toward the observed position.
     let gap_x = (jitter(4, 0) - 0.5) * 5.2;
@@ -471,15 +468,25 @@ fn obstacles(seed: u64, env: usize, episode: u64) -> [(Vec3, Vec3); 5] {
     let corridor_half = 4.5f32;
     let left_width = (gap_x - gap_half) - (-corridor_half);
     let right_width = corridor_half - (gap_x + gap_half);
-    layout[3] = (
+    layout[0] = (
         Vec3::new(-corridor_half + left_width * 0.5, wall_y * 0.5, wall_z),
         Vec3::new(left_width.max(0.01), wall_y, wall_half_z * 2.0),
     );
-    layout[4] = (
+    layout[1] = (
         Vec3::new(gap_x + gap_half + right_width * 0.5, wall_y * 0.5, wall_z),
         Vec3::new(right_width.max(0.01), wall_y, wall_half_z * 2.0),
     );
     layout
+}
+
+fn gap_center(seed: u64, env: usize, episode: u64) -> f32 {
+    // Same stream as obstacles(): index 4, shift 0 draws the wall gap center.
+    let stream = mix64(
+        seed ^ mix64((env as u64).wrapping_mul(0x9e3779b97f4a7c15))
+            ^ mix64(episode.wrapping_mul(0x85ebca6b)),
+    );
+    let value = mix64(stream.wrapping_add(4u64.wrapping_mul(0xc2b2ae35)));
+    ((value & 1023) as f32 / 1023.0 - 0.5) * 5.2
 }
 
 fn collides(seed: u64, env: usize, episode: u64, x: f32, z: f32) -> bool {

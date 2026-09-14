@@ -98,6 +98,8 @@ class RGBEnv:
             if paired
             else None
         )
+        self._host_gap_centers = self._view(12, ctypes.c_float, (n,))
+        self._host_vehicle_xs = self._view(13, ctypes.c_float, (n,))
 
         if self.device.type == "cuda":
             self._staging = [
@@ -135,6 +137,8 @@ class RGBEnv:
             if paired
             else None
         )
+        self.gap_centers = torch.empty_like(self.rewards)
+        self.vehicle_xs = torch.empty_like(self.rewards)
         self.terminated = torch.empty_like(self.rewards)
         self.truncated = torch.empty_like(self.rewards)
         self.completed_returns = torch.empty_like(self.rewards)
@@ -193,6 +197,8 @@ class RGBEnv:
         self._copy(self.current_returns, self._host_current_returns)
         self._copy(self.current_lengths, self._host_current_lengths)
         self._copy(self.successes, self._host_successes)
+        self._copy(self.gap_centers, self._host_gap_centers)
+        self._copy(self.vehicle_xs, self._host_vehicle_xs)
 
     def reset(self, seed=None):
         seed = self.seed if seed is None else seed
