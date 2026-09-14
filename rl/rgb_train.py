@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--recurrent", action="store_true")
+    parser.add_argument("--paired", action="store_true")
+    parser.add_argument("--consistency-coef", type=float, default=0.1)
     args = parser.parse_args()
     if args.num_envs <= 0 or args.horizon <= 0 or args.steps <= 0:
         parser.error("num-envs, horizon and steps must be positive")
@@ -44,6 +46,7 @@ def main():
         seed=args.seed,
         device=args.device,
         library=args.library,
+        paired=args.paired,
     ) as env:
         policy_cls = RecurrentRGBPolicy if args.recurrent else RGBPolicy
         policy = policy_cls(env.observation_shape).to(env.device)
@@ -68,6 +71,8 @@ def main():
             "vf_coef": 0.5,
             "ent_coef": 0.001,
             "max_grad_norm": 1.0,
+            "paired": args.paired,
+            "consistency_coef": args.consistency_coef,
         }
         learner = PuffeRL(config, env, policy)
         if args.resume:

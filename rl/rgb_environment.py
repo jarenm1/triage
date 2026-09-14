@@ -26,6 +26,7 @@ class RGBEnv:
         height=64,
         device=0,
         library=None,
+        paired=False,
     ):
         if n <= 0 or max_steps <= 0 or width <= 0 or height <= 0:
             raise ValueError("n, max_steps, width and height must be positive")
@@ -53,6 +54,7 @@ class RGBEnv:
             ctypes.c_uint32,
             ctypes.c_uint32,
             ctypes.c_uint32,
+            ctypes.c_uint8,
         ]
         self.lib.triage_rgb_create.restype = p
         self.lib.triage_rgb_reset.argtypes = [p, ctypes.c_uint64]
@@ -70,7 +72,9 @@ class RGBEnv:
         self.lib.triage_rgb_timings.argtypes = [p, ctypes.POINTER(ctypes.c_double)]
         self.lib.triage_rgb_timings.restype = ctypes.c_int
 
-        self.handle = self.lib.triage_rgb_create(n, seed, max_steps, width, height)
+        self.handle = self.lib.triage_rgb_create(
+            n, seed, max_steps, width, height, 1 if paired else 0
+        )
         if not self.handle:
             self._raise()
         self.last_step_timings = {}
@@ -89,6 +93,11 @@ class RGBEnv:
         self._host_current_returns = self._view(8, ctypes.c_float, (n,))
         self._host_current_lengths = self._view(9, ctypes.c_float, (n,))
         self._host_successes = self._view(10, ctypes.c_float, (n,))
+        self._host_paired = (
+            self._view(11, ctypes.c_uint8, (n, self.history_frames * 3, height, width))
+            if paired
+            else None
+        )
 
         if self.device.type == "cuda":
             self._staging = [
@@ -119,6 +128,13 @@ class RGBEnv:
         )
         self.final_observations = torch.empty_like(self.observations)
         self.rewards = torch.empty(n, dtype=torch.float32, device=self.device)
+        self.paired_observations = (
+            torch.empty(
+                (n, *self.observation_shape), dtype=torch.uint8, device=self.device
+            )
+            if paired
+            else None
+        )
         self.terminated = torch.empty_like(self.rewards)
         self.truncated = torch.empty_like(self.rewards)
         self.completed_returns = torch.empty_like(self.rewards)
@@ -148,6 +164,8 @@ class RGBEnv:
         if self.device.type != "cuda":
             self.observations.copy_(torch.from_numpy(self._host_observations))
             self.final_observations.copy_(torch.from_numpy(self._host_final_observations))
+            if self._host_paired is not None:
+                self.paired_observations.copy_(torch.from_numpy(self._host_paired))
             return
 
         slot = self._staging_index
@@ -157,6 +175,8 @@ class RGBEnv:
         np.copyto(observations.numpy(), self._host_observations)
         np.copyto(final_observations.numpy(), self._host_final_observations)
         self.observations.copy_(observations, non_blocking=True)
+        if self._host_paired is not None:
+            self.paired_observations.copy_(torch.from_numpy(self._host_paired))
         self.final_observations.copy_(final_observations, non_blocking=True)
         self._staging_events[slot].record(torch.cuda.current_stream(self.device))
         self._staging_recorded[slot] = True

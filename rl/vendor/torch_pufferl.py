@@ -58,6 +58,11 @@ class PuffeRL:
         self.advantages = buffer(n, horizon)
         self.ratio = torch.ones(n, horizon, device=self.device)
         self.episode_stats = buffer(3)
+        self.paired = bool(config.get("paired", False)) and getattr(
+            vec, "paired_observations", None
+        ) is not None
+        if self.paired:
+            self.paired_observations = buffer(horizon, n, *self.observation_shape)
         self.recurrent = bool(getattr(policy, "recurrent", False))
         if self.recurrent:
             self.hidden_size = int(policy.hidden_size)
@@ -89,6 +94,8 @@ class PuffeRL:
             logits, value, next_state = self.policy.forward_eval(
                 self.observations[t], self._state, self._prev_action
             )
+            if self.paired:
+                self.paired_observations[t].copy_(env.paired_observations)
             action, logprob, _ = sample_logits(logits)
             self.actions[t].copy_(action)
             self.logprobs[t].copy_(logprob)
@@ -193,6 +200,13 @@ class PuffeRL:
                 )
             else:
                 logits, newvalue = self.policy(mb_obs)
+            if self.paired:
+                mb_paired = self.paired_observations.transpose(0, 1)[idx]
+                consistency = (
+                    self.policy.features(mb_obs) - self.policy.features(mb_paired)
+                ).pow(2).mean()
+            else:
+                consistency = torch.zeros((), device=device)
             actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
 
             newlogprob = newlogprob.reshape(mb_logprobs.shape)
@@ -221,7 +235,10 @@ class PuffeRL:
 
             entropy_loss = entropy.mean()
             loss = (
-                pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss
+                pg_loss
+                + config["vf_coef"] * v_loss
+                - config["ent_coef"] * entropy_loss
+                + config.get("consistency_coef", 0.0) * consistency
             )
             val.index_copy_(0, idx, newvalue.detach().float())
 
@@ -232,6 +249,7 @@ class PuffeRL:
             losses["approx_kl"] += approx_kl
             losses["clipfrac"] += clipfrac
             losses["importance"] += ratio.mean()
+            losses["consistency"] += consistency
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(

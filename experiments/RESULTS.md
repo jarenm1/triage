@@ -100,6 +100,12 @@ Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recordin
 - The native env now exposes a per-env `successes` buffer (field 10) so episode records distinguish success from collision; a dropped `state.return_` accumulation was restored after eval showed zeroed returns.
 - Smoke run: `target/experiments/e001-eval-dev-seed101/` — the 131k-step GRU checkpoint on development seed 101 produced 929 episodes, all collisions, mean return -7.45, matching the diagnostic's -7.59. The harness is validated; the policy is not yet competent.
 
+## E001 / 1 paired-render path (arm C)
+
+- `apps/rgb-env` accepts a `paired` flag: each render pass runs twice per step, once per appearance variant, with variant-aware view keys and seeded color streams. Paired frames land in a second history buffer (field 11) exposed as `env.paired_observations`.
+- `PuffeRL` stores paired observations per rollout step and adds `consistency_coef * MSE(features(obs), features(paired_obs))` to the loss; both policies expose `features()` (encoder output, pre-GRU for the recurrent policy).
+- `rl/rgb_train.py --paired --consistency-coef` runs the arm-C path. Smoke: 1,024 steps, consistency loss 0.033, finite losses, checkpoint saved. Paired frames differ from primary by ~38/255 mean pixel intensity with identical geometry.
+
 ## E000 / 2 fixed-action replay and full-loop profile
 
 - Clean source revision: `594b00c`; both fresh-process runs used seed 11, 256 environments, 64x64 RGB, 64 measured steps, two warmup steps, and `max_steps=64`.
