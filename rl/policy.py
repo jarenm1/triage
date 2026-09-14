@@ -90,6 +90,10 @@ class RGBPolicy(nn.Module):
         )
         return distribution, self.critic(features)
 
+    def features(self, observations):
+        observations = observations.reshape(-1, *self.observation_shape)
+        return self.encoder(observations.float() / 255.0)
+
     def forward_eval(self, observations, state=(), prev_action=None):
         distribution, value = self(observations)
         return distribution, value, ()
@@ -141,6 +145,9 @@ class RecurrentRGBPolicy(nn.Module):
     def _features(self, observations):
         observations = observations.reshape(-1, *self.observation_shape)
         return self.encoder(observations.float() / 255.0)
+
+    def features(self, observations):
+        return self._features(observations)
 
     def _heads(self, features):
         mean = self.actor(features)

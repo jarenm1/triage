@@ -47,6 +47,8 @@ pub struct RgbEnv {
     states: Vec<State>,
     observations: Vec<u8>,
     final_observations: Vec<u8>,
+    paired: bool,
+    paired_observations: Vec<u8>,
     rgba_batch: Vec<u8>,
     rewards: Vec<f32>,
     terminated: Vec<f32>,
@@ -67,7 +69,14 @@ pub struct RgbEnv {
 }
 
 impl RgbEnv {
-    fn new(n: usize, seed: u64, max_steps: u32, width: u32, height: u32) -> Result<Self> {
+    fn new(
+        n: usize,
+        seed: u64,
+        max_steps: u32,
+        width: u32,
+        height: u32,
+        paired: bool,
+    ) -> Result<Self> {
         ensure!(n > 0, "environment count must be positive");
         ensure!(max_steps > 0, "max_steps must be positive");
         ensure!(width > 0 && height > 0, "image dimensions must be positive");
@@ -100,6 +109,12 @@ impl RgbEnv {
             observations: vec![0; n * history_bytes],
             final_observations: vec![0; n * history_bytes],
             rgba_batch: vec![0; n * rgba_frame_bytes],
+            paired,
+            paired_observations: if paired {
+                vec![0; n * history_bytes]
+            } else {
+                Vec::new()
+            },
             rewards: vec![0.0; n],
             terminated: vec![0.0; n],
             truncated: vec![0.0; n],
@@ -136,10 +151,18 @@ impl RgbEnv {
         self.last_dynamics_ms = 0.0;
         self.last_history_ms = 0.0;
         let render_start = Instant::now();
-        self.render_batch()?;
+        self.render_batch(0)?;
         self.last_render_ms = render_start.elapsed().as_secs_f64() * 1_000.0;
         for env in 0..self.n {
-            self.fill_history_from_current(env);
+            self.fill_history_from_current(env, 0);
+        }
+        if self.paired {
+            let render_start = Instant::now();
+            self.render_batch(1)?;
+            self.last_render_ms += render_start.elapsed().as_secs_f64() * 1_000.0;
+            for env in 0..self.n {
+                self.fill_history_from_current(env, 1);
+            }
         }
         self.current_returns.fill(0.0);
         self.current_lengths.fill(0.0);
@@ -198,11 +221,11 @@ impl RgbEnv {
         self.last_render_ms = 0.0;
         self.last_history_ms = 0.0;
         let render_start = Instant::now();
-        self.render_batch()?;
+        self.render_batch(0)?;
         self.last_render_ms += render_start.elapsed().as_secs_f64() * 1_000.0;
         let history_start = Instant::now();
         for env in 0..self.n {
-            self.append_current_frame(env);
+            self.append_current_frame(env, 0);
             if done[env] {
                 let base = env * self.history_bytes;
                 self.final_observations[base..base + self.history_bytes]
@@ -217,18 +240,40 @@ impl RgbEnv {
             }
         }
         self.last_history_ms += history_start.elapsed().as_secs_f64() * 1_000.0;
+        if self.paired {
+            let render_start = Instant::now();
+            self.render_batch(1)?;
+            self.last_render_ms += render_start.elapsed().as_secs_f64() * 1_000.0;
+            let history_start = Instant::now();
+            for env in 0..self.n {
+                self.append_current_frame(env, 1);
+            }
+            self.last_history_ms += history_start.elapsed().as_secs_f64() * 1_000.0;
+        }
 
         if done.iter().any(|value| *value) {
             let render_start = Instant::now();
-            self.render_batch()?;
+            self.render_batch(0)?;
             self.last_render_ms += render_start.elapsed().as_secs_f64() * 1_000.0;
             let history_start = Instant::now();
-            for (env, is_done) in done.into_iter().enumerate() {
-                if is_done {
-                    self.fill_history_from_current(env);
+            for (env, is_done) in done.iter().enumerate() {
+                if *is_done {
+                    self.fill_history_from_current(env, 0);
                 }
             }
             self.last_history_ms += history_start.elapsed().as_secs_f64() * 1_000.0;
+            if self.paired {
+                let render_start = Instant::now();
+                self.render_batch(1)?;
+                self.last_render_ms += render_start.elapsed().as_secs_f64() * 1_000.0;
+                let history_start = Instant::now();
+                for (env, is_done) in done.iter().enumerate() {
+                    if *is_done {
+                        self.fill_history_from_current(env, 1);
+                    }
+                }
+                self.last_history_ms += history_start.elapsed().as_secs_f64() * 1_000.0;
+            }
         }
         for env in 0..self.n {
             self.current_returns[env] = self.states[env].return_;
@@ -237,7 +282,7 @@ impl RgbEnv {
         Ok(())
     }
 
-    fn render_batch(&mut self) -> Result<()> {
+    fn render_batch(&mut self, variant: u8) -> Result<()> {
         self.frame.begin();
         let grid = (self.n as f32).sqrt().ceil() as usize;
         let spacing = 16.0f32;
@@ -249,7 +294,7 @@ impl RgbEnv {
             let state = self.states[env];
             let vehicle = origin + Vec3::new(state.x, 0.0, state.z);
             self.frame.add_view(RenderView {
-                key: ViewKey(env as u64),
+                key: ViewKey(env as u64 * 2 + u64::from(variant)),
                 kind: ViewKind::Sensor,
                 camera: Camera {
                     eye: vehicle + Vec3::new(0.0, 2.0, 4.5),
@@ -270,7 +315,7 @@ impl RgbEnv {
                     Quat::IDENTITY,
                     origin + Vec3::new(0.0, -0.05, -2.5),
                 ),
-                color: floor_color(self.seed, env),
+                color: floor_color(self.seed, env, variant),
                 object_id: env as u32 * 10 + 1,
             });
             for (index, (position, scale)) in obstacles(self.seed, env, state.episode)
@@ -284,7 +329,7 @@ impl RgbEnv {
                         Quat::IDENTITY,
                         origin + position,
                     ),
-                    color: obstacle_color(self.seed, env, index),
+                    color: obstacle_color(self.seed, env, index, variant),
                     object_id: env as u32 * 10 + 2 + index as u32,
                 });
             }
@@ -314,9 +359,14 @@ impl RgbEnv {
         Ok(())
     }
 
-    fn append_current_frame(&mut self, env: usize) {
+    fn append_current_frame(&mut self, env: usize, variant: u8) {
+        let target = if variant == 0 {
+            &mut self.observations
+        } else {
+            &mut self.paired_observations
+        };
         let history_base = env * self.history_bytes;
-        self.observations.copy_within(
+        target.copy_within(
             history_base + self.frame_bytes..history_base + self.history_bytes,
             history_base,
         );
@@ -325,20 +375,25 @@ impl RgbEnv {
         let plane_pixels = self.frame_bytes / 3;
         for pixel in 0..plane_pixels {
             let source = rgba_base + pixel * 4;
-            self.observations[rgb_base + pixel] = self.rgba_batch[source];
-            self.observations[rgb_base + plane_pixels + pixel] = self.rgba_batch[source + 1];
-            self.observations[rgb_base + 2 * plane_pixels + pixel] = self.rgba_batch[source + 2];
+            target[rgb_base + pixel] = self.rgba_batch[source];
+            target[rgb_base + plane_pixels + pixel] = self.rgba_batch[source + 1];
+            target[rgb_base + 2 * plane_pixels + pixel] = self.rgba_batch[source + 2];
         }
     }
 
-    fn fill_history_from_current(&mut self, env: usize) {
-        self.append_current_frame(env);
+    fn fill_history_from_current(&mut self, env: usize, variant: u8) {
+        self.append_current_frame(env, variant);
+        let target = if variant == 0 {
+            &mut self.observations
+        } else {
+            &mut self.paired_observations
+        };
         let base = env * self.history_bytes;
         let last = base + self.history_bytes - self.frame_bytes;
-        let frame = self.observations[last..last + self.frame_bytes].to_vec();
+        let frame = target[last..last + self.frame_bytes].to_vec();
         for history in 0..HISTORY - 1 {
             let start = base + history * self.frame_bytes;
-            self.observations[start..start + self.frame_bytes].copy_from_slice(&frame);
+            target[start..start + self.frame_bytes].copy_from_slice(&frame);
         }
     }
 
@@ -355,6 +410,7 @@ impl RgbEnv {
             8 => self.current_returns.as_mut_ptr().cast(),
             9 => self.current_lengths.as_mut_ptr().cast(),
             10 => self.successes.as_mut_ptr().cast(),
+            11 => self.paired_observations.as_mut_ptr().cast(),
             _ => std::ptr::null_mut(),
         }
     }
@@ -444,8 +500,11 @@ fn mix64(mut value: u64) -> u64 {
     value ^ value >> 31
 }
 
-fn floor_color(seed: u64, env: usize) -> [f32; 4] {
-    let value = mix64(seed ^ mix64(env as u64).wrapping_add(0x9e3779b97f4a7c15));
+fn floor_color(seed: u64, env: usize, variant: u8) -> [f32; 4] {
+    let value = mix64(
+        seed ^ mix64(env as u64).wrapping_add(0x9e3779b97f4a7c15)
+            ^ mix64((variant as u64).wrapping_mul(0x27d4eb2f)),
+    );
     [
         0.06 + (value & 1023) as f32 / 1023.0 * 0.55,
         0.06 + ((value >> 10) & 1023) as f32 / 1023.0 * 0.55,
@@ -454,10 +513,11 @@ fn floor_color(seed: u64, env: usize) -> [f32; 4] {
     ]
 }
 
-fn obstacle_color(seed: u64, env: usize, index: usize) -> [f32; 4] {
+fn obstacle_color(seed: u64, env: usize, index: usize, variant: u8) -> [f32; 4] {
     let value = mix64(
         seed ^ mix64((env as u64).wrapping_mul(747796405))
-            .wrapping_add((index as u64 + 1).wrapping_mul(2891336453)),
+            .wrapping_add((index as u64 + 1).wrapping_mul(2891336453))
+            ^ mix64((variant as u64).wrapping_mul(0x27d4eb2f)),
     );
     [
         0.08 + (value & 1023) as f32 / 1023.0 * 0.80,
@@ -497,9 +557,10 @@ pub extern "C" fn triage_rgb_create(
     max_steps: u32,
     width: u32,
     height: u32,
+    paired: u8,
 ) -> *mut c_void {
     clear_error();
-    match call(|| RgbEnv::new(n, seed, max_steps, width, height)) {
+    match call(|| RgbEnv::new(n, seed, max_steps, width, height, paired != 0)) {
         Ok(env) => Box::into_raw(Box::new(env)).cast(),
         Err(error) => {
             set_error(error);
