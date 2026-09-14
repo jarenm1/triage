@@ -106,6 +106,12 @@ Updated: 2026-09-13. E000 implementation, fixed-action replay, artifact recordin
 - `PuffeRL` stores paired observations per rollout step and adds `consistency_coef * MSE(features(obs), features(paired_obs))` to the loss; both policies expose `features()` (encoder output, pre-GRU for the recurrent policy).
 - `rl/rgb_train.py --paired --consistency-coef` runs the arm-C path. Smoke: 1,024 steps, consistency loss 0.033, finite losses, checkpoint saved. Paired frames differ from primary by ~38/255 mean pixel intensity with identical geometry.
 
+## E001 / 1 privileged reference controller
+
+- `rl/rgb_reference.py` steers toward the true gap center using the new `gap_centers`/`vehicle_xs` native buffers (fields 12/13) — simulator truth, no vision. It is the diagnostic ceiling: if it succeeds and the RGB policy fails, the gap is a vision problem.
+- Course simplified to the wall alone: the three jittered obstacles were removed because the gap-only reference could not see them and died on them (7.6% success). On the wall-only course the reference achieves **100% success** (256/256 episodes, mean return +11.7, seed 101) while a blind full-forward policy terminates every episode (328 terminations / 300 steps).
+- The course is now provably solvable and provably vision-required. The RGB policy's job is to close the gap between the blind floor (-10/episode) and the privileged ceiling (+11.7).
+
 ## E000 / 2 fixed-action replay and full-loop profile
 
 - Clean source revision: `594b00c`; both fresh-process runs used seed 11, 256 environments, 64x64 RGB, 64 measured steps, two warmup steps, and `max_steps=64`.
