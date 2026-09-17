@@ -60,6 +60,7 @@ pub struct RgbEnv {
     current_returns: Vec<f32>,
     gap_centers: Vec<f32>,
     vehicle_xs: Vec<f32>,
+    vehicle_poses: Vec<f32>,
     current_lengths: Vec<f32>,
     renderer: Renderer,
     cube: sim_graphics::MeshHandle,
@@ -127,6 +128,7 @@ impl RgbEnv {
             current_returns: vec![0.0; n],
             current_lengths: vec![0.0; n],
             gap_centers: vec![0.0; n],
+            vehicle_poses: vec![0.0; n * 4],
             vehicle_xs: vec![0.0; n],
             renderer,
             cube,
@@ -171,6 +173,12 @@ impl RgbEnv {
         for env in 0..self.n {
             self.vehicle_xs[env] = self.states[env].x;
             self.gap_centers[env] = gap_center(self.seed, env, self.states[env].episode);
+        }
+        for env in 0..self.n {
+            let state = self.states[env];
+            let base = env * 4;
+            self.vehicle_poses[base..base + 4]
+                .copy_from_slice(&[state.x, state.z, state.vx, state.vz]);
         }
         self.current_returns.fill(0.0);
         self.current_lengths.fill(0.0);
@@ -288,6 +296,12 @@ impl RgbEnv {
             self.current_lengths[env] = self.states[env].length as f32;
             self.vehicle_xs[env] = self.states[env].x;
             self.gap_centers[env] = gap_center(self.seed, env, self.states[env].episode);
+        }
+        for env in 0..self.n {
+            let state = self.states[env];
+            let base = env * 4;
+            self.vehicle_poses[base..base + 4]
+                .copy_from_slice(&[state.x, state.z, state.vx, state.vz]);
         }
         Ok(())
     }
@@ -423,6 +437,7 @@ impl RgbEnv {
             11 => self.paired_observations.as_mut_ptr().cast(),
             12 => self.gap_centers.as_mut_ptr().cast(),
             13 => self.vehicle_xs.as_mut_ptr().cast(),
+            14 => self.vehicle_poses.as_mut_ptr().cast(),
             _ => std::ptr::null_mut(),
         }
     }
