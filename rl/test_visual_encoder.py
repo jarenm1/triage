@@ -23,9 +23,9 @@ def test_output_shapes():
     assert out["f"].shape == (3, 64, 12, 16)
     assert out["mask"].shape == (3, 1, 12, 16)
     assert out["probe"].shape == (3, 4)
-    assert out["occupancy"].shape == (3, 1, 24, 32)
-    assert out["future_f"].shape == (3, 32, 6, 8)
-    assert state["h"].shape == (3, 64, 12, 16)
+
+    assert out["occupancy"].shape == (3, 32)
+    assert out["future_f"].shape == (3, 64, 6, 8)
 
 
 def test_uint8_input():

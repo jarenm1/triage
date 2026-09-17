@@ -226,20 +226,21 @@ class VisualEncoder(nn.Module):
         )
         self.global_temporal = GlobalTemporal(cfg) if cfg.global_temporal else None
 
-        # probes (training-time; decode from spatial map when spatial_probe)
+        # probes (training-only; decode from spatial map when spatial_probe)
         self.probe = nn.Linear(cfg.global_dim, 4)  # gap_x, wall_dist, vx, vz
-        occ_h, occ_w = cfg.occupancy_hw
+        occ_w = cfg.occupancy_hw[1]
         self.occupancy = nn.Sequential(
             nn.Conv2d(cfg.latent_channels, 32, 3, 1, 1),
             nn.GELU(),
-            nn.Conv2d(32, 1, 1),
-            nn.Upsample((occ_h, occ_w), mode="bilinear", align_corners=False),
+            nn.Conv2d(32, 8, 1),
+            nn.GELU(),
         )
+        self.occupancy_out = nn.Linear(8 * (cfg.input_hw[1] // 8), occ_w)
         if cfg.future_head:
             self.future = nn.Sequential(
                 nn.Linear(cfg.global_dim + cfg.motion_embed + cfg.action_dim, 256),
                 nn.GELU(),
-                nn.Linear(256, 8 * 6 * 32),
+                nn.Linear(256, 8 * 6 * cfg.latent_channels),
             )
 
     def latent_hw(self):
@@ -308,17 +309,20 @@ class VisualEncoder(nn.Module):
             g = self.global_temporal(hist)
             new_state["g_hist"] = hist
 
+        occ_feat = self.occupancy(h).mean(dim=2)  # (B,8,W_lat) column features
         out = {
             "h": h,
             "g": g,
             "f": f_t,
             "mask": mask,
             "probe": self.probe(g),
-            "occupancy": self.occupancy(h),
+            "occupancy": self.occupancy_out(
+                occ_feat.reshape(occ_feat.shape[0], -1)
+            ),
         }
         if self.cfg.future_head and action is not None:
             pred = self.future(torch.cat([g, m, action], dim=1))
-            out["future_f"] = pred.reshape(-1, 32, 6, 8)
+            out["future_f"] = pred.reshape(-1, self.cfg.latent_channels, 6, 8)
         return out, new_state
 
     def forward_sequence(self, frames, motions, actions=None, state=None):
