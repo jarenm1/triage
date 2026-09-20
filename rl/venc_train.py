@@ -116,7 +116,7 @@ class RolloutData:
     """Flat rollout storage -> contiguous per-env segments -> windows."""
 
     def __init__(self, path, device):
-        d = torch.load(path, weights_only=False)
+        d = torch.load(path, weights_only=False, mmap=True)
         self.device = device
         # frames stored as JPEG byte blobs (bounded RAM, Drive-friendly size)
         self.frames_jpeg = d.get("frames_jpeg")
@@ -136,41 +136,40 @@ class RolloutData:
         seg_start = torch.ones(n, dtype=torch.bool)
         seg_start[1:] = (self.env_id[1:] != self.env_id[:-1]) | self.done[:-1]
         self.seg_starts = seg_start.nonzero().flatten().tolist() + [n]
-        # bounded LRU-ish caches: decoded frames are ~147KB each at 256x192,
-        # cap at ~4GB so Colab's 12GB RAM survives
-        self._fcache = {}
-        self._pcache = {}
-        self._cache_max = 27000
-    def _decode(self, packed, lens, s, e, cache):
-        """JPEG blobs -> (T,3,H,W) uint8, bounded per-index cache."""
+        # no decode cache: JPEGs decode straight to GPU via nvjpeg
+        try:
+            from torchvision.io import decode_jpeg
+            self._gpu_jpeg = True
+        except Exception:
+            self._gpu_jpeg = False
+    def _decode(self, packed, lens, s, e):
+        """JPEG blobs -> (T,3,H,W) uint8, on GPU when nvjpeg available."""
+        if self._gpu_jpeg:
+            from torchvision.io import decode_jpeg
+            bufs = [
+                packed[i, : int(lens[i])].to(self.device)
+                for i in range(s, e)
+            ]
+            return torch.stack(
+                [decode_jpeg(b, device=self.device) for b in bufs]
+            )
         import io
         from PIL import Image
-        out = []
-        for i in range(s, e):
-            if i in cache:
-                out.append(cache[i])
-                continue
-            n = int(lens[i])
-            img = Image.open(io.BytesIO(bytes(packed[i, :n].numpy())))
-            t = torch.from_numpy(np.array(img)).permute(2, 0, 1)
-            if len(cache) >= self._cache_max:
-                cache.pop(next(iter(cache)))  # evict oldest
-            cache[i] = t
-            out.append(t)
-        return torch.stack(out)
+        return torch.stack([
+            torch.from_numpy(
+                np.array(Image.open(io.BytesIO(bytes(packed[i, : int(lens[i])].numpy()))))
+            ).permute(2, 0, 1)
+            for i in range(s, e)
+        ])
 
     def _frames(self, s, e):
         if self.frames_jpeg is not None:
-            return self._decode(
-                self.frames_jpeg, self.frames_len, s, e, self._fcache
-            )
+            return self._decode(self.frames_jpeg, self.frames_len, s, e)
         return self.frames[s:e]
 
     def _pframes(self, s, e):
         if self.pframes_jpeg is not None:
-            return self._decode(
-                self.pframes_jpeg, self.pframes_len, s, e, self._pcache
-            )
+            return self._decode(self.pframes_jpeg, self.pframes_len, s, e)
         return self.pframes[s:e]
 
     def windows(self, length):
@@ -213,6 +212,32 @@ class RolloutData:
                 [self._pframes(s, e) for s, e in sel]
             ).to(self.device)
         return out
+
+class _JpegFrames:
+    """Lazy view over packed JPEG rows; decodes on index, returns GPU tensor."""
+
+    def __init__(self, packed, lens, device):
+        self.packed, self.lens, self.device = packed, lens, device
+        self.shape = (packed.shape[0],)  # callers only need shape[0]
+
+    def __len__(self):
+        return self.packed.shape[0]
+
+    def __getitem__(self, idx):
+        import io
+        from PIL import Image
+        if isinstance(idx, int):
+            idx = [idx]
+        if isinstance(idx, torch.Tensor):
+            idx = idx.tolist()
+        if isinstance(idx, slice):
+            idx = list(range(*idx.indices(self.packed.shape[0])))
+        out = []
+        for i in idx:
+            n = int(self.lens[i])
+            img = Image.open(io.BytesIO(bytes(self.packed[i, :n].numpy())))
+            out.append(torch.from_numpy(np.array(img)).permute(2, 0, 1))
+        return torch.stack(out)
 
 
 def future_target(enc, frames):
@@ -414,19 +439,9 @@ def main():
     )
     real_frames = None
     if args.real:
-        rd = torch.load(args.real, weights_only=False)
+        rd = torch.load(args.real, weights_only=False, mmap=True)
         if "frames_jpeg" in rd:
-            # decode JPEG blobs once to a CPU uint8 tensor
-            import io
-            from PIL import Image
-            packed, lens = rd["frames_jpeg"], rd["frames_len"]
-            imgs = []
-            for i in range(packed.shape[0]):
-                n = int(lens[i])
-                imgs.append(torch.from_numpy(np.array(
-                    Image.open(io.BytesIO(bytes(packed[i, :n].numpy())))
-                )).permute(2, 0, 1))
-            real_frames = torch.stack(imgs)  # CPU; chunks move to GPU
+            real_frames = _JpegFrames(rd["frames_jpeg"], rd["frames_len"], device)
         else:
             real_frames = rd["frames"]
 
