@@ -136,28 +136,41 @@ class RolloutData:
         seg_start = torch.ones(n, dtype=torch.bool)
         seg_start[1:] = (self.env_id[1:] != self.env_id[:-1]) | self.done[:-1]
         self.seg_starts = seg_start.nonzero().flatten().tolist() + [n]
-
-    def _decode(self, packed, lens, s, e):
-        """JPEG blobs -> (T,3,H,W) uint8."""
+        # bounded LRU-ish caches: decoded frames are ~147KB each at 256x192,
+        # cap at ~4GB so Colab's 12GB RAM survives
+        self._fcache = {}
+        self._pcache = {}
+        self._cache_max = 27000
+    def _decode(self, packed, lens, s, e, cache):
+        """JPEG blobs -> (T,3,H,W) uint8, bounded per-index cache."""
         import io
         from PIL import Image
         out = []
         for i in range(s, e):
+            if i in cache:
+                out.append(cache[i])
+                continue
             n = int(lens[i])
             img = Image.open(io.BytesIO(bytes(packed[i, :n].numpy())))
-            out.append(
-                torch.from_numpy(np.array(img)).permute(2, 0, 1)
-            )
+            t = torch.from_numpy(np.array(img)).permute(2, 0, 1)
+            if len(cache) >= self._cache_max:
+                cache.pop(next(iter(cache)))  # evict oldest
+            cache[i] = t
+            out.append(t)
         return torch.stack(out)
 
     def _frames(self, s, e):
         if self.frames_jpeg is not None:
-            return self._decode(self.frames_jpeg, self.frames_len, s, e)
+            return self._decode(
+                self.frames_jpeg, self.frames_len, s, e, self._fcache
+            )
         return self.frames[s:e]
 
     def _pframes(self, s, e):
         if self.pframes_jpeg is not None:
-            return self._decode(self.pframes_jpeg, self.pframes_len, s, e)
+            return self._decode(
+                self.pframes_jpeg, self.pframes_len, s, e, self._pcache
+            )
         return self.pframes[s:e]
 
     def windows(self, length):
