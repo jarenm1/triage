@@ -430,8 +430,8 @@ def main():
         else:
             real_frames = rd["frames"]
 
-    train = RolloutData(args.data / "rollouts.pt", device)
-    val = RolloutData(args.val / "rollouts.pt", device)
+    train = RolloutData(args.data, device)
+    val = RolloutData(args.val, device)
     viz = None
     if args.viz:
         from rl.venc_viz import init_viz, log_eval, log_step
