@@ -439,6 +439,11 @@ def main():
     train_windows = train.windows(args.window)
     val_windows = val.windows(args.window)
     print(f"train windows: {len(train_windows)}, val: {len(val_windows)}")
+    print(
+        f"data loaded: {train.frames_jpeg.shape[0] if train.frames_jpeg is not None else train.frames.shape[0]} train frames, "
+        f"device={device}",
+        flush=True,
+    )
 
     params = list(enc.parameters()) + (
         list(disc.parameters()) if disc is not None and spec.get("domain") else []
@@ -556,6 +561,12 @@ def main():
         opt.zero_grad()
         loss.backward()
         opt.step()
+        if step % 25 == 0:
+            print(
+                f"step {step}/{args.steps} loss={loss.item():.4f} "
+                + " ".join(f"{k}={v:.4f}" for k, v in logs.items()),
+                flush=True,
+            )
         if viz is not None and step % args.viz_every == 0:
             real = None
             if real_frames is not None:
