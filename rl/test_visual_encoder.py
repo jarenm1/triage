@@ -14,7 +14,7 @@ def make(**kw):
 def test_output_shapes():
     enc = make()
     state = enc.initial_state(3)
-    frame = torch.rand(3, 3, 96, 128)
+    frame = torch.rand(3, 3, *VisualEncoderConfig().input_hw)
     motion = torch.zeros(3, 5)
     action = torch.rand(3, 2)
     out, state = enc.update(frame, state, motion, action)
@@ -31,7 +31,7 @@ def test_output_shapes():
 def test_uint8_input():
     enc = make()
     state = enc.initial_state(1)
-    frame = torch.randint(0, 256, (1, 3, 96, 128), dtype=torch.uint8)
+    frame = torch.randint(0, 256, (1, 3, *VisualEncoderConfig().input_hw), dtype=torch.uint8)
     out, _ = enc.update(frame, state, torch.zeros(1, 5), torch.zeros(1, 2))
     assert torch.isfinite(out["h"]).all()
 
@@ -40,8 +40,8 @@ def test_state_is_explicit():
     """Two sequences with independent state must not interact."""
     enc = make().eval()
     s1, s2 = enc.initial_state(1), enc.initial_state(1)
-    f_a = torch.rand(1, 3, 96, 128)
-    f_b = torch.rand(1, 3, 96, 128)
+    f_a = torch.rand(1, 3, *VisualEncoderConfig().input_hw)
+    f_b = torch.rand(1, 3, *VisualEncoderConfig().input_hw)
     m = torch.zeros(1, 5)
     a = torch.zeros(1, 2)
     with torch.no_grad():
@@ -56,7 +56,7 @@ def test_state_is_explicit():
 def test_determinism_eval():
     enc = make().eval()
     state = enc.initial_state(2)
-    frame = torch.rand(2, 3, 96, 128)
+    frame = torch.rand(2, 3, *VisualEncoderConfig().input_hw)
     m, a = torch.rand(2, 5), torch.rand(2, 2)
     with torch.no_grad():
         o1, _ = enc.update(frame, state, m, a)
@@ -103,7 +103,7 @@ def test_frame_independent_variant():
     enc = make(temporal=False, warp=False, diff_signal=False)
     state = enc.initial_state(2)
     out, state = enc.update(
-        torch.rand(2, 3, 96, 128), state, torch.zeros(2, 5), torch.zeros(2, 2)
+        torch.rand(2, 3, *VisualEncoderConfig().input_hw), state, torch.zeros(2, 5), torch.zeros(2, 2)
     )
     assert out["h"].shape == (2, 64, 12, 16)
 
@@ -112,7 +112,7 @@ def test_motion_conditioning_changes_output():
     enc = make().eval()
     state = enc.initial_state(1)
     state["h"] = torch.randn_like(state["h"])
-    frame = torch.rand(1, 3, 96, 128)
+    frame = torch.rand(1, 3, *VisualEncoderConfig().input_hw)
     a = torch.zeros(1, 2)
     with torch.no_grad():
         o1, _ = enc.update(frame, state, torch.zeros(1, 5), a)
@@ -128,7 +128,7 @@ def test_motion_conditioning_changes_output():
 
 def test_forward_sequence():
     enc = make()
-    frames = torch.rand(2, 5, 3, 96, 128)
+    frames = torch.rand(2, 5, 3, *VisualEncoderConfig().input_hw)
     motions = torch.zeros(2, 5, 5)
     actions = torch.rand(2, 5, 2)
     outs, state = enc.forward_sequence(frames, motions, actions)
@@ -143,7 +143,7 @@ def test_global_temporal_variant():
     assert "g_hist" in state
     for _ in range(3):
         out, state = enc.update(
-            torch.rand(2, 3, 96, 128), state, torch.zeros(2, 5), torch.zeros(2, 2)
+            torch.rand(2, 3, *VisualEncoderConfig().input_hw), state, torch.zeros(2, 5), torch.zeros(2, 2)
         )
     assert out["g"].shape == (2, 128)
     assert state["g_hist"].shape == (2, 8, 128)

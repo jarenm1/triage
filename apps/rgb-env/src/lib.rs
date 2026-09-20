@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use glam::{Mat4, Quat, Vec3};
+mod scene;
 use sim_graphics::{
     Camera, Frame, MeshData, ReadbackData, RenderPrimitive, RenderView, Renderer, ViewKey,
     ViewKind, ViewOutputs,
@@ -65,6 +66,9 @@ pub struct RgbEnv {
     renderer: Renderer,
     cube: sim_graphics::MeshHandle,
     plane: sim_graphics::MeshHandle,
+    terrain: sim_graphics::MeshHandle,
+    cylinder: sim_graphics::MeshHandle,
+    sphere: sim_graphics::MeshHandle,
     frame: Frame,
     last_dynamics_ms: f64,
     last_render_ms: f64,
@@ -99,6 +103,11 @@ impl RgbEnv {
         let mut renderer = pollster::block_on(Renderer::new(&instance, None))?;
         let cube = renderer.register_mesh(MeshData::cube())?;
         let plane = renderer.register_mesh(MeshData::plane())?;
+        let terrain = renderer.register_mesh(MeshData::heightfield(
+            24, 14.0, 0.6, terrain_noise,
+        ))?;
+        let cylinder = renderer.register_mesh(MeshData::cylinder(8))?;
+        let sphere = renderer.register_mesh(MeshData::sphere(8, 10))?;
         let mut env = Self {
             n,
             width,
@@ -125,6 +134,9 @@ impl RgbEnv {
             completed_returns: vec![0.0; n],
             completed_lengths: vec![0.0; n],
             episode_counts: vec![0; n],
+            terrain,
+            cylinder,
+            sphere,
             current_returns: vec![0.0; n],
             current_lengths: vec![0.0; n],
             gap_centers: vec![0.0; n],
@@ -317,14 +329,19 @@ impl RgbEnv {
             let origin = Vec3::new(gx as f32 * spacing, 0.0, gz as f32 * spacing);
             let state = self.states[env];
             let vehicle = origin + Vec3::new(state.x, 0.0, state.z);
+            // camera jitter: FOV, height, tilt vary per env+episode so the
+            // encoder can't overfit one viewpoint
+            let cam = camera_jitter(self.seed, env, state.episode, variant);
             self.frame.add_view(RenderView {
                 key: ViewKey(env as u64 * 2 + u64::from(variant)),
                 kind: ViewKind::Sensor,
                 camera: Camera {
-                    eye: vehicle + Vec3::new(0.0, 2.0, 4.5),
-                    target: vehicle + Vec3::new(0.0, 1.0, -2.0),
+                    // onboard FPV: eye above the vehicle, tilted slightly
+                    eye: vehicle + Vec3::new(0.0, 1.0 + cam[0], 0.0),
+                    target: vehicle + Vec3::new(cam[1], -0.3 + cam[2], -5.0),
+
                     up: Vec3::Y,
-                    vertical_fov_radians: fov,
+                    vertical_fov_radians: fov * cam[3],
                     near: 0.05,
                     far: 14.0,
                 },
@@ -341,22 +358,46 @@ impl RgbEnv {
                 ),
                 color: floor_color(self.seed, env, variant),
                 object_id: env as u32 * 10 + 1,
+                pattern: [0.0; 4], // floor stays clean — it's the dominant surface
+                aux: [0.0; 4],
             });
-            for (index, (position, scale)) in obstacles(self.seed, env, state.episode)
-                .into_iter()
-                .enumerate()
-            {
+            // procedural scene: wall + buildings + trees + wires + cover
+            let scene_seed = mix64(
+                self.seed ^ mix64(env as u64)
+                    ^ mix64(state.episode.wrapping_mul(0x85ebca6b)),
+            );
+            let (prims, _gap) = scene::scene(scene_seed);
+            for (index, p) in prims.iter().enumerate() {
+                let mesh = match p.mesh {
+                    scene::MeshKind::Cube => self.cube,
+                    scene::MeshKind::Cylinder => self.cylinder,
+                    scene::MeshKind::Sphere => self.sphere,
+                    scene::MeshKind::Terrain => self.terrain,
+                };
                 self.frame.draw(RenderPrimitive {
-                    mesh: self.cube,
+                    mesh,
                     transform: Mat4::from_scale_rotation_translation(
-                        scale,
-                        Quat::IDENTITY,
-                        origin + position,
+                        p.scale,
+                        p.rot,
+                        origin + p.pos,
                     ),
-                    color: obstacle_color(self.seed, env, index, variant),
+                    color: p.color,
                     object_id: env as u32 * 10 + 2 + index as u32,
+                    pattern: p.pattern,
+                    aux: p.aux,
                 });
             }
+            // terrain heightfield under the corridor
+            self.frame.draw(RenderPrimitive {
+                mesh: self.terrain,
+                transform: Mat4::from_translation(
+                    origin + Vec3::new(0.0, -0.06, -3.0),
+                ),
+                color: floor_color(self.seed, env, variant),
+                object_id: env as u32 * 10 + 9,
+                pattern: surface_pattern(self.seed, env, 12, variant),
+                    aux: [0.0; 4],
+            });
         }
 
         let submission = self.renderer.execute(&self.frame, &[])?;
@@ -514,6 +555,83 @@ fn collides(seed: u64, env: usize, episode: u64, x: f32, z: f32) -> bool {
         })
 }
 
+fn terrain_noise(x: f32, z: f32) -> f32 {
+    // Cheap value-noise: two octaves of a hash-based heightmap.
+    let h = |ix: i32, iz: i32| {
+        let v = mix64(
+            (ix as u64).wrapping_mul(0x9e3779b97f4a7c15)
+                ^ (iz as u64).wrapping_mul(0x85ebca6b),
+        );
+        (v & 1023) as f32 / 1023.0
+    };
+    let noise = |x: f32, z: f32, freq: f32| {
+        let fx = x * freq;
+        let fz = z * freq;
+        let ix = fx.floor() as i32;
+        let iz = fz.floor() as i32;
+        let tx = fx - ix as f32;
+        let tz = fz - iz as f32;
+        let sx = tx * tx * (3.0 - 2.0 * tx);
+        let sz = tz * tz * (3.0 - 2.0 * tz);
+        let a = h(ix, iz);
+        let b = h(ix + 1, iz);
+        let c = h(ix, iz + 1);
+        let d = h(ix + 1, iz + 1);
+        a + (b - a) * sx + (c - a) * sz + (a - b - c + d) * sx * sz
+    };
+    noise(x, z, 0.35) * 0.7 + noise(x, z, 0.9) * 0.3
+}
+
+fn scenery(seed: u64, env: usize, episode: u64) -> Scenery {
+    // Buildings (tall boxes) and trees (trunk+canopy) scattered outside
+    // the flight corridor. Purely visual — no collision.
+    let stream = mix64(
+        seed ^ mix64((env as u64).wrapping_mul(0x9e3779b97f4a7c15))
+            ^ mix64(episode.wrapping_mul(0x85ebca6b))
+            ^ 0x5ce9e9u64,
+    );
+    let j = |index: u64| {
+        let v = mix64(stream.wrapping_add(index.wrapping_mul(0xc2b2ae35)));
+        (v & 1023) as f32 / 1023.0
+    };
+    let mut buildings = [(Vec3::ZERO, Vec3::ZERO); 4];
+    for i in 0..4 {
+        let b = (i * 4) as u64;
+        let side = if j(b) > 0.5 { 1.0 } else { -1.0 };
+        let x = side * (5.5 + j(b + 1) * 3.0);
+        let z = -1.0 - j(b + 2) * 8.0;
+        let h = 1.5 + j(b + 3) * 3.5;
+        let w = 0.8 + j(b + 1) * 1.4;
+        buildings[i] = (
+            Vec3::new(x, h * 0.5, z),
+            Vec3::new(w, h, w * (0.6 + j(b + 2))),
+        );
+    }
+    let mut trees = [(Vec3::ZERO, Vec3::ZERO, Vec3::ZERO); 6];
+    for i in 0..6 {
+        let b = (i * 4 + 16) as u64;
+        let side = if j(b) > 0.5 { 1.0 } else { -1.0 };
+        let x = side * (3.0 + j(b + 1) * 5.0);
+        let z = -0.5 - j(b + 2) * 8.5;
+        let trunk_h = 0.4 + j(b + 3) * 0.8;
+        let canopy_r = 0.3 + j(b + 1) * 0.5;
+        trees[i] = (
+            Vec3::new(x, trunk_h * 0.5, z),                    // trunk pos
+            Vec3::new(0.08, trunk_h, 0.08),                    // trunk scale
+            Vec3::new(x, trunk_h + canopy_r * 0.7, z),         // canopy pos
+        );
+        // canopy radius packed into trunk scale z for the draw call
+        trees[i].1.z = canopy_r;
+    }
+    Scenery { buildings, trees }
+}
+
+struct Scenery {
+    buildings: [(Vec3, Vec3); 4],
+    trees: [(Vec3, Vec3, Vec3); 6],
+}
+
+
 fn mix64(mut value: u64) -> u64 {
     value ^= value >> 30;
     value = value.wrapping_mul(0xbf58476d1ce4e5b9);
@@ -534,6 +652,71 @@ fn floor_color(seed: u64, env: usize, variant: u8) -> [f32; 4] {
         1.0,
     ]
 }
+
+fn camera_jitter(seed: u64, env: usize, episode: u64, variant: u8) -> [f32; 4] {
+    // (eye_dy, target_dx, target_dy, fov_scale) — small per-env+episode
+    // perturbations so the encoder can't overfit one viewpoint.
+    let stream = mix64(
+        seed ^ mix64((env as u64).wrapping_mul(0x2545f4914f6cdd1d))
+            ^ mix64(episode.wrapping_mul(0x9e3779b9))
+            ^ mix64((variant as u64).wrapping_mul(0x27d4eb2f)),
+    );
+    let j = |index: u64| {
+        let v = mix64(stream.wrapping_add(index.wrapping_mul(0xc2b2ae35)));
+        ((v & 1023) as f32 / 1023.0 - 0.5) * 2.0
+    };
+    [j(0) * 0.15, j(1) * 0.8, j(2) * 0.3, 1.0 + j(3) * 0.15]
+}
+
+fn clutter(seed: u64, env: usize, episode: u64) -> [(Vec3, Vec3); 6] {
+    // Non-colliding visual clutter: boxes scattered around the corridor,
+    // kept out of the flight path (|x|>2.5 or behind the wall) and below
+    // the vehicle's flight height so they never block the gap.
+    let stream = mix64(
+        seed ^ mix64((env as u64).wrapping_mul(0x9e3779b97f4a7c15))
+            ^ mix64(episode.wrapping_mul(0x85ebca6b))
+            ^ 0xc1773du64,
+    );
+    let j = |index: u64| {
+        let v = mix64(stream.wrapping_add(index.wrapping_mul(0xc2b2ae35)));
+        (v & 1023) as f32 / 1023.0
+    };
+    let mut out = [(Vec3::ZERO, Vec3::ZERO); 6];
+    for i in 0..6 {
+        let base = (i * 4) as u64;
+        // x in [-4.2,-2.6] or [2.6,4.2] — outside the flight corridor
+        let side = if j(base) > 0.5 { 1.0 } else { -1.0 };
+        let x = side * (2.6 + j(base + 1) * 1.6);
+        let z = -1.0 - j(base + 2) * 7.0;
+        let h = 0.15 + j(base + 3) * 0.5; // short: below flight height
+        let w = 0.2 + j(base + 1) * 0.6;
+        out[i] = (
+            Vec3::new(x, h * 0.5, z),
+            Vec3::new(w, h, w * (0.5 + j(base + 2))),
+        );
+    }
+    out
+}
+
+fn surface_pattern(seed: u64, env: usize, index: usize, variant: u8) -> [f32; 4] {
+    // (kind, scale, seed, contrast): procedural texture per surface.
+    let stream = mix64(
+        seed ^ mix64((env as u64).wrapping_mul(747796405))
+            .wrapping_add((index as u64 + 1).wrapping_mul(2891336453))
+            ^ mix64((variant as u64).wrapping_mul(0x27d4eb2f))
+            ^ 0x9a77e9u64,
+    );
+    let j = |shift: u32| ((stream >> shift) & 1023) as f32 / 1023.0;
+    // ~40% of surfaces get no pattern; the rest pick a kind
+    let kind = if j(0) < 0.4 { 0.0 } else { (j(5) * 4.0).floor() + 1.0 };
+    [
+        kind,
+        0.5 + j(10) * 3.0,   // scale
+        j(20) * 100.0,       // seed
+        0.15 + j(30) * 0.5,  // contrast — subtler than before
+    ]
+}
+
 
 fn obstacle_color(seed: u64, env: usize, index: usize, variant: u8) -> [f32; 4] {
     let value = mix64(

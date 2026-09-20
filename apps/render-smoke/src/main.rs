@@ -78,6 +78,8 @@ async fn run() -> Result<()> {
         ),
         color: [0.18, 0.22, 0.26, 1.0],
         object_id: 1,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
     });
     for z in -10_i32..10 {
         for x in -10_i32..10 {
@@ -98,6 +100,8 @@ async fn run() -> Result<()> {
                 transform: Mat4::from_scale_rotation_translation(scale, Quat::IDENTITY, position),
                 color,
                 object_id: ((z + 10) * 20 + (x + 10) + 2) as u32,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
         }
     }

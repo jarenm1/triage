@@ -74,7 +74,8 @@ struct Instance {
     model: [[f32; 4]; 4],
     color: [f32; 4],
     object_id: u32,
-    padding: [u32; 3],
+    pattern: [f32; 4],
+    aux: [f32; 4],
 }
 
 #[repr(C)]
@@ -504,7 +505,8 @@ impl Renderer {
                     model: primitive.transform.to_cols_array_2d(),
                     color: primitive.color,
                     object_id: primitive.object_id,
-                    padding: [0; 3],
+                    pattern: primitive.pattern,
+                    aux: primitive.aux,
                 });
                 match self.batches.last_mut() {
                     Some(batch) if batch.mesh == primitive.mesh => batch.instance_count += 1,
@@ -1089,7 +1091,7 @@ fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffe
 
 const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Uint32];
+const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Uint32, 8 => Float32x4, 9 => Float32x4];
 
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {

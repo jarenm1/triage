@@ -90,6 +90,8 @@ impl Inspector {
                     ),
                     color: part.color,
                     object_id: o.id,
+                    pattern: [0.0; 4],
+                    aux: [0.0; 4],
                 });
             }
         }
@@ -152,6 +154,8 @@ impl Inspector {
             ),
             color,
             object_id: 0,
+                    pattern: [0.0; 4],
+                    aux: [0.0; 4],
         });
     }
 

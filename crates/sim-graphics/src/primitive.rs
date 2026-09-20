@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 
 use crate::resource::Handle;
 
@@ -114,6 +114,88 @@ impl MeshData {
         }
     }
 
+    /// Heightfield terrain from a noise function. `size` is the grid
+    /// resolution (verts per side), `extent` the world span, `height`
+    /// the max elevation. `noise(x, z) -> [0,1]` supplies the heightmap.
+    pub fn heightfield(
+        size: u32,
+        extent: f32,
+        height: f32,
+        noise: impl Fn(f32, f32) -> f32,
+    ) -> Self {
+        let size = size.max(2);
+        let n = size as usize;
+        let mut vertices = Vec::with_capacity(n * n);
+        let step = extent / (size - 1) as f32;
+        let half = extent * 0.5;
+        let mut heights = vec![0.0f32; n * n];
+        for iz in 0..n {
+            for ix in 0..n {
+                let x = ix as f32 * step - half;
+                let z = iz as f32 * step - half;
+                heights[iz * n + ix] = noise(x, z) * height;
+            }
+        }
+        for iz in 0..n {
+            for ix in 0..n {
+                let x = ix as f32 * step - half;
+                let z = iz as f32 * step - half;
+                let y = heights[iz * n + ix];
+                // central-difference normal
+                let hl = heights[iz * n + ix.saturating_sub(1)];
+                let hr = heights[iz * n + (ix + 1).min(n - 1)];
+                let hd = heights[iz.saturating_sub(1) * n + ix];
+                let hu = heights[(iz + 1).min(n - 1) * n + ix];
+                let normal = Vec3::new(hl - hr, 2.0 * step, hd - hu).normalize();
+                vertices.push(MeshVertex {
+                    position: [x, y, z],
+                    normal: normal.to_array(),
+                });
+            }
+        }
+        let mut indices = Vec::with_capacity((n - 1) * (n - 1) * 6);
+        for iz in 0..(n - 1) {
+            for ix in 0..(n - 1) {
+                let a = (iz * n + ix) as u32;
+                let b = a + 1;
+                let c = a + n as u32;
+                let d = c + 1;
+                indices.extend_from_slice(&[a, c, b, b, c, d]);
+            }
+        }
+        Self { vertices, indices }
+    }
+
+    /// Flat subdivided grid for vertex-shader-displaced terrain.
+    /// `size` verts per side, `extent` world span. Normals are up;
+    /// the shader displaces Y by world-space noise.
+    pub fn grid(size: u32, extent: f32) -> Self {
+        let size = size.max(2);
+        let n = size as usize;
+        let mut vertices = Vec::with_capacity(n * n);
+        let step = extent / (size - 1) as f32;
+        let half = extent * 0.5;
+        for iz in 0..n {
+            for ix in 0..n {
+                vertices.push(MeshVertex {
+                    position: [ix as f32 * step - half, 0.0, iz as f32 * step - half],
+                    normal: [0.0, 1.0, 0.0],
+                });
+            }
+        }
+        let mut indices = Vec::with_capacity((n - 1) * (n - 1) * 6);
+        for iz in 0..(n - 1) {
+            for ix in 0..(n - 1) {
+                let a = (iz * n + ix) as u32;
+                let b = a + 1;
+                let c = a + n as u32;
+                let d = c + 1;
+                indices.extend_from_slice(&[a, c, b, b, c, d]);
+            }
+        }
+        Self { vertices, indices }
+    }
+
     pub fn cylinder(segments: u32) -> Self {
         let segments = segments.max(3);
         let mut vertices = Vec::with_capacity((segments * 4 + 2) as usize);
@@ -168,30 +250,6 @@ impl MeshData {
                 top_ring_start + i,
             ]);
         }
-
-        // Bottom cap (normal [0, -1, 0])
-        let bottom_center_idx = vertices.len() as u32;
-        vertices.push(MeshVertex {
-            position: [0.0, -0.5, 0.0],
-            normal: [0.0, -1.0, 0.0],
-        });
-        let bottom_ring_start = vertices.len() as u32;
-        for i in 0..segments {
-            let angle = i as f32 * step;
-            vertices.push(MeshVertex {
-                position: [angle.cos() * 0.5, -0.5, angle.sin() * 0.5],
-                normal: [0.0, -1.0, 0.0],
-            });
-        }
-        for i in 0..segments {
-            let next = (i + 1) % segments;
-            indices.extend_from_slice(&[
-                bottom_center_idx,
-                bottom_ring_start + i,
-                bottom_ring_start + next,
-            ]);
-        }
-
         Self { vertices, indices }
     }
 
@@ -250,6 +308,13 @@ pub struct RenderPrimitive {
     pub transform: Mat4,
     pub color: [f32; 4],
     pub object_id: u32,
+    /// Procedural texture: (kind, scale, seed, contrast).
+    /// kind 0=none, 1=checker, 2=stripes, 3=value-noise, 4=gradient,
+    /// 5=voronoi, 6=brick, 7=grid, 8=rings, 9=terrain-displace.
+    pub pattern: [f32; 4],
+    /// Aux: (snap_flag, base_x, base_z, unused). snap_flag > 0.5
+    /// displaces the object by terrain_height(base_xz).
+    pub aux: [f32; 4],
 }
 
 #[cfg(test)]

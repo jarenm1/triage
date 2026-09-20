@@ -158,3 +158,126 @@ Copy this structure into a dated subsection when a run completes, fails, or beco
 - Decision: change the initial full-loop benchmark batch from 16 to 256 environments, at the user's request.
 - Specification: E000 / 2 supersedes E000 / 1 before any experiment runs. Use measured rendering, transfer, and learner costs to decide further scaling.
 - Evidence status: specification change only; no benchmark has been run.
+
+### D002: visual-inertial encoder ablation (E002 scope), 2026-09-17
+
+- Decision: adopt the temporally persistent spatial-latent encoder
+  (`rl/visual_encoder.py`) as the perception front-end direction; the
+  future-feature prediction loss is the single most valuable component for
+  state retention under occlusion.
+- Evidence: eight-variant ablation on the E001 corridor task, 96k-frame
+  scripted rollouts at 128x96 (train seed 11, held-out val seed 77).
+  Variants: A frame-CNN, B +spatial probes, C +ConvGRU, D +motion
+  conditioning, E +ego-motion warp, F +diff channel, G +future-feature
+  loss, H +tiny causal transformer over g history.
+- Standard metrics (held-out): all variants reach occ IoU 0.92-0.99 and
+  gap_x MAE 0.15-0.37; differences are small on unobstructed frames.
+- Occlusion retention (4 blanked frames, probe at last blanked frame):
+  gap_x MAE A=3.35, B=4.23, C=4.29, D=5.20, E=2.89, F=2.11, G=1.23,
+  H=2.05. The future-prediction objective (G) retains gap position ~3.5x
+  better than the plain recurrent baseline (C/D); the diff channel (F)
+  and warp (E) also help. Wall-distance is not retained by any variant
+  (it changes during occlusion — expected).
+- Efficiency (batch-1, RTX 2070 SUPER, FP32): deployed params 0.14-0.29M
+  for A-F, 0.29M for G (1.13M incl. training-only future head), 1.39M H.
+  Latency 1.2ms (A) to 2.7ms (G); H costs +1.2ms over G for no gain.
+  MACs 18.7M (A) to 44.5M (G).
+- Caveats: velocity probes are trivially solved by motion-conditioned
+  variants (vx/vz are inputs); gap_x is static within an episode so
+  occlusion retention is partly memorization, not tracking. Dataset is
+  scripted-policy rollouts, not policy-in-the-loop.
+- Decision: keep G as the reference encoder; drop H (transformer adds
+  latency, no benefit). Next: wire encoder into the E001 policy loop and
+  measure downstream control, not just probes.
+- Evidence status: measured; artifacts in target/venc-results/*.json,
+  checkpoints *.pt, data target/venc-data/.
+
+### D003: appearance consistency + DINOv2 distillation, 2026-09-17
+
+- Question: can the latent be made appearance-invariant (sim/real
+  alignment proxy) without hurting task representation?
+- Setup: paired-appearance rollouts (same trajectory, two seeded color
+  variants; env `paired` mode), 48k train / 3.2k val frames. Variant I =
+  G + cosine consistency loss between F(frame) and F(paired frame).
+  Variant J = I + DINOv2 ViT-S/14 patch-feature distillation (real-
+  anchored teacher; DINOv3 weights are license-gated, DINOv2 used).
+  Baseline G retrained on the same paired data for a fair comparison.
+- Results (held-out, same data): G gap_x 0.159 / IoU 0.874 / paired_cos
+  0.893 / occluded gap_x 1.00. I: gap_x 0.115 / IoU 0.989 / paired_cos
+  0.999 / occluded 4.26. J: gap_x 0.241 / IoU 0.802 / paired_cos 0.907 /
+  occluded 2.43.
+- Findings: (1) consistency loss achieves near-perfect appearance
+  invariance (cos 0.999) and *improves* clean-frame probes — the
+  invariance acts as a regularizer. (2) But it collapses occlusion
+  retention (4.26 vs 1.00): forcing frame features appearance-invariant
+  appears to also suppress the state information the future-loss uses
+  for retention. (3) DINOv2 distillation hurts every metric — on
+  flat-shaded synthetic scenes the teacher's semantic features don't
+  align with task geometry; distillation should pay off on richer
+  scenes/real footage, not here.
+- Caveats: single seed, single loss weight (0.5); the occlusion
+  regression may be a weighting artifact — a lower consistency
+  coefficient or consistency-on-g-only is untested.
+- Decision: keep G as reference. Consistency training is worth one more
+  run at lower coefficient before richer scenes; distillation deferred
+  until real footage or richer sim exists.
+- Evidence: target/venc-results/{i,j,g-paired}.json + .pt; data
+  target/venc-data/{train,val}-paired/.
+
+### D004: domain-adversarial sim->real alignment (variant K), 2026-09-17
+
+- Question: does DANN (gradient-reversal domain discriminator) align the
+  latent across sim and real FPV footage?
+- Setup: 1200 real frames from two FPV freestyle clips (yt-dlp, 10fps,
+  128x96; local research use, provenance target/venc-data/real/). K = I
+  + domain adversarial on F_t. Three discriminator settings tried:
+  conv disc coef 0.1, conv disc coef 1.0, weak (linear) disc coef 1.0.
+- Results: conv disc wins outright at both coefficients (eval domain_acc
+  0.999/0.991) and damages task metrics (gap_x 0.45/0.23). Weak disc
+  reaches a stalemate — training domain loss ~= ln 2 (encoder fools it
+  in-training) while eval domain_acc stays 0.96 because the disc
+  memorizes 1200 real frames; task metrics recover (gap_x 0.247, IoU
+  0.984, paired_cos 0.999) but occlusion retention stays poor (3.89).
+- Findings: (1) DANN on 1200 real frames is degenerate — the
+  discriminator memorizes rather than measures the domain gap, so
+  domain_acc is a weak metric at this scale. (2) The sim/real gap here
+  is large (flat-shaded boxes vs. real FPV); appearance-level alignment
+  alone can't bridge geometry statistics. (3) Occlusion retention
+  regresses whenever consistency/domain losses are added — the
+  retention mechanism (future-loss state) is fragile to feature-space
+  regularization.
+- Decision: domain-adversarial alignment needs (a) more real data
+  (thousands→tens of thousands of frames), (b) a discriminator that
+  can't memorize (spectral norm / dropout / smaller capacity), or
+  (c) deferred until richer sim exists. Keep G as reference; K-weak is
+  the best domain-aligned variant but not deployment-ready.
+- Evidence: target/venc-results/{k,k-d1,k-weak}.json + .pt;
+  rl/venc_domain.py (GRL, discriminator, degrade(), load_teacher).
+
+### D005: LingBot-Vision teacher + full alignment stack (variant L), 2026-09-18
+
+- Setup: L = I + weak DANN on real FPV frames + LingBot-Vision-Large
+  (ViT-L/16, dense spatial perception pretraining, Apache-2.0) feature
+  distillation. Teacher vendored at rl/vendor/lingbot_vision. Trained
+  3000 steps (resumed once after a 3600s timeout; periodic checkpointing
+  added to venc_train.py).
+- Results (held-out paired val): gap_x MAE 0.22, occ IoU 0.98,
+  paired_cos 0.998, domain_acc ~0.78-0.84 (encoder partially fools the
+  discriminator — healthy DANN equilibrium, vs 0.96+ failure or 0.5
+  collapse), distill loss 1.0 -> 0.075.
+- Occlusion retention: occluded gap_x MAE 1.07 — matches G (1.00) and
+  far better than I (4.26) or K (3.89). The distill loss appears to
+  protect the retention mechanism that consistency alone destroyed.
+- Findings: (1) LingBot's dense-perception features are a better teacher
+  than DINOv2 for this task — distillation now *helps* where DINOv2
+  hurt. (2) L is the best overall variant: near-G occlusion retention
+  plus appearance invariance plus real-domain alignment. (3) wall_d
+  probe degraded (ctrl MAE ~1.0) — distance estimation traded off for
+  invariance.
+- Caveats: ViT-L teacher makes training ~3x slower (1.6s/step); deployed
+  encoder unchanged (0.29M params). domain_acc is still a weak metric at
+  1200 real frames.
+- Decision: L is the new reference encoder. Next: more real footage for
+  a stronger domain signal, and wire the encoder into the E001 policy.
+- Evidence: target/venc-results/l.{json,pt}; teacher
+  robbyant/lingbot-vision-vit-large (HF, Apache-2.0).

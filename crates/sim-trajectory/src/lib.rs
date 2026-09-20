@@ -306,6 +306,8 @@ impl TrajectoryScene {
             transform: Mat4::from_scale(Vec3::new(60.0, 1.0, 60.0)),
             color: [0.16, 0.20, 0.23, 1.0],
             object_id: GROUND_OBJECT_ID,
+                    pattern: [0.0; 4],
+                    aux: [0.0; 4],
         });
         for vehicle in &snapshot.vehicles {
             let position = graphics_position(vehicle.position_w);
@@ -319,6 +321,8 @@ impl TrajectoryScene {
                         * Mat4::from_scale_rotation_translation(scale, Quat::IDENTITY, offset),
                     color,
                     object_id: drone_id,
+                    pattern: [0.0; 4],
+                    aux: [0.0; 4],
                 });
             };
             part(
@@ -356,6 +360,8 @@ impl TrajectoryScene {
                     transform: Mat4::from_scale_rotation_translation(scale, Quat::IDENTITY, target),
                     color: [0.2, 1.0, 0.35, 1.0],
                     object_id: vehicle.target_object_id(),
+                    pattern: [0.0; 4],
+                    aux: [0.0; 4],
                 });
             }
         }

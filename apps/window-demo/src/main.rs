@@ -20,6 +20,9 @@ const COLLISION_RADIUS: f32 = 0.85;
 mod inspection;
 #[cfg(not(target_arch = "wasm32"))]
 mod trajectory;
+mod rgb_viewer;
+mod scene;
+mod fly;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> anyhow::Result<()> {
@@ -42,6 +45,24 @@ fn main() -> anyhow::Result<()> {
         let path = args.next().map(std::path::PathBuf::from);
         anyhow::ensure!(args.next().is_none(), "usage: window-demo --inspect [scene.json]");
         return inspection::run(path);
+    }
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--rgb")) {
+        let seed = args
+            .next()
+            .and_then(|s| s.to_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(11);
+        let envs = args
+            .next()
+            .and_then(|s| s.to_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(9);
+        return rgb_viewer::run(seed, envs);
+    }
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--fly")) {
+        let seed = args
+            .next()
+            .and_then(|s| s.to_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(11);
+        return fly::run(seed);
     }
     Ok(sim_graphics_winit::run("Autonomous Drone Swarm Simulator", DroneDemoScene::new())?)
 }
@@ -890,6 +911,8 @@ impl Scene for DroneDemoScene {
             ),
             color: [0.015, 0.018, 0.024, 1.0],
             object_id: 1,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
         });
         // Launch / Recharge Pads (Square Design)
         for (idx, pad) in self.pads.iter().enumerate() {
@@ -905,6 +928,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: pad.color,
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // Inner Target Square
@@ -917,6 +942,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: [0.10, 0.65, 0.95, 1.0],
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // Center Target Square Inlay
@@ -929,6 +956,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: [0.02, 0.03, 0.04, 1.0],
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // 4 Corner Square Warning Pads
@@ -943,6 +972,8 @@ impl Scene for DroneDemoScene {
                     ),
                     color: [1.0, 0.80, 0.10, 1.0],
                     object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                 });
             }
         }
@@ -961,6 +992,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: tower.color,
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // Tower Base Flange / Trim
@@ -973,6 +1006,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: tower.color,
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // Tower Top Platform / Crown
@@ -985,6 +1020,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: tower.color,
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // Glowing Beacon Orb
@@ -1001,6 +1038,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: [0.15, 0.17, 0.22, 1.0],
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // Turret Housing Pod (Sphere)
@@ -1013,6 +1052,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: [0.10, 0.12, 0.16, 1.0],
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // Turret Heavy Cannon Barrels (Dual Barrels)
@@ -1030,6 +1071,8 @@ impl Scene for DroneDemoScene {
                     ),
                     color: [0.22, 0.25, 0.30, 1.0],
                     object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                 });
             }
 
@@ -1049,6 +1092,8 @@ impl Scene for DroneDemoScene {
                     1.0,
                 ],
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
         }
 
@@ -1066,6 +1111,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: proj.color,
                 object_id: 80,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
             // Brilliant glowing plasma head
             self.frame.draw(RenderPrimitive {
@@ -1077,6 +1124,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: [1.0, 1.0, 1.0, 1.0],
                 object_id: 80,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
         }
 
@@ -1113,6 +1162,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: active_color,
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // Bottom frame strut
@@ -1125,6 +1176,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: active_color,
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // Left vertical strut
@@ -1137,6 +1190,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: active_color,
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // Right vertical strut
@@ -1149,6 +1204,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: active_color,
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
 
             // 4 Corner Markers / Glowing Joint Caps
@@ -1167,6 +1224,8 @@ impl Scene for DroneDemoScene {
                         1.0,
                     ],
                     object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                 });
             }
 
@@ -1188,6 +1247,8 @@ impl Scene for DroneDemoScene {
                 ),
                 color: center_color,
                 object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
         }
 
@@ -1209,6 +1270,8 @@ impl Scene for DroneDemoScene {
                         ),
                         color: [0.15, 0.17, 0.22, 1.0],
                         object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                     });
 
                     // Top Aero Canopy Shell (Colored)
@@ -1221,6 +1284,8 @@ impl Scene for DroneDemoScene {
                         ),
                         color: drone.color,
                         object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                     });
 
                     // Front Sensor Camera / Lens
@@ -1233,6 +1298,8 @@ impl Scene for DroneDemoScene {
                         ),
                         color: [0.1, 0.9, 1.0, 1.0],
                         object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                     });
 
                     // Flashing Top Beacon
@@ -1251,6 +1318,8 @@ impl Scene for DroneDemoScene {
                             1.0,
                         ],
                         object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                     });
 
                     // 4 Diagonal Rotor Arms (X-Configuration)
@@ -1270,6 +1339,8 @@ impl Scene for DroneDemoScene {
                             ),
                             color: [0.12, 0.14, 0.18, 1.0],
                             object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                         });
 
                         // Motor Mount
@@ -1283,6 +1354,8 @@ impl Scene for DroneDemoScene {
                             ),
                             color: [0.22, 0.25, 0.30, 1.0],
                             object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                         });
 
                         // Spinning Propeller / Rotor Blade
@@ -1297,6 +1370,8 @@ impl Scene for DroneDemoScene {
                             ),
                             color: [0.85, 0.90, 0.95, 1.0],
                             object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                         });
                     }
                 }
@@ -1331,6 +1406,8 @@ impl Scene for DroneDemoScene {
                             ),
                             color,
                             object_id: obj_id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                         });
                     }
                 }
@@ -1351,6 +1428,8 @@ impl Scene for DroneDemoScene {
                         ),
                         color: [drone.color[0] * 0.35, drone.color[1] * 0.35, drone.color[2] * 0.35, 1.0],
                         object_id: drone.id,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
                     });
                 }
             }

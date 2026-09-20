@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 @dataclass
 class VisualEncoderConfig:
-    input_hw: tuple = (96, 128)  # (H, W)
+    input_hw: tuple = (192, 256)  # (H, W)
     stem_channels: tuple = (24, 32, 64)
     latent_channels: int = 64
     context_channels: int = 96
@@ -39,6 +39,8 @@ class VisualEncoderConfig:
     future_head: bool = True     # G: predict next-frame features (loss flag)
     global_temporal: bool = False  # H: tiny causal transformer over g history
     global_temporal_len: int = 8
+    distill: bool = False        # J: project F_t to teacher feature space
+    distill_dim: int = 384       # DINOv2 ViT-S/14 patch token width
     separable_gates: bool = True
     occupancy_hw: tuple = (24, 32)
 
@@ -229,18 +231,26 @@ class VisualEncoder(nn.Module):
         # probes (training-only; decode from spatial map when spatial_probe)
         self.probe = nn.Linear(cfg.global_dim, 4)  # gap_x, wall_dist, vx, vz
         occ_w = cfg.occupancy_hw[1]
-        self.occupancy = nn.Sequential(
-            nn.Conv2d(cfg.latent_channels, 32, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(32, 8, 1),
-            nn.GELU(),
-        )
-        self.occupancy_out = nn.Linear(8 * (cfg.input_hw[1] // 8), occ_w)
+        if cfg.spatial_probe:
+            self.occupancy = nn.Sequential(
+                nn.Conv2d(cfg.latent_channels, 32, 3, 1, 1),
+                nn.GELU(),
+                nn.Conv2d(32, 8, 1),
+                nn.GELU(),
+            )
+            self.occupancy_out = nn.Linear(8 * (cfg.input_hw[1] // 8), occ_w)
+        else:
+            self.occupancy = None
+            self.occupancy_out = nn.Linear(cfg.global_dim, occ_w)
         if cfg.future_head:
             self.future = nn.Sequential(
                 nn.Linear(cfg.global_dim + cfg.motion_embed + cfg.action_dim, 256),
                 nn.GELU(),
                 nn.Linear(256, 8 * 6 * cfg.latent_channels),
+            )
+        if cfg.distill:
+            self.distill_proj = nn.Conv2d(
+                cfg.latent_channels, cfg.distill_dim, 1
             )
 
     def latent_hw(self):
@@ -309,17 +319,21 @@ class VisualEncoder(nn.Module):
             g = self.global_temporal(hist)
             new_state["g_hist"] = hist
 
-        occ_feat = self.occupancy(h).mean(dim=2)  # (B,8,W_lat) column features
+        if self.occupancy is not None:
+            occ_feat = self.occupancy(h).mean(dim=2)  # (B,8,W_lat)
+            occ_in = occ_feat.reshape(occ_feat.shape[0], -1)
+        else:
+            occ_in = g
         out = {
             "h": h,
             "g": g,
             "f": f_t,
             "mask": mask,
             "probe": self.probe(g),
-            "occupancy": self.occupancy_out(
-                occ_feat.reshape(occ_feat.shape[0], -1)
-            ),
+            "occupancy": self.occupancy_out(occ_in),
         }
+        if self.cfg.distill:
+            out["distill_f"] = self.distill_proj(f_t)
         if self.cfg.future_head and action is not None:
             pred = self.future(torch.cat([g, m, action], dim=1))
             out["future_f"] = pred.reshape(-1, self.cfg.latent_channels, 6, 8)

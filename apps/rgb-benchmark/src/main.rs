@@ -353,6 +353,8 @@ fn populate_frame(
             ),
             color: [0.16, 0.19, 0.22, 1.0],
             object_id: (env as u32) * 10 + 1,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
         });
         let color = palette(env);
         for (index, (position, scale)) in [
@@ -380,6 +382,8 @@ fn populate_frame(
                     1.0,
                 ],
                 object_id: (env as u32) * 10 + 2 + index as u32,
+                pattern: [0.0; 4],
+                    aux: [0.0; 4],
             });
         }
     }

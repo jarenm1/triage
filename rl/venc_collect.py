@@ -33,11 +33,11 @@ from rl.rgb_environment import RGBEnv
 WALL_Z = -5.2
 WALL_HALF_Z = 0.15
 WALL_TOP = 1.2
+CAMERA_OFFSET = (0.0, 0.4, 0.0)
+CAMERA_TARGET = (0.0, 0.4, -5.0)
+FOV_RAD = 1.0471975512  # 60 deg
 CORRIDOR_HALF = 4.5
 GAP_HALF = 1.5
-CAMERA_OFFSET = (0.0, 2.0, 4.5)
-CAMERA_TARGET = (0.0, 1.0, -2.0)
-FOV_RAD = 1.0471975512  # 60 deg
 OCC_COLS = 32
 
 
@@ -87,6 +87,8 @@ def main():
     p.add_argument("--library")
     p.add_argument("--noise", type=float, default=0.4)
     p.add_argument("--random-frac", type=float, default=0.2)
+    p.add_argument("--paired", action="store_true",
+                   help="also store second-appearance frames for consistency training")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -101,10 +103,39 @@ def main():
         height=args.height,
         device=args.device,
         library=args.library,
+        paired=args.paired,
     ) as env:
-        frames, poses, actions, gaps, walld, occs, env_ids, dones = (
-            [], [], [], [], [], [], [], []
+        poses, actions, gaps, walld, occs, env_ids, dones = (
+            [], [], [], [], [], [], []
         )
+        # frames packed to JPEG every FLUSH steps: bounded RAM, small files.
+        # blobs accumulate per-env so final order stays env-major.
+        FLUSH = 100
+        jpeg_blobs = [[] for _ in range(env.n)]
+        jpeg_lens = [[] for _ in range(env.n)]
+        pj_blobs = [[] for _ in range(env.n)]
+        pj_lens = [[] for _ in range(env.n)]
+        frame_buf, pframe_buf = [], []
+
+        def flush():
+            import io
+            from PIL import Image
+            for buf_list, blobs, lens in (
+                (frame_buf, jpeg_blobs, jpeg_lens),
+                (pframe_buf, pj_blobs, pj_lens),
+            ):
+                if not buf_list:
+                    continue
+                chunk = torch.stack(buf_list)  # (steps, env, 3, H, W)
+                for e in range(env.n):
+                    for i in range(chunk.shape[0]):
+                        b = io.BytesIO()
+                        Image.fromarray(
+                            chunk[i, e].permute(1, 2, 0).numpy()
+                        ).save(b, format="JPEG", quality=88)
+                        blobs[e].append(b.getvalue())
+                        lens[e].append(len(b.getvalue()))
+                buf_list.clear()
         random_mask = (torch.rand(env.n) < args.random_frac).to(env.device)
         for step in range(args.steps):
             # reference controller + noise; some envs act randomly
@@ -120,7 +151,9 @@ def main():
 
             pose = env.vehicle_poses  # x, z, vx, vz
             gap = env.gap_centers
-            frames.append(env.observations[:, -3:].cpu())
+            frame_buf.append(env.observations[:, -3:].cpu())
+            if args.paired:
+                pframe_buf.append(env.paired_observations[:, -3:].cpu())
             poses.append(pose.cpu())
             actions.append(act.cpu())
             gaps.append(gap.cpu())
@@ -133,12 +166,24 @@ def main():
             env_ids.append(torch.arange(env.n))
             dones.append((env.terminated + env.truncated).cpu() > 0)
 
-            # re-randomize the random subset occasionally
             if step % 25 == 0:
                 random_mask = (torch.rand(env.n) < args.random_frac).to(env.device)
+            if step % FLUSH == FLUSH - 1 or step == args.steps - 1:
+                flush()
+                print(f"step {step + 1}/{args.steps}", flush=True)
+
+        def pack(blobs, lens):
+            # flatten env-major: env0 all steps, env1 all steps, ...
+            flat_b = [b for env_blobs in blobs for b in env_blobs]
+            flat_l = [l for env_lens in lens for l in env_lens]
+            max_len = max(flat_l)
+            packed = torch.zeros(len(flat_b), max_len, dtype=torch.uint8)
+            for i, b in enumerate(flat_b):
+                packed[i, : len(b)] = torch.frombuffer(b, dtype=torch.uint8)
+            return packed, torch.tensor(flat_l, dtype=torch.int64)
+
 
         data = {
-            "frames": torch.stack(frames).transpose(0, 1).reshape(-1, 3, args.height, args.width),
             "poses": torch.stack(poses).transpose(0, 1).reshape(-1, 4),
             "actions": torch.stack(actions).transpose(0, 1).reshape(-1, 2),
             "gap_x": torch.stack(gaps).transpose(0, 1).reshape(-1),
@@ -147,12 +192,15 @@ def main():
             "env_id": torch.stack(env_ids).transpose(0, 1).reshape(-1),
             "done": torch.stack(dones).transpose(0, 1).reshape(-1),
         }
+        data["frames_jpeg"], data["frames_len"] = pack(jpeg_blobs, jpeg_lens)
+        if args.paired:
+            data["pframes_jpeg"], data["pframes_len"] = pack(pj_blobs, pj_lens)
         # reshape: (env, step, ...) -> flat, keeping env-major order so
         # contiguous runs per env are recoverable via env_id + done
         path = out_dir / "rollouts.pt"
         torch.save(data, path)
-        n = data["frames"].shape[0]
-        print(f"saved {n} frames -> {path}")
+        n = data["frames_jpeg"].shape[0]
+        print(f"saved {n} frames -> {path} ({path.stat().st_size / 1e9:.1f} GB)")
         print(f"episodes ended: {int(data['done'].sum())}")
 
 

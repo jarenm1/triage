@@ -54,6 +54,65 @@ update:     D_t = |norm(F_t) − norm(H')|        (optional, flag)
             g_t = MLP(pool(H_t) ⊕ pool(ctx_t))  → 128-d
 ```
 
+```mermaid
+flowchart TD
+    frame["RGB frame<br/>128×96×3"] --> stem
+
+    subgraph stem["Conv stem (stride-8)"]
+        s1["conv s2 → 64×48×24<br/>DW-res block"]
+        s2["conv s2 → 32×24×32<br/>DW-res block"]
+        s3["conv s2 → 16×12×64<br/>DW-res block"]
+        s1 --> s2 --> s3
+    end
+
+    s3 --> F["F_t<br/>16×12×64 features"]
+    s3 --> ctx["context conv s2<br/>8×6×96"]
+
+    motion["motion_t<br/>Δx Δz vx vz dt"] --> mlp["MotionEncoder<br/>MLP → m_t (64)"]
+
+    Hprev["H_{t-1}<br/>persistent state<br/>16×12×64"]
+
+    subgraph propagate["propagate() — IMU-rate step"]
+        warp["LearnedWarp<br/>flow(H, m_t) → grid_sample"]
+        mask["validity mask<br/>1 = source in-frame"]
+        Hprev --> warp
+        mlp --> warp
+        warp --> mask
+    end
+
+    warp --> Hp["H'_prev aligned"]
+    mask --> fuse
+
+    subgraph fuse["update() — camera step"]
+        diff["D_t = |norm(F_t) − norm(H')|<br/>(flag: diff_signal)"]
+        gru["ConvGRU<br/>input [F_t, mask, D_t]<br/>FiLM bias from m_t"]
+        F --> diff
+        Hp --> diff
+        F --> gru
+        Hp --> gru
+        diff --> gru
+        mlp --> gru
+    end
+
+    gru --> H["H_t<br/>16×12×64"]
+    H --> Hnext["state → next step"]
+
+    H --> pool["pool(H) ⊕ pool(ctx)"]
+    ctx --> pool
+    pool --> g["g_t<br/>128-d global"]
+
+    subgraph heads["training-only heads"]
+        probe["probe → gap_x, wall_d, vx, vz"]
+        occ["occupancy → 32-col free space"]
+        fut["future → F̂_{t+1} (64×6×8)<br/>from g_t + m_t + action"]
+    end
+
+    g --> probe
+    H --> occ
+    g --> fut
+    mlp --> fut
+```
+
 API (first-class state, no hidden globals):
 
 ```python
@@ -68,7 +127,7 @@ Aux heads (training only, discarded at deployment):
 - `gap_x` regression (where is the gap)
 - `wall_dist` regression (how far to the wall)
 - `vx, vz` regression (ego-motion)
-- `occupancy`: 32×24 analytic wall-projection mask (computed from scene
+- `occupancy`: 32-column free-space profile (analytic ray-cast against wall
   geometry, no renderer changes)
 - `future`: predict `F_{t+1}` (stop-grad) from `(H_t, m_t, action_t)`
 

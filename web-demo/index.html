@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Visual Encoder Demo</title>
+<style>
+  body { background: #111; color: #ddd; font: 13px/1.4 monospace; margin: 16px; }
+  h1 { font-size: 15px; font-weight: normal; }
+  .row { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+  .panel label { display: block; color: #888; margin-bottom: 4px; }
+  canvas { background: #000; image-rendering: pixelated; }
+  #controls { margin: 12px 0; }
+  button { background: #222; color: #ddd; border: 1px solid #444; padding: 4px 12px; font: inherit; cursor: pointer; }
+  input[type=range] { width: 480px; vertical-align: middle; }
+  #status { color: #888; }
+</style>
+</head>
+<body>
+<h1>visual-inertial encoder — live inference in browser (ONNX Runtime Web)</h1>
+<div id="controls">
+  <button id="play">pause</button>
+  <button id="dataset">sim → real</button>
+  <input id="scrub" type="range" min="0" max="0" value="0">
+  <span id="status">loading…</span>
+</div>
+<div class="row">
+  <div class="panel"><label>input frame (128×96)</label><canvas id="input" width="128" height="96" style="width:384px;height:288px"></canvas></div>
+  <div class="panel"><label>spatial latent H (16×12×64 → PCA)</label><canvas id="latent" width="16" height="12" style="width:384px;height:288px"></canvas></div>
+  <div class="panel"><label>free-space profile (pred / target)</label><canvas id="occ" width="256" height="96" style="width:384px;height:144px"></canvas></div>
+</div>
+<div class="row" style="margin-top:12px">
+  <div class="panel"><label>probe: gap_x / wall_d / vx / vz</label><canvas id="probe" width="384" height="60"></canvas></div>
+</div>
+<script type="module" src="main.js"></script>
+</body>
+</html>
